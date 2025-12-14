@@ -921,7 +921,7 @@ function setupGameSocket(io) {
         // reset, swap, notify, restart
         game.board = [...INITIAL_BOARD];
         game.turn = "X";
-        game.timers = { X: game.timers.X, O: game.timers.O };
+        game.timers = { X: game.timers.O, O: game.timers.X };
 
         const oldPlayers = { ...game.players };
         const oldSockets = { ...game.sockets };
