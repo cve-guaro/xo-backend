@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db/index");
 const Redis = require("ioredis");
+require('dotenv').config();
 
 // ---- Debug helpers -------------------------------------------------
 const DEBUG_MATCH = process.env.DEBUG_MATCH === "1" || process.env.NODE_ENV !== "production";
@@ -10,13 +11,13 @@ const shortId = () => uuidv4().slice(0, 8);
 const ts = () => new Date().toISOString();
 function dbg(ctx, ...args) { if (DEBUG_MATCH) console.log(`[MM ${ts()}] ${ctx}`, ...args); }
 function logAlways(ctx, ...args) { console.log(`[MM ${ts()}] ${ctx}`, ...args); }
-function emitDebug(socket, event, payload) { try { if (DEBUG_MATCH) socket.emit("debug", { event, payload, ts: ts() }); } catch {} }
+function emitDebug(socket, event, payload) { try { if (DEBUG_MATCH) socket.emit("debug", { event, payload, ts: ts() }); } catch { } }
 
 const JWT_SECRET = process.env.JWT_SECRET || "supersecret";
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 const QUEUE_TTL = 120_000; // 2 minutes
 
-const REMATCH_NS  = "rematch";
+const REMATCH_NS = "rematch";
 const REMATCH_TTL = 30_000; // 30s to respond (tweak as you like)
 
 // ---- Room configuration --------------------------------------------
@@ -37,7 +38,7 @@ const ROOMS_CONFIG = {
   },
   3: {
     name: "Room 3 - Advanced",
-    betRange: [1000, 2500, 5000, 7500,10000], // Base bet amounts
+    betRange: [1000, 2500, 5000, 7500, 10000], // Base bet amounts
     houseCutPercent: 10, // 10% cut
     timerDuration: 20, // 15 seconds per turn
     description: "Large bets - 10% house cut - 15s timer"
@@ -47,27 +48,27 @@ const ROOMS_CONFIG = {
 // ---- Helper to determine room based on bet amount ------------------
 function determineRoomByBetAmount(betAmount) {
   const amount = Number(betAmount);
-  
+
   // Check Room 1 first
   if (ROOMS_CONFIG[1].betRange.includes(amount)) {
     return 1;
   }
-  
+
   // Check Room 2
   if (ROOMS_CONFIG[2].betRange.includes(amount)) {
     return 2;
   }
-  
+
   // Check Room 3
   if (ROOMS_CONFIG[3].betRange.includes(amount)) {
     return 3;
   }
-  
+
   // For Room 3, check if amount is 10000 or more
   if (amount >= 10000) {
     return 3;
   }
-  
+
   // If no match found, return null
   return null;
 }
@@ -75,32 +76,32 @@ function determineRoomByBetAmount(betAmount) {
 // ---- Modified calculatePrize function with room-based cuts ---------
 function calculatePrize(betAmount) {
   const totalPot = betAmount * 2;
-  
+
   // Determine which room this bet belongs to
   const roomNumber = determineRoomByBetAmount(betAmount);
-  
+
   if (!roomNumber) {
     // Fallback to original tiered logic if room not found
     const HOUSE_FEE_THRESHOLD = Number(process.env.HOUSE_FEE_THRESHOLD || 50);
     const HOUSE_FEE_LOW_PERCENT = Number(process.env.HOUSE_FEE_LOW_PERCENT || 20);
     const HOUSE_FEE_HIGH_PERCENT = Number(process.env.HOUSE_FEE_HIGH_PERCENT || 10);
-    
+
     let pct = betAmount < HOUSE_FEE_THRESHOLD ? HOUSE_FEE_LOW_PERCENT : HOUSE_FEE_HIGH_PERCENT;
     pct = Math.max(0, Math.min(100, pct));
-    
+
     const prize = Math.floor(totalPot * (1 - pct / 100));
     return { prize, totalPot, feePercent: pct, room: null };
   }
-  
+
   // Use room-specific cut
   const roomConfig = ROOMS_CONFIG[roomNumber];
   const pct = roomConfig.houseCutPercent;
   const prize = Math.floor(totalPot * (1 - pct / 100));
-  
-  return { 
-    prize, 
-    totalPot, 
-    feePercent: pct, 
+
+  return {
+    prize,
+    totalPot,
+    feePercent: pct,
     room: roomNumber,
     roomName: roomConfig.name,
     timerDuration: roomConfig.timerDuration
@@ -113,7 +114,7 @@ function getInitialTimerForBetAmount(betAmount) {
   if (roomNumber && ROOMS_CONFIG[roomNumber]) {
     return ROOMS_CONFIG[roomNumber].timerDuration;
   }
-  
+
   // Fallback to default
   return 30;
 }
@@ -126,20 +127,20 @@ const socketSearching = new Map();    // socket.id -> queueKey
 const BOARD_SIZE = 9;
 const INITIAL_BOARD = Array(BOARD_SIZE).fill("_");
 const WINNING_COMBINATIONS = [
-  [0,1,2],[3,4,5],[6,7,8],
-  [0,3,6],[1,4,7],[2,5,8],
-  [0,4,8],[2,4,6],
+  [0, 1, 2], [3, 4, 5], [6, 7, 8],
+  [0, 3, 6], [1, 4, 7], [2, 5, 8],
+  [0, 4, 8], [2, 4, 6],
 ];
 const RECONNECT_GRACE = 10_000; // 10 sec
 const MM_QUEUES_SET = "mm:queues";
 
-function opposite(s){ return s === "X" ? "O" : "X"; }
+function opposite(s) { return s === "X" ? "O" : "X"; }
 // helpers (top of file)
 const userRoom = (uid) => `user:${uid}`;
 
 function rememberUserSocket(socket, userId) {
   socket.data = { ...(socket.data || {}), userId };
-  try { socket.join(userRoom(userId)); } catch {}
+  try { socket.join(userRoom(userId)); } catch { }
 }
 
 // === REMATCH: light user index (online sockets by userId) ===========
@@ -258,7 +259,7 @@ async function withRematchLock(userA, userB, ttlMs, fn) {
 async function tx(fn) {
   const client = await pool.connect();
   try { await client.query("BEGIN"); const res = await fn(client); await client.query("COMMIT"); return res; }
-  catch (e) { try { await client.query("ROLLBACK"); } catch {} throw e; }
+  catch (e) { try { await client.query("ROLLBACK"); } catch { } throw e; }
   finally { client.release(); }
 }
 
@@ -272,7 +273,7 @@ async function removeFromQueue(queueKey, userId) {
         await redis.lrem(queueKey, 1, raw);
         return true;
       }
-    } catch {}
+    } catch { }
   }
   return false;
 }
@@ -325,28 +326,28 @@ async function startDirectMatch(io, userA, userB, betAmount) {
   sockets.X.join(matchId);
   sockets.O.join(matchId);
 
-  await redis.set(`in_game:${X}`, matchId, "PX", QUEUE_TTL * 10).catch(()=>{});
-  await redis.set(`in_game:${O}`, matchId, "PX", QUEUE_TTL * 10).catch(()=>{});
+  await redis.set(`in_game:${X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+  await redis.set(`in_game:${O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
 
-  const payloadX = { 
-    matchId, 
-    youAre: "X", 
-    symbol: "X", 
-    opponentId: O, 
-    opponentSymbol: "O", 
-    players: { X, O }, 
+  const payloadX = {
+    matchId,
+    youAre: "X",
+    symbol: "X",
+    opponentId: O,
+    opponentSymbol: "O",
+    players: { X, O },
     betAmount,
     room: roomNumber,
     roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
     timerDuration: initialTimer
   };
-  const payloadO = { 
-    matchId, 
-    youAre: "O", 
-    symbol: "O", 
-    opponentId: X, 
-    opponentSymbol: "X", 
-    players: { X, O }, 
+  const payloadO = {
+    matchId,
+    youAre: "O",
+    symbol: "O",
+    opponentId: X,
+    opponentSymbol: "X",
+    players: { X, O },
     betAmount,
     room: roomNumber,
     roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
@@ -371,7 +372,7 @@ async function removeAllOccurrencesFromQueue(queueKey, userId) {
     try {
       const entry = JSON.parse(raw);
       if (entry.userId === userId) removed += await redis.lrem(queueKey, 0, raw);
-    } catch {}
+    } catch { }
   }
   if (removed && DEBUG_MATCH) dbg(`purge[${queueKey}]`, { userId, removed });
   return removed;
@@ -383,7 +384,7 @@ async function purgeUserFromAllQueues(userId) {
 }
 async function lpopN(key, n) {
   if (typeof redis.lpop === "function" && redis.lpop.length >= 2) {
-    try { return await redis.lpop(key, n); } catch {}
+    try { return await redis.lpop(key, n); } catch { }
   }
   const out = [];
   for (let i = 0; i < n; i++) {
@@ -406,7 +407,7 @@ async function withRedisLock(redisClient, key, ttlMs, fn) {
         return 0
       end
     `;
-    try { await redisClient.eval(lua, 1, key, lockId); } catch {}
+    try { await redisClient.eval(lua, 1, key, lockId); } catch { }
   }
 }
 async function requeuePreservingPlace(queueKey, entry) {
@@ -415,7 +416,7 @@ async function requeuePreservingPlace(queueKey, entry) {
 function startQueueTimeout(socket, queueKey, userId) {
   clearQueueTimeout(socket.id);
   const t = setTimeout(async () => {
-    try { await removeFromQueue(queueKey, userId); } catch {}
+    try { await removeFromQueue(queueKey, userId); } catch { }
     socketSearching.delete(socket.id);
     queueTimers.delete(socket.id);
     emitDebug(socket, "queue_timeout", { queueKey, userId, ttl: QUEUE_TTL });
@@ -508,7 +509,7 @@ function isValidMove(game, index, symbol) {
   );
 }
 function checkWin(board, symbol) {
-  return WINNING_COMBINATIONS.some(([a,b,c]) => board[a] === symbol && board[b] === symbol && board[c] === symbol);
+  return WINNING_COMBINATIONS.some(([a, b, c]) => board[a] === symbol && board[b] === symbol && board[c] === symbol);
 }
 function checkDraw(board) { return board.every(cell => cell !== "_"); }
 
@@ -519,8 +520,8 @@ function cleanupGame(matchId) {
   if (game.reconnectTimeout) clearTimeout(game.reconnectTimeout);
   if (game.startTimeout) clearTimeout(game.startTimeout); // clear pending start
   const { X, O } = game.players || {};
-  if (X) redis.del(`in_game:${X}`).catch(()=>{});
-  if (O) redis.del(`in_game:${O}`).catch(()=>{});
+  if (X) redis.del(`in_game:${X}`).catch(() => { });
+  if (O) redis.del(`in_game:${O}`).catch(() => { });
   activeGames.delete(matchId);
   dbg("cleanupGame", { matchId });
 }
@@ -586,7 +587,7 @@ function setupGameSocket(io) {
         socket.data = socket.data || {};
         socket.data.userId = userId;
         addUserSocket(userId, socket);
-      } catch {}
+      } catch { }
     }
 
     // ------- Matchmaking -------
@@ -614,9 +615,9 @@ function setupGameSocket(io) {
             "10000+ (Room 3)"
           ];
           if (typeof ack === "function") ack({ ok: true, data: { state: "INVALID_BET_AMOUNT" } });
-          socket.emit("error", { 
-            code: "INVALID_BET_AMOUNT", 
-            message: `Invalid bet amount. Valid amounts are: ${validBets.join(", ")}` 
+          socket.emit("error", {
+            code: "INVALID_BET_AMOUNT",
+            message: `Invalid bet amount. Valid amounts are: ${validBets.join(", ")}`
           });
           return;
         }
@@ -641,7 +642,7 @@ function setupGameSocket(io) {
         }
 
         const queueKey = `queue:${betAmount}`;
-        await redis.sadd(MM_QUEUES_SET, queueKey).catch(()=>{});
+        await redis.sadd(MM_QUEUES_SET, queueKey).catch(() => { });
         dbg(ctx, "queueKey", queueKey);
 
         // socket already searching?
@@ -657,11 +658,11 @@ function setupGameSocket(io) {
         if (removed) dbg(ctx, "removed stale entry in this queue");
 
         // enqueue
-        const entry = { 
-          userId, 
-          username, 
-          socketId: socket.id, 
-          joinedAt: Date.now(), 
+        const entry = {
+          userId,
+          username,
+          socketId: socket.id,
+          joinedAt: Date.now(),
           rid,
           betAmount,
           room: roomNumber,
@@ -670,7 +671,7 @@ function setupGameSocket(io) {
         await redis.rpush(queueKey, JSON.stringify(entry));
         socketSearching.set(socket.id, queueKey);
         startQueueTimeout(socket, queueKey, userId);
-        socket.emit("queue_status", { 
+        socket.emit("queue_status", {
           searching: true,
           room: roomNumber,
           roomName: ROOMS_CONFIG[roomNumber].name,
@@ -680,17 +681,17 @@ function setupGameSocket(io) {
         });
         emitDebug(socket, "queued", { queueKey, entry });
 
-        if (typeof ack === "function") ack({ 
-          ok: true, 
-          data: { 
-            queued: true, 
+        if (typeof ack === "function") ack({
+          ok: true,
+          data: {
+            queued: true,
             ttlMs: QUEUE_TTL,
             room: roomNumber,
             roomName: ROOMS_CONFIG[roomNumber].name,
             betAmount,
             timerDuration: ROOMS_CONFIG[roomNumber].timerDuration,
             houseCutPercent: ROOMS_CONFIG[roomNumber].houseCutPercent
-          } 
+          }
         });
 
         // prune stale entries
@@ -768,11 +769,11 @@ function setupGameSocket(io) {
             // build game
             const players = { X: p1.userId, O: p2.userId };
             const sockets = { X: s1, O: s2 };
-            
+
             // Get room configuration
             const roomNumber = determineRoomByBetAmount(betAmount);
             const initialTimer = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
-            
+
             const game = {
               id: matchId,
               board: Array(9).fill("_"),
@@ -806,30 +807,30 @@ function setupGameSocket(io) {
             sockets.O.emit("queue_status", { searching: false });
 
             // mark in_game (blocks requeue)
-            await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(()=>{});
-            await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(()=>{});
+            await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+            await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
 
             // payloads with room info
-            const payloadX = { 
-              matchId, 
-              youAre: "X", 
-              symbol: "X", 
-              opponentId: players.O, 
-              opponentSymbol: "O", 
-              players, 
+            const payloadX = {
+              matchId,
+              youAre: "X",
+              symbol: "X",
+              opponentId: players.O,
+              opponentSymbol: "O",
+              players,
               betAmount,
               room: roomNumber,
               roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
               timerDuration: initialTimer,
               houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
             };
-            const payloadO = { 
-              matchId, 
-              youAre: "O", 
-              symbol: "O", 
-              opponentId: players.X, 
-              opponentSymbol: "X", 
-              players, 
+            const payloadO = {
+              matchId,
+              youAre: "O",
+              symbol: "O",
+              opponentId: players.X,
+              opponentSymbol: "X",
+              players,
               betAmount,
               room: roomNumber,
               roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
@@ -1011,17 +1012,17 @@ function setupGameSocket(io) {
                   await redis.lrem(qKey, 1, raw);
                   break;
                 }
-              } catch {}
+              } catch { }
             }
           }
-        } catch {}
+        } catch { }
         socketSearching.delete(socket.id);
         clearQueueTimeout(socket.id);
         socket.emit?.("queue_status", { searching: false });
       }
 
       // Also purge any duplicates the user might have across queues
-      if (userId) { try { await purgeUserFromAllQueues(userId); } catch {} }
+      if (userId) { try { await purgeUserFromAllQueues(userId); } catch { } }
 
       // In-game grace → then forfeit
       if (!matchId || !activeGames.has(matchId)) return;
@@ -1092,7 +1093,7 @@ function setupGameSocket(io) {
           const { matchId, X, O } = await startDirectMatch(io, userId, opponentId, Number(amount || 0));
 
           // Optional: notify that we're transitioning
-          emitToUser(io, userId,     "rematch_result", { accepted: true, matchId, youAre: X === userId ? "X" : "O" });
+          emitToUser(io, userId, "rematch_result", { accepted: true, matchId, youAre: X === userId ? "X" : "O" });
           emitToUser(io, opponentId, "rematch_result", { accepted: true, matchId, youAre: X === opponentId ? "X" : "O" });
           ack?.({ ok: true, matchId });
         } catch (err) {
