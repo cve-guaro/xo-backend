@@ -1,0 +1,51 @@
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Expo
+.expo/
+.expo-shared/
+web-build/
+
+# React Native
+android/
+ios/
+*.keystore
+*.gradle
+*.idea/
+*.xcworkspace
+*.xcuserdatad
+*.hmap
+*.lock
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+DerivedData/
+build/
+*.iml
+*.log
+
+# Metro bundler cache
+.expo/cache/
+*.tmp
+
+# Misc
+*.env
+*.env.local
+.env.*.local
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# TypeScript
+*.tsbuildinfo
+
+# Yarn / PNPM
+.pnp.*
+.pnpm-debug.log*
