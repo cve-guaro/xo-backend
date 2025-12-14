@@ -3,7 +3,7 @@ require('dotenv').config();
 
 function bool(v) { return String(v).toLowerCase() === 'true'; }
 function toCents(etb) {
-  return Number(parseFloat(etb).toFixed(2));
+  return Number(parseInt(etb));
 }
 
 
