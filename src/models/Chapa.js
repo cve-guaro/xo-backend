@@ -28,7 +28,7 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
  * Initialize a DEPOSIT with Chapa
  * Returns provider response (often includes checkout URL or instructions).
  */
-async function initDeposit({ tx_ref, amountCents, bank, callback_url, secretKey }) {
+async function initDeposit({ tx_ref, amountCents, mobile, bank, callback_url, secretKey }) {
   // Chapa expects amount in ETB string; we convert cents -> birr
   const amount = amountCents;
   // Map internal bank code to Chapa payment channel (adjust if your account differs)
@@ -45,7 +45,7 @@ async function initDeposit({ tx_ref, amountCents, bank, callback_url, secretKey 
     tx_ref,
     // Optional customer info (if you have it)
     // email, first_name, last_name, phone_number,
-    phone_number: '251960334175',
+    phone_number: mobile,
     callback_url,
     // Some providers accept specifying payment channel
     // For Chapa, "payment_method" is supported for some channels
