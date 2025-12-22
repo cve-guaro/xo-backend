@@ -29,56 +29,56 @@ app.use("/webhook/:provider", bodyParser.raw({ type: "*/*" }));
 app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
-app.post("/webhook/:provider", async (req, res) => {
-  try {
-    const providerCode = req.params.provider;
-    const rawBody = req.body; // Buffer
-    const payload = rawBody
-    console.log("Received webhook:", providerCode, payload);
+// app.post("/webhook/:provider", async (req, res) => {
+//   try {
+//     const providerCode = req.params.provider;
+//     const rawBody = req.body; // Buffer
+//     const payload = rawBody
+//     console.log("Received webhook:", providerCode, payload);
 
-    // Map the provider payload → internal fields
-    const mapPayload = (p) => ({
-      providerEventId: p.id || p.eventId,
-      eventType: p.type,
-      providerExtId: p.data?.reference || 'test_id',
-      newStatus: mapProviderStatus(p.data?.status),
-      metadata: { raw: p },
-    });
-    console.log("Mapped webhook payload:");
+//     // Map the provider payload → internal fields
+//     const mapPayload = (p) => ({
+//       providerEventId: p.id || p.eventId,
+//       eventType: p.type,
+//       providerExtId: p.data?.reference || 'test_id',
+//       newStatus: mapProviderStatus(p.data?.status),
+//       metadata: { raw: p },
+//     });
+//     console.log("Mapped webhook payload:");
 
-    function mapProviderStatus(s) {
-      switch (String(s || "").toLowerCase()) {
-        case "pending":
-        case "processing": return "pending";
-        case "authorized": return "authorized";
-        case "success":
-        case "succeeded":
-        case "paid":       return "succeeded";
-        case "failed":
-        case "error":      return "failed";
-        case "canceled":
-        case "cancelled":  return "canceled";
-        case "refunded":   return "refunded";
-        default:           return null;
-      }
-    }
+//     function mapProviderStatus(s) {
+//       switch (String(s || "").toLowerCase()) {
+//         case "pending":
+//         case "processing": return "pending";
+//         case "authorized": return "authorized";
+//         case "success":
+//         case "succeeded":
+//         case "paid":       return "succeeded";
+//         case "failed":
+//         case "error":      return "failed";
+//         case "canceled":
+//         case "cancelled":  return "canceled";
+//         case "refunded":   return "refunded";
+//         default:           return null;
+//       }
+//     }
 
-    const result = await recordAndProcessWebhook({
-      providerCode,
-      rawBody,
-      headers: req.headers,
-      payload,
-      mapPayload,
-      signatureHeaderName: "x-signature", // change per provider
-    });
+//     const result = await recordAndProcessWebhook({
+//       providerCode,
+//       rawBody,
+//       headers: req.headers,
+//       payload,
+//       mapPayload,
+//       signatureHeaderName: "x-signature", // change per provider
+//     });
 
-    res.status(200).json({ ok: true, result });
-  } catch (err) {
-    res.status(400).json({ ok: false, error: err.message });
-  }
-});
+//     res.status(200).json({ ok: true, result });
+//   } catch (err) {
+//     res.status(400).json({ ok: false, error: err.message });
+//   }
+// });
 
 setupGameSocket(io);
 
-const PORT = process.env.PORT || 7000;
+const PORT = process.env.PORT || 9000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));

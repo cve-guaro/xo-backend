@@ -21,8 +21,8 @@ const LIMITS = {
 };
 
 const CHAPA = {
-  secret: process.env.CHAPA_SECRET_KEY,
-  callbackUrl: process.env.CHAPA_CALLBACK_URL,
+  secret: process.env.CHAPA_SECRET_KEY || 'test-key',
+  callbackUrl: process.env.CHAPA_CALLBACK_UR || 'testkey',
 };
 
 if (!CHAPA.secret) throw new Error('CHAPA_SECRET_KEY is required');

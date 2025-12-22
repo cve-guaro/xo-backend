@@ -8,7 +8,7 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
   const res = await fetch(`${CHAPA_BASE}${path}`, {
     method,
     headers: {
-      'Authorization': `Bearer ${secretKey}`,
+      'Authorization': `Bearer CHASECK-gn0RFezIBSCzmMnZyrb2rGgTCfQCLBVy`,
       'Content-Type': 'application/json',
     },
     body: bodyJson ? JSON.stringify(bodyJson) : undefined,
@@ -28,9 +28,7 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
  * Initialize a DEPOSIT with Chapa
  * Returns provider response (often includes checkout URL or instructions).
  */
-async function initDeposit({ tx_ref, amountCents, mobile, bank, callback_url, secretKey }) {
-  // Chapa expects amount in ETB string; we convert cents -> birr
-  const amount = amountCents;
+async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secretKey ) {
   // Map internal bank code to Chapa payment channel (adjust if your account differs)
   const methodMap = {
     TELEBIRR_USSD: 'telebirr',
@@ -38,6 +36,7 @@ async function initDeposit({ tx_ref, amountCents, mobile, bank, callback_url, se
     WEB_CHECKOUT: 'card', // generic checkout
   };
   const payment_method = methodMap[bank] || 'card';
+  console.log(amount, tx_ref, mobile)
 
   const payload = {
     amount,
@@ -53,27 +52,27 @@ async function initDeposit({ tx_ref, amountCents, mobile, bank, callback_url, se
     customization: { title: 'Wallet Top-up', description: `Deposit via ${bank}` },
   };
 
-  return chapaFetch('/transaction/initialize', 'POST', payload, secretKey);
+  return chapaFetch('/transaction/initialize', 'POST', payload, 'CHASECK-gn0RFezIBSCzmMnZyrb2rGgTCfQCLBVy');
 }
 
 /**
  * Initiate a PAYOUT (withdrawal) with Chapa Business payouts.
  * You must have payouts enabled. Adjust fields to your KYC scope.
  */
-async function initPayout({ tx_ref, amountCents, bank, account_name, account_number, secretKey }) {
-  const amount = (amountCents / 100).toFixed(2);
+async function initChapaPayout(tx_ref, amount, account_number, bank, account_name, secretKey) {
   const methodMap = {
     TELEBIRR_USSD: 'telebirr',
     CBE_BIRR: 'cbe',
     WEB_CHECKOUT: 'card', // generic checkout
   };
   const payment_method = methodMap[bank] || 'card';
-  console.log(tx_ref, tx_ref.length)
+  // console.log(tx_ref, tx_ref.length)
+  console.log('dwithdraw data: ', tx_ref, amount, account_name, account_number)
   const body = {
-    "amount": 20,
+    "amount": amount,
     "reference": tx_ref,
     "bank_code": 855,
-    "account_name": account_name,
+    "account_name": account_name || "xo user",
     "account_number": account_number
   };
   return chapaFetch('/transfers', 'POST', body, secretKey);
@@ -86,4 +85,4 @@ async function verifyTx(tx_ref, secretKey) {
   return chapaFetch(`/transaction/verify/${encodeURIComponent(tx_ref)}`, 'GET', null, secretKey);
 }
 
-module.exports = { initDeposit, initPayout, verifyTx };
+module.exports = { initChapaDeposit, initChapaPayout, verifyTx };

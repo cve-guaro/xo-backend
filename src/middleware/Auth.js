@@ -2,7 +2,7 @@
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
 
-const pubKey = JWT_SECRET; // or HS256 secret
+const pubKey = JWT_SECRET || 'test'; // or HS256 secret
 if (!pubKey) {
   console.warn('JWT_PUBLIC_KEY not set — auth middleware will accept x-user-id for local testing.');
 }

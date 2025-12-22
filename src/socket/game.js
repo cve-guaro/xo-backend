@@ -482,18 +482,7 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       [status, winnerUserId || null, gameId]
     );
     if (winnerUserId) {
-      await client.query(
-        `UPDATE wallets
-           SET available_balance = available_balance + $1
-         WHERE user_id = $2`,
-        [prizeAmount, winnerUserId]
-      );
-      await client.query(
-        `UPDATE wallets
-           SET withdrawable_balance = withdrawable_balance + $1
-         WHERE user_id = $2 AND (withdrawable_balance + $1) <= available_balance`,
-        [prizeAmount, winnerUserId]
-      );
+      creditPrize(winnerUserId, prizeAmount, {gameid: gameId})
     }
   });
 }
@@ -569,7 +558,7 @@ function startTimer(io, matchId) {
       finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
         console.error("finishAndPayout timeout err:", err)
       );
-      io.to(matchId).emit("game_won", { winnerSymbol, winnerId, reason: "timeout" });
+      io.to(matchId).emit("game_won", { winnerSymbol, winnerId, reason: "timeout", prizeAmount: prize });
       cleanupGame(matchId);
     }
   }, 1000);
@@ -912,7 +901,7 @@ function setupGameSocket(io) {
         finishAndPayout(matchId, symbol, userId, prize).catch(err =>
           console.error("finishAndPayout win err:", err)
         );
-        io.to(matchId).emit("game_won", { winnerSymbol: symbol, winnerId: userId, reason: "win" });
+        io.to(matchId).emit("game_won", { winnerSymbol: symbol, winnerId: userId, reason: "win", prizeAmount: prize });
         cleanupGame(matchId);
         return;
       }
@@ -985,7 +974,7 @@ function setupGameSocket(io) {
 
         await finishAndPayout(matchId, opponentSymbol, winnerId, prize).catch(e => console.error(e));
         if (game.sockets[opponentSymbol]) game.sockets[opponentSymbol].emit("opponent_forfeited");
-        io.to(matchId).emit("game_won", { winnerSymbol: opponentSymbol, winnerId, reason: "opponent_left" });
+        io.to(matchId).emit("game_won", { winnerSymbol: opponentSymbol, winnerId, reason: "opponent_left", prizeAmount: prize });
         cleanupGame(matchId);
         if (typeof ack === "function") ack({ ok: true, data: { done: true } });
       } catch (e) {

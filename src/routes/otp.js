@@ -46,10 +46,15 @@ router.post('/request-otp', async (req, res) => {
     const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
     await withTx(async (client) => {
-      await client.query(
+      const user = await client.query(
         `INSERT INTO users (number) VALUES ($1)
-         ON CONFLICT (number) DO NOTHING`,
+         ON CONFLICT (number) DO NOTHING RETURNING *`,
         [number]
+      );
+      await client.query(
+        `INSERT INTO wallets (user_id) VALUES ($1)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [user.rows[0].id]
       );
 
       await client.query(
@@ -82,7 +87,7 @@ router.post('/verify-otp', async (req, res) => {
   if (!raw || !code) return res.status(400).json({ error: 'number and code are required' });
 
   const number = String(raw).replace(/\s+/g, '');
-  const secret = process.env.JWT_SECRET;
+  const secret = process.env.JWT_SECRET || 'test';
   if (!secret) return res.status(500).json({ error: 'server jwt misconfigured' });
 
   try {
