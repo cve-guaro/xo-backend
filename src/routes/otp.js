@@ -38,54 +38,60 @@ router.post('/request-otp', async (req, res) => {
     const raw = req.body?.number;
     if (!raw) return res.status(400).json({ error: 'number is required' });
 
-    const number = normalizeNumber(raw)
-    const code = String(Math.floor(Math.random() * 10000)).padStart(4, '0');
-    const ttl = Number(process.env.OTP_TTL_SECONDS || 300);
+    const number = normalizeNumber(raw);
+    const code = genOtp();
+    const ttl = OTP_TTL;
 
-    // Log the OTP for debugging
     console.log(`[DEBUG] OTP for ${number}: ${code} (valid for ${ttl}s)`);
 
-    const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
-
     await withTx(async (client) => {
+      // 1️⃣ Ensure user exists
       const userResult = await client.query(
-  `INSERT INTO users (number)
-   VALUES ($1)
-   ON CONFLICT (number) DO NOTHING
-   RETURNING id`,
-  [number]
-);
+        `INSERT INTO users (number)
+         VALUES ($1)
+         ON CONFLICT (number) DO NOTHING
+         RETURNING id`,
+        [number]
+      );
 
-let userId;
+      let userId;
 
-if (userResult.rows.length > 0) {
-  // New user inserted
-  userId = userResult.rows[0].id;
-} else {
-  // User already exists → fetch it
-  const existingUser = await client.query(
-    `SELECT id FROM users WHERE number = $1`,
-    [number]
-  );
-  userId = existingUser.rows[0].id;
-}
+      if (userResult.rows.length > 0) {
+        userId = userResult.rows[0].id;
+      } else {
+        const existingUser = await client.query(
+          `SELECT id FROM users WHERE number = $1`,
+          [number]
+        );
+        userId = existingUser.rows[0].id;
+      }
 
-await client.query(
-  `INSERT INTO wallets (user_id)
-   VALUES ($1)
-   ON CONFLICT (user_id) DO NOTHING`,
-  [userId]
-);
+      // 2️⃣ Ensure wallet exists
+      await client.query(
+        `INSERT INTO wallets (user_id)
+         VALUES ($1)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [userId]
+      );
 
+      // 3️⃣ 🔥 INSERT OTP (THIS WAS MISSING)
+      await client.query(
+        `INSERT INTO otps (number, code, expires_at)
+         VALUES ($1, $2, now() + ($3 || ' seconds')::interval)`,
+        [number, code, ttl]
+      );
     });
-     
-    // send SMS here...
+
+    // 4️⃣ Send SMS
+    await sendOtpSMS(number, code);
+
     return res.json({ ok: true, message: 'OTP sent' });
   } catch (err) {
-    console.error(err);
+    console.error('[REQUEST_OTP] Error', err);
     return res.status(500).json({ error: 'failed to request otp' });
   }
 });
+
 
 
 /**
