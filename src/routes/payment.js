@@ -223,7 +223,7 @@ router.post('/withdraw', auth, async (req, res) => {
 //   }
 // });
 
-router.post("/webhook", express.json({ type: "*/*" }), handleWebhook);
+router.post("/webhook", handleWebhook);
 
 
 router.post('/withdrawal/approve', async (req, res) => {
