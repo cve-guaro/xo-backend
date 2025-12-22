@@ -1,6 +1,38 @@
 const SQL = {
   ensureWallet: `SELECT fn_wallet_ensure($1::uuid) AS wallet;`,
 
+  applyExistingTx: `
+    SELECT fn_wallet_apply_existing_tx($1::uuid) AS tx_id;
+  `,
+
+  // Find deposit tx by providerRef (CHAPA tx_ref, etc.)
+  findDepositTxByProviderRef: `
+    SELECT id, user_id, status
+    FROM wallet_transactions
+    WHERE tx_type = 'DEPOSIT'
+      AND provider = $1::text
+      AND id = $2::uuid
+    ORDER BY created_at DESC
+    LIMIT 1
+    FOR UPDATE;
+  `,
+    getWalletByUserId: `
+    SELECT user_id, available_balance, withdrawable_balance
+    FROM wallets
+    WHERE user_id = $1::uuid;
+  `,
+
+  // Mark completed by tx_id
+  markTxCompletedById: `
+    UPDATE wallet_transactions
+    SET status = 'COMPLETED',
+        provider = COALESCE($2::text, provider),
+        provider_ref = $3::uuid,
+        updated_at = now()
+    WHERE id = $1::uuid
+    RETURNING id, user_id;
+  `,
+
   applyTx: `
     SELECT fn_wallet_apply_tx(
       $1::uuid,                 -- user_id

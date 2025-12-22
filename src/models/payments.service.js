@@ -26,7 +26,7 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
       Number(amount),
       "PENDING",
       crypto.randomUUID(), // internal only
-      provider || "UNKNOWN",
+      "CHAPA",
       null,
       {},
     ]);
@@ -54,26 +54,30 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
 
 // ----------- Deposit (complete via webhook) -----------
 // payments.service.js
-async function completeDeposit({ userId, amount, provider, providerRef }) {
-  // providerRef is UNIQUE → retries safe
+async function completeDeposit(providerRef, provider) {
   return withTx(async (client) => {
-    await client.query(SQL.ensureWallet, [userId]);
+    // 1) Find the deposit tx row using providerRef
+    const found = await client.query(SQL.findDepositTxByProviderRef, [provider, providerRef]);
+    const txRow = found.rows[0];
 
-    const { rows } = await client.query(SQL.applyTx, [
-      userId,
-      "DEPOSIT",
-      Number(amount),
-      "COMPLETED",
-      `PROVIDER:${provider}:${providerRef}`, // backend-only idempotency
-      provider,
-      providerRef,
-      {},
-    ]);
+    if (!txRow) {
+      // This means you never created a DEPOSIT tx row with provider_ref = providerRef
+      throw new Error(`Deposit tx not found for providerRef=${providerRef}`);
+    }
 
-    const wallet = await client.query(SQL.getWallet, [userId]);
-    return { txId: rows[0].tx_id, wallet: wallet.rows[0] };
+    const txId = txRow.id;
+    const userId = txRow.user_id;
+
+    await client.query(SQL.markTxCompletedById, [providerRef, "CHAPA", txId]);
+    await client.query(SQL.applyExistingTx, [providerRef]); // providerRef == tx_id
+
+    // 4) Fetch wallet by userId (you need userId for this query)
+    const walletRes = await client.query(SQL.getWalletByUserId, [userId]);
+
+    return { txId: txId, wallet: walletRes.rows[0] };
   });
 }
+
 
 
 // ----------- Prize / Won money (available + withdrawable) -----------
