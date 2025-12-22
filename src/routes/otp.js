@@ -14,8 +14,10 @@ function genOtp() {
 }
 
 function normalizeNumber(n) {
-  // very light normalization; adjust to your country rules
-  return String(n).replace(/\s+/g, '');
+  return String(n)
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/^(\+251|251)/, '0');
 }
 
 // Placeholder: integrate your SMS gateway here
@@ -36,7 +38,7 @@ router.post('/request-otp', async (req, res) => {
     const raw = req.body?.number;
     if (!raw) return res.status(400).json({ error: 'number is required' });
 
-    const number = String(raw).replace(/\s+/g, '');
+    const number = normalizeNumber(raw)
     const code = String(Math.floor(Math.random() * 10000)).padStart(4, '0');
     const ttl = Number(process.env.OTP_TTL_SECONDS || 300);
 
@@ -97,15 +99,31 @@ await client.query(
 router.post('/verify-otp', async (req, res) => {
   const raw = req.body?.number;
   const code = req.body?.code;
-  if (!raw || !code) return res.status(400).json({ error: 'number and code are required' });
 
-  const number = String(raw).replace(/\s+/g, '');
+  console.log('[VERIFY_OTP] Incoming request', {
+    raw,
+    hasCode: !!code,
+    ip: req.ip,
+  });
+
+  if (!raw || !code) {
+    console.warn('[VERIFY_OTP] Missing number or code');
+    return res.status(400).json({ error: 'number and code are required' });
+  }
+
+  const number = normalizeNumber(raw);
   const secret = process.env.JWT_SECRET || 'test';
-  if (!secret) return res.status(500).json({ error: 'server jwt misconfigured' });
+
+  if (!secret) {
+    console.error('[VERIFY_OTP] JWT secret missing');
+    return res.status(500).json({ error: 'server jwt misconfigured' });
+  }
 
   try {
     const result = await withTx(async (client) => {
-      // 1) Find latest active OTP and lock it
+      console.log('[VERIFY_OTP] Looking for active OTP', { number });
+
+      // 1) Find latest active OTP
       const { rows } = await client.query(
         `SELECT * FROM otps
          WHERE number = $1 AND used = FALSE AND expires_at > now()
@@ -113,59 +131,102 @@ router.post('/verify-otp', async (req, res) => {
          LIMIT 1`,
         [number]
       );
+
       if (!rows.length) {
-        return { ok: false, reason: 'no_active_otp' }; // don't throw—let tx commit
+        console.warn('[VERIFY_OTP] No active OTP found', { number });
+        return { ok: false, reason: 'no_active_otp' };
       }
+
       const otp = rows[0];
+      console.log('[VERIFY_OTP] OTP found', {
+        otpId: otp.id,
+        tried: otp.tried,
+        expiresAt: otp.expires_at,
+      });
+
+      // Lock row
       await client.query(`SELECT id FROM otps WHERE id=$1 FOR UPDATE`, [otp.id]);
 
-      // 2) Check tries limit (don’t throw to avoid rollback)
-      if (Number(otp.tried) >= Number(process.env.MAX_OTP_TRIES || 5)) {
+      // 2) Tries limit
+      const maxTries = Number(process.env.MAX_OTP_TRIES || 5);
+      if (Number(otp.tried) >= maxTries) {
+        console.warn('[VERIFY_OTP] Too many attempts', {
+          otpId: otp.id,
+          tried: otp.tried,
+        });
         return { ok: false, reason: 'too_many_attempts' };
       }
 
-      // 3) Match code
+      // 3) Code match
       if (otp.code !== code) {
-        // increment tried on wrong code
-        await client.query(`UPDATE otps SET tried = tried + 1 WHERE id = $1`, [otp.id]);
+        console.warn('[VERIFY_OTP] Invalid OTP code', {
+          otpId: otp.id,
+          triedBefore: otp.tried,
+        });
+
+        await client.query(
+          `UPDATE otps SET tried = tried + 1 WHERE id = $1`,
+          [otp.id]
+        );
+
         return { ok: false, reason: 'invalid_code' };
       }
 
-      // 4) Success: mark used and ensure user exists
+      console.log('[VERIFY_OTP] OTP verified successfully', { otpId: otp.id });
+
+      // 4) Success
       await client.query(`UPDATE otps SET used = TRUE WHERE id = $1`, [otp.id]);
 
       const { rows: userRows } = await client.query(
         `INSERT INTO users (number)
-           VALUES ($1)
+         VALUES ($1)
          ON CONFLICT (number)
-           DO UPDATE SET number = EXCLUDED.number
+         DO UPDATE SET number = EXCLUDED.number
          RETURNING id, number, username, avatar, new_user`,
         [number]
       );
+
       const user = userRows[0];
+
+      console.log('[VERIFY_OTP] User resolved', {
+        userId: user.id,
+        newUser: user.new_user,
+      });
 
       return { ok: true, user };
     });
 
-    // After COMMIT, decide the HTTP response based on the result
+    // ---- After COMMIT ----
     if (!result.ok) {
-      if (result.reason === 'no_active_otp') {
-        return res.status(400).json({ error: 'No active OTP or it expired' });
-      }
-      if (result.reason === 'too_many_attempts') {
-        return res.status(429).json({ error: 'Too many attempts' });
-      }
-      if (result.reason === 'invalid_code') {
-        return res.status(400).json({ error: 'Invalid code' });
-      }
-      return res.status(400).json({ error: 'Verification failed' });
+      console.warn('[VERIFY_OTP] Verification failed', result.reason);
+
+      const map = {
+        no_active_otp: [400, 'No active OTP or it expired'],
+        too_many_attempts: [429, 'Too many attempts'],
+        invalid_code: [400, 'Invalid code'],
+      };
+
+      const [status, message] = map[result.reason] || [400, 'Verification failed'];
+      return res.status(status).json({ error: message });
     }
 
-    // Issue token for success
-    console.log(secret)
-    console.log("user info: ", result.user)
-    const token = jwt.sign({ sub: result.user.id, number: result.user.number, username: result.user.username }, secret, { expiresIn: '30d' });
-    console.log("generated token: ",token)
+    console.log('[VERIFY_OTP] Issuing JWT', {
+      userId: result.user.id,
+      number: result.user.number,
+    });
+
+    const token = jwt.sign(
+      {
+        sub: result.user.id,
+        number: result.user.number,
+        username: result.user.username,
+      },
+      secret,
+      { expiresIn: '30d' }
+    );
+
+    console.log('[VERIFY_OTP] Token generated successfully');
+
     return res.json({
       token,
       user: {
@@ -177,7 +238,11 @@ router.post('/verify-otp', async (req, res) => {
       },
     });
   } catch (err) {
-    console.error(err);
+    console.error('[VERIFY_OTP] Fatal error', {
+      message: err.message,
+      stack: err.stack,
+    });
+
     return res.status(500).json({ error: 'verify failed' });
   }
 });
