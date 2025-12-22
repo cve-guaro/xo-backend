@@ -46,24 +46,37 @@ router.post('/request-otp', async (req, res) => {
     const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
     await withTx(async (client) => {
-      const user = await client.query(
-        `INSERT INTO users (number) VALUES ($1)
-         ON CONFLICT (number) DO NOTHING RETURNING *`,
-        [number]
-      );
-      await client.query(
-        `INSERT INTO wallets (user_id) VALUES ($1)
-         ON CONFLICT (user_id) DO NOTHING`,
-        [user.rows[0].id]
-      );
+      const userResult = await client.query(
+  `INSERT INTO users (number)
+   VALUES ($1)
+   ON CONFLICT (number) DO NOTHING
+   RETURNING id`,
+  [number]
+);
 
-      await client.query(
-        `INSERT INTO otps (number, code, expires_at)
-         VALUES ($1, $2, $3)`,
-        [number, code, expiresAt]
-      );
+let userId;
+
+if (userResult.rows.length > 0) {
+  // New user inserted
+  userId = userResult.rows[0].id;
+} else {
+  // User already exists → fetch it
+  const existingUser = await client.query(
+    `SELECT id FROM users WHERE number = $1`,
+    [number]
+  );
+  userId = existingUser.rows[0].id;
+}
+
+await client.query(
+  `INSERT INTO wallets (user_id)
+   VALUES ($1)
+   ON CONFLICT (user_id) DO NOTHING`,
+  [userId]
+);
+
     });
-
+     
     // send SMS here...
     return res.json({ ok: true, message: 'OTP sent' });
   } catch (err) {
