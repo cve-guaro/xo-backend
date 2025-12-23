@@ -16,38 +16,38 @@ function makeIdempotencyKey(prefix, userId, anchor) {
 // payments.service.js
 async function initDeposit({ userId, phoneNumber, amount, provider }) {
   return withTx(async (client) => {
-    try{
-    await client.query(SQL.ensureWallet, [userId]);
+    try {
+      await client.query(SQL.ensureWallet, [userId]);
 
-    // PENDING deposit, no idempotency needed here
-    const { rows } = await client.query(SQL.applyTx, [
-      userId,
-      "DEPOSIT",
-      Number(amount),
-      "PENDING",
-      crypto.randomUUID(), // internal only
-      "CHAPA",
-      null,
-      {},
-    ]);
+      // PENDING deposit, no idempotency needed here
+      const { rows } = await client.query(SQL.applyTx, [
+        userId,
+        "DEPOSIT",
+        Number(amount),
+        "PENDING",
+        crypto.randomUUID(), // internal only
+        "CHAPA",
+        null,
+        {},
+      ]);
 
-    const paymentData = rows[0]
+      const paymentData = rows[0]
 
-    const deposit = await initChapaDeposit(
+      const deposit = await initChapaDeposit(
         paymentData.tx_id,
         amount,
         phoneNumber,
         provider,
         'https://test.com',
         ''
-    )
+      )
 
-    const url = deposit.data.checkout_url || null
+      const url = deposit.data.checkout_url || null
 
-    return { txId: rows[0].tx_id,  checkout_url: url};
-}catch(err){
-    throw new Error("deposit failed");
-}
+      return { txId: rows[0].tx_id, checkout_url: url };
+    } catch (err) {
+      throw new Error("deposit failed");
+    }
   });
 }
 
@@ -82,29 +82,31 @@ async function completeDeposit(providerRef, provider) {
 
 // ----------- Prize / Won money (available + withdrawable) -----------
 async function creditPrize({ userId, amount, meta }) {
+  console.warn('prize called')
   const sourceRef = (meta && meta.sourceRef) || crypto.randomUUID();
   const idem = makeIdempotencyKey("PRIZE", userId, sourceRef);
 
   return withTx(async (client) => {
-    try{
-    await client.query(SQL.ensureWallet, [userId]);
+    try {
+      await client.query(SQL.ensureWallet, [userId]);
 
-    const { rows } = await client.query(SQL.applyTx, [
-      userId,
-      "PRIZE",
-      Number(amount),
-      "COMPLETED",
-      idem,
-      null,
-      sourceRef,
-      meta || {},
-    ]);
+      const { rows } = await client.query(SQL.applyTx, [
+        userId,
+        "PRIZE",
+        Number(amount),
+        "COMPLETED",
+        idem,
+        null,
+        sourceRef,
+        meta || {},
+      ]);
 
-    const walletRes = await client.query(SQL.getWallet, [userId]);
-    return { txId: rows[0].tx_id, wallet: walletRes.rows[0] };
-}catch(err){
-    throw new Error("crediting prize failed");
-}
+      const walletRes = await client.query(SQL.getWallet, [userId]);
+      console.warn('prize finished')
+      return { txId: rows[0].tx_id, wallet: walletRes.rows[0] };
+    } catch (err) {
+      throw new Error("crediting prize failed");
+    }
   });
 }
 
@@ -114,33 +116,33 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   const idem = makeIdempotencyKey("WREQ", userId, anchor);
 
   return withTx(async (client) => {
-    try{
-    await client.query(SQL.ensureWallet, [userId]);
+    try {
+      await client.query(SQL.ensureWallet, [userId]);
 
-    // Reserve funds right now (COMPLETED -> apply)
-    const txRes = await client.query(SQL.applyTx, [
-      userId,
-      "WITHDRAW_REQUEST",
-      Number(amount),
-      "COMPLETED",
-      idem,
-      null,
-      null,
-      { payoutMethod, payoutDestination },
-    ]);
+      // Reserve funds right now (COMPLETED -> apply)
+      const txRes = await client.query(SQL.applyTx, [
+        userId,
+        "WITHDRAW_REQUEST",
+        Number(amount),
+        "COMPLETED",
+        idem,
+        null,
+        null,
+        { payoutMethod, payoutDestination },
+      ]);
 
-    const reserveTxId = txRes.rows[0].tx_id;
-    const paymentData = txRes.rows[0]
+      const reserveTxId = txRes.rows[0].tx_id;
+      const paymentData = txRes.rows[0]
 
-    const reqRes = await client.query(SQL.createWithdrawRequest, [
-      userId,
-      Number(amount),
-      payoutMethod,
-      payoutDestination,
-      reserveTxId,
-    ]);
+      const reqRes = await client.query(SQL.createWithdrawRequest, [
+        userId,
+        Number(amount),
+        payoutMethod,
+        payoutDestination,
+        reserveTxId,
+      ]);
 
-    const withdraw = await initChapaPayout(
+      const withdraw = await initChapaPayout(
         paymentData.tx_id,
         amount,
         phoneNumber,
@@ -148,14 +150,14 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
         "xoet user",
         'https://test.com',
         ''
-    )
+      )
 
-    const walletRes = await client.query(SQL.getWallet, [userId]);
-    return { withdrawRequest: reqRes.rows[0], wallet: walletRes.rows[0] };
-}catch(err){
-    console.log(err)
-    throw new Error("withdraw failed");
-}
+      const walletRes = await client.query(SQL.getWallet, [userId]);
+      return { withdrawRequest: reqRes.rows[0], wallet: walletRes.rows[0] };
+    } catch (err) {
+      console.log(err)
+      throw new Error("withdraw failed");
+    }
   });
 }
 
