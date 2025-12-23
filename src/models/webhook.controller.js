@@ -30,7 +30,8 @@ async function handleWebhook(req, res) {
   try {
 
     const body = req.body;
-    const verify = verifyChapaWebhookSignature(req.headers, body, ('jNHpBla8CcJVile0ZtTngl4z'));
+    const verify = verifyChapaWebhookSignature(req.headers, body, 'jNHpBla8CcJVile0ZtTngl4z');
+    console.log(verify)
     if (!verify) return res.status(400).json("sig failed")
     const { event, providerRef } = parseProviderEvent(body);
     if (!event || !providerRef) {
