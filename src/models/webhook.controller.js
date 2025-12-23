@@ -13,26 +13,26 @@ function parseProviderEvent(body) {
 }
 
 function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
-    if (!secretKey) throw new Error("Missing CHAPA secret key");
+  if (!secretKey) throw new Error("Missing CHAPA secret key");
 
-    const sigA = headers["Chapa-Signature"];
-    const sigB = headers["x-chapa-signature"];
+  const sigA = headers["Chapa-Signature"];
+  const sigB = headers["x-chapa-signature"];
 
-    if (!sigA && !sigB) {
-        throw new Error("Missing chapa-signature and x-chapa-signature");
-    }
-    console.log(rawBodyBuffer)
-    const hash = crypto.createHmac('sha256', secretKey).update(secretKey).digest('hex');
-    console.log(hash, secretKey)
-    return (hash === sigB)
-  };
+  if (!sigA && !sigB) {
+    throw new Error("Missing chapa-signature and x-chapa-signature");
+  }
+  console.log(rawBodyBuffer)
+  const hash = crypto.createHmac('sha256', secretKey).update(secretKey).digest('hex');
+  console.log(hash, secretKey)
+  return (hash === sigA)
+};
 
 async function handleWebhook(req, res) {
   try {
-    
+
     const body = req.body;
     const verify = verifyChapaWebhookSignature(req.headers, body, ('jNHpBla8CcJVile0ZtTngl4z'));
-    if(!verify) return res.status(400).json("sig failed")
+    if (!verify) return res.status(400).json("sig failed")
     const { event, providerRef } = parseProviderEvent(body);
     if (!event || !providerRef) {
       return res.status(400).json({ detail: "Invalid webhook payload" });
