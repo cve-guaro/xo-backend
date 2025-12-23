@@ -105,6 +105,7 @@ async function creditPrize({ userId, amount, meta }) {
       console.warn('prize finished')
       return { txId: rows[0].tx_id, wallet: walletRes.rows[0] };
     } catch (err) {
+      console.warn(err)
       throw new Error("crediting prize failed");
     }
   });
