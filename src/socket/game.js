@@ -976,7 +976,7 @@ function setupGameSocket(io) {
         const { prize } = calculatePrize(game.betAmount); // use room-specific cut
 
         await finishAndPayout(matchId, opponentSymbol, winnerId, prize).catch(e => console.error(e));
-        if (game.sockets[opponentSymbol]) game.sockets[opponentSymbol].emit("opponent_forfeited");
+        if (game.sockets[opponentSymbol]) game.sockets[opponentSymbol].emit("opponent_forfeited", { prizeAmount: prize });
         io.to(matchId).emit("game_won", { winnerSymbol: opponentSymbol, winnerId, reason: "opponent_left", prizeAmount: prize });
         cleanupGame(matchId);
         if (typeof ack === "function") ack({ ok: true, data: { done: true } });
