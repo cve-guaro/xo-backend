@@ -15,7 +15,7 @@ function parseProviderEvent(body) {
 function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
   if (!secretKey) throw new Error("Missing CHAPA secret key");
 
-  const sigA = headers["Chapa-Signature"];
+  const sigA = headers["chapa-signature"];
   const sigB = headers["x-chapa-signature"];
 
   if (!sigA && !sigB) {
