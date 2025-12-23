@@ -21,9 +21,8 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
   if (!sigA && !sigB) {
     throw new Error("Missing chapa-signature and x-chapa-signature");
   }
-  console.log(rawBodyBuffer)
   const hash = crypto.createHmac('sha256', secretKey).update(secretKey).digest('hex');
-  console.log(hash, secretKey)
+  console.log(hash, secretKey, sigA)
   return (hash === sigA)
 };
 
