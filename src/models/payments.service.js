@@ -86,9 +86,9 @@ async function creditPrize({ userId, amount, meta }) {
   const sourceRef = (meta && meta.sourceRef) || crypto.randomUUID();
   const idem = makeIdempotencyKey("PRIZE", userId, sourceRef);
 
+  console.log(userId, amount)
   return withTx(async (client) => {
     try {
-      await client.query(SQL.ensureWallet, [userId]);
 
       const { rows } = await client.query(SQL.applyTx, [
         userId,
