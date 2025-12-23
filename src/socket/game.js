@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const { pool } = require("../db/index");
 const Redis = require("ioredis");
 require('dotenv').config();
+const {creditPrize} = require('../models/payments.service')
 
 // ---- Debug helpers -------------------------------------------------
 const DEBUG_MATCH = process.env.DEBUG_MATCH === "1" || process.env.NODE_ENV !== "production";
