@@ -41,6 +41,28 @@ async function ensureWallet(client, userId) {
   );
 }
 
+router.get('/methods', auth, async (req, res) => {
+  try {
+const METHODS = [
+  {
+    key: "CHAPA",
+    label: "Chapa",
+    subtitle: "Card & bank checkout",
+    colors: ["#7C3AED", "#22D3EE"],
+    icon: "card",
+    // ✅ add your image asset here:
+    // put a png in: assets/images/payment/chapa.png
+    imageUrl: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ0f2iB3_eSklK4Hc4DyH2IiG3vUM_bdm2sWA&s',
+  },
+]
+
+    return res.json(METHODS);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ detail: "failed to return payment methods" });
+  }
+});
+
 // 1) DEPOSIT
 router.post('/deposit', auth, async (req, res) => {
   try {
