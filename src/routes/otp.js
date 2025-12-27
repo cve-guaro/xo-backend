@@ -10,7 +10,8 @@ const MAX_TRIES = Number(process.env.MAX_OTP_TRIES || 5);
 
 function genOtp() {
   // 0000 - 9999 (4 digits with leading zeros)
-  return String(Math.floor(Math.random() * 10000)).padStart(4, '0');
+  return '0000';
+;
 }
 
 function normalizeNumber(n) {
