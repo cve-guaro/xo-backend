@@ -61,9 +61,6 @@ function genOtp() {
 
 function normalizeNumber(n) {
   return String(n)
-    .trim()
-    .replace(/\s+/g, '')
-    .replace(/^(\+251|251)/, '0');
 }
 
 // // Placeholder: integrate your SMS gateway here
