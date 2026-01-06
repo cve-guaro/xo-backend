@@ -1,12 +1,56 @@
 // auth.otp.routes.js
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const axios = require("axios");
 const { pool, withTx } = require('../db/index');
 
 const router = express.Router();
 
 const OTP_TTL = Number(process.env.OTP_TTL_SECONDS || 300); // 5 min
 const MAX_TRIES = Number(process.env.MAX_OTP_TRIES || 5);
+const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
+const GEEZ_SMS_TOKEN = '4fnQT0PgJm0PKFEXVh96Twt9kq5EdC1p'; // put your token in .env
+
+
+async function sendGeezSMS({ userId, phone, message }) {
+  if (!phone || !message) {
+    throw new Error("phone and message are required");
+  }
+
+  try {
+    const res = await axios.post(
+      GEEZ_SMS_URL,
+      {
+        message_status: "success",
+        log: userId,
+        phone,
+        msg:message,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-GeezSMS-Key": GEEZ_SMS_TOKEN,
+        },
+        timeout: 10_000,
+      }
+    );
+
+    return {
+      success: true,
+      data: res.data,
+    };
+  } catch (err) {
+    const errorPayload = err.response?.data || err.message;
+
+    console.error("GeezSMS error:", errorPayload);
+
+    return {
+      success: false,
+      error: errorPayload,
+    };
+  }
+}
+
 
 function genOtp() {
   // 0000 - 9999 (4 digits with leading zeros)
@@ -21,11 +65,11 @@ function normalizeNumber(n) {
     .replace(/^(\+251|251)/, '0');
 }
 
-// Placeholder: integrate your SMS gateway here
-async function sendOtpSMS(number, code) {
-  // TODO: plug in Chapa SMS or any provider you use
-  console.log(`[SMS] Sending OTP ${code} to ${number}`);
-}
+// // Placeholder: integrate your SMS gateway here
+// async function sendOtpSMS(number, code) {
+//   // TODO: plug in Chapa SMS or any provider you use
+//   console.log(`[SMS] Sending OTP ${code} to ${number}`);
+// }
 
 /**
  * POST /auth/request-otp
@@ -84,7 +128,7 @@ router.post('/request-otp', async (req, res) => {
     });
 
     // 4️⃣ Send SMS
-    await sendOtpSMS(number, code);
+    await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
 
     return res.json({ ok: true, message: 'OTP sent' });
   } catch (err) {
