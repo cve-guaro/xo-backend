@@ -2,6 +2,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const axios = require("axios");
+const crypto = require("crypto");
 const { pool, withTx } = require('../db/index');
 
 const router = express.Router();
@@ -53,9 +54,9 @@ async function sendGeezSMS({ userId, phone, message }) {
 
 
 function genOtp() {
-  // 0000 - 9999 (4 digits with leading zeros)
-  return '0000';
-;
+  // 0..9999 inclusive
+  const n = crypto.randomInt(0, 10000);
+  return String(n).padStart(4, "0");
 }
 
 function normalizeNumber(n) {
@@ -125,10 +126,10 @@ router.post('/request-otp', async (req, res) => {
          VALUES ($1, $2, now() + ($3 || ' seconds')::interval)`,
         [number, code, ttl]
       );
-    });
 
-    // 4️⃣ Send SMS
-    await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
+        // 4️⃣ Send SMS
+        await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
+    });
 
     return res.json({ ok: true, message: 'OTP sent' });
   } catch (err) {
