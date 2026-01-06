@@ -883,7 +883,7 @@ function setupGameSocket(io) {
 
       const userId = socket.data?.userId;
       if (!isValidMove(game, index, symbol) || game.players[symbol] !== userId) {
-        return socket.emit("error", { message: "Invalid move" });
+        return
       }
 
       game.board[index] = symbol;
