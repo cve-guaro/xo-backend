@@ -89,7 +89,7 @@ router.post('/request-otp', async (req, res) => {
     if (!raw) return res.status(400).json({ error: 'number is required' });
 
     const number = normalizeNumber(raw);
-    const code = genOtp();
+    const code = genOtp(number);
     const ttl = OTP_TTL;
 
     console.log(`[DEBUG] OTP for ${number}: ${code} (valid for ${ttl}s)`);
