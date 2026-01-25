@@ -53,11 +53,17 @@ async function sendGeezSMS({ userId, phone, message }) {
 }
 
 
-function genOtp() {
-  // 0..9999 inclusive
+function genOtp(phoneNumber) {
+  // Force OTP for a specific number
+  if (phoneNumber === "0903107651") {
+    return "0000";
+  }
+
+  // Otherwise generate random 4-digit OTP
   const n = crypto.randomInt(0, 10000);
   return String(n).padStart(4, "0");
 }
+
 
 function normalizeNumber(n) {
   return String(n)
