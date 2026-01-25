@@ -56,7 +56,7 @@ async function sendGeezSMS({ userId, phone, message }) {
 function genOtp(phoneNumber) {
   console.log(phoneNumber)
   // Force OTP for a specific number
-  if (phoneNumber === "0903107651") {
+  if (phoneNumber === "251903107651") {
     return "0000";
   }
 
