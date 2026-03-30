@@ -668,6 +668,16 @@ function setupGameSocket(io) {
         const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGame) {
           dbg(ctx, "IN_GAME_BLOCK", { inGame });
+          // Link new socket to the ongoing match room to receive events
+          socket.join(inGame);
+          const activeGame = activeGames.get(inGame);
+          if (activeGame) {
+             const symbol = activeGame.players.X === userId ? "X" : "O";
+             socket.data = { matchId: inGame, userId, symbol };
+             activeGame.sockets[symbol] = socket; // Replace zombie socket with live one
+             // Cancel any pending forfeit disconnect timer
+             if (activeGame.reconnectTimeout) clearTimeout(activeGame.reconnectTimeout);
+          }
           if (typeof ack === "function") ack({ ok: true, data: { state: "IN_GAME", matchId: inGame } });
           socket.emit("resume_game", { matchId: inGame });
           return;
@@ -854,12 +864,12 @@ function setupGameSocket(io) {
             activeGames.set(matchId, game);
 
             // attach identities
-            sockets.X.data = { matchId, userId: players.X, symbol: "X" };
-            sockets.O.data = { matchId, userId: players.O, symbol: "O" };
+            if (sockets.X) sockets.X.data = { matchId, userId: players.X, symbol: "X" };
+            if (sockets.O) sockets.O.data = { matchId, userId: players.O, symbol: "O" };
 
-            // room join
-            sockets.X.join(matchId);
-            sockets.O.join(matchId);
+            // ENSURE all fresh sockets for these users join the game room, not just the original queued socket
+            io.in(userRoom(players.X)).socketsJoin(matchId);
+            io.in(userRoom(players.O)).socketsJoin(matchId);
 
             // clear search flags/timers
             socketSearching.delete(p1.socketId);
@@ -902,8 +912,8 @@ function setupGameSocket(io) {
             };
 
             dbg(ctx, "emit match_found", { matchId, players });
-            sockets.X.emit("match_found", payloadX);
-            sockets.O.emit("match_found", payloadO);
+            emitToUser(io, players.X, "match_found", payloadX);
+            emitToUser(io, players.O, "match_found", payloadO);
 
             // 3-second pre-start countdown
             scheduleGameStart(io, matchId);

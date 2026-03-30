@@ -614,7 +614,10 @@ router.get('/game-logs', async (req, res) => {
 
     const { rows } = await pool.query(`
       SELECT
-        g.id, g.bet_amount, g.status, g.winner, g.created_at, g.finished_at, g.moves,
+        g.id, g.bet_amount, g.status, g.created_at, g.finished_at, g.moves,
+        g.winner    AS winner_id,
+        g.player_x  AS player_x_id,
+        g.player_o  AS player_o_id,
         px.username AS player_x_name, px.number AS player_x_number,
         po.username AS player_o_name, po.number AS player_o_number
       FROM games g

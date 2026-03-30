@@ -23,7 +23,7 @@ const server = http.createServer(app);
 // Must be FIRST, before any routes or other middleware.
 const corsOptions = {
   origin: "*",
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-access-token"],
   credentials: false,
 };
