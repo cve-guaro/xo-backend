@@ -19,16 +19,10 @@ const { setupGameSocket } = require('./socket/game');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { 
-    cors: { 
-        origin: '*',
-        methods: ["GET", "POST"]
-    } 
+  cors: { origin: "*" }
 });
 
-app.use(cors({
-    origin: "*", // You can lock this to your Vercel URL later
-    methods: ["GET", "POST", "PUT", "DELETE"]
-}));
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use('/payments', payments);
 // Health
