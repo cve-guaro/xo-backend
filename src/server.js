@@ -18,15 +18,31 @@ const { setupGameSocket } = require('./socket/game');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { 
+
+// ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
+// Must be FIRST, before any routes or other middleware.
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-access-token"],
+  credentials: false,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests globally
+
+// ─── SOCKET.IO ─────────────────────────────────────────────────────────────────
+const io = new Server(server, {
   cors: { origin: "*" }
 });
 
-app.use(cors({ origin: "*" }));
+// ─── BODY PARSERS ──────────────────────────────────────────────────────────────
 app.use(express.json());
+
+// ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() }));
+
+// ─── ROUTES ────────────────────────────────────────────────────────────────────
 app.use('/payments', payments);
-// Health
-app.get('/health', (_, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use("/api/transactions", txRoutes);
 app.use("/webhook/:provider", bodyParser.raw({ type: "*/*" }));
@@ -35,56 +51,8 @@ app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
 
-// app.post("/webhook/:provider", async (req, res) => {
-//   try {
-//     const providerCode = req.params.provider;
-//     const rawBody = req.body; // Buffer
-//     const payload = rawBody
-//     console.log("Received webhook:", providerCode, payload);
-
-//     // Map the provider payload → internal fields
-//     const mapPayload = (p) => ({
-//       providerEventId: p.id || p.eventId,
-//       eventType: p.type,
-//       providerExtId: p.data?.reference || 'test_id',
-//       newStatus: mapProviderStatus(p.data?.status),
-//       metadata: { raw: p },
-//     });
-//     console.log("Mapped webhook payload:");
-
-//     function mapProviderStatus(s) {
-//       switch (String(s || "").toLowerCase()) {
-//         case "pending":
-//         case "processing": return "pending";
-//         case "authorized": return "authorized";
-//         case "success":
-//         case "succeeded":
-//         case "paid":       return "succeeded";
-//         case "failed":
-//         case "error":      return "failed";
-//         case "canceled":
-//         case "cancelled":  return "canceled";
-//         case "refunded":   return "refunded";
-//         default:           return null;
-//       }
-//     }
-
-//     const result = await recordAndProcessWebhook({
-//       providerCode,
-//       rawBody,
-//       headers: req.headers,
-//       payload,
-//       mapPayload,
-//       signatureHeaderName: "x-signature", // change per provider
-//     });
-
-//     res.status(200).json({ ok: true, result });
-//   } catch (err) {
-//     res.status(400).json({ ok: false, error: err.message });
-//   }
-// });
-
+// ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
 
 const PORT = process.env.PORT || 9000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
