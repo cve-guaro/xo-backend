@@ -1,7 +1,8 @@
 const { body } = require("express-validator");
 const { completeDeposit } = require("./payments.service.js");
+const { CHAPA } = require("../env.js");
 require('dotenv').config();
-const crypto = require('crypto')
+const crypto = require('crypto');
 
 // Map provider payload -> { eventType, userId, amount, providerRef }
 function parseProviderEvent(body) {
@@ -31,7 +32,7 @@ async function handleWebhook(req, res) {
   try {
     console.log(req.headers)
     const body = req.body;
-    const verify = verifyChapaWebhookSignature(req.headers, body, 'jNHpBla8CcJVile0ZtTngl4z');
+    const verify = verifyChapaWebhookSignature(req.headers, body, CHAPA.secret);
     console.log(verify)
     if (!verify) return res.status(400).json("sig failed")
     const { event, providerRef } = parseProviderEvent(body);

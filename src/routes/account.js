@@ -74,10 +74,16 @@ router.post('/history', auth, async (req, res) => {
     const limit = parseInt(req.body.limit, 10) || 50;
 
     const query = `
-      SELECT id, bet_amount, winner, status, created_at, finished_at, moves, (player_x, player_o) as players
-      FROM games
-      WHERE player_x = $1 OR player_o = $1
-      ORDER BY created_at DESC
+      SELECT 
+        g.id, g.bet_amount, g.winner, g.status, g.created_at, g.finished_at, g.moves, 
+        (g.player_x, g.player_o) as players,
+        ux.username as px_name, uo.username as po_name,
+        ux.number as px_num, uo.number as po_num
+      FROM games g
+      LEFT JOIN users ux ON g.player_x = ux.id
+      LEFT JOIN users uo ON g.player_o = uo.id
+      WHERE g.player_x = $1 OR g.player_o = $1
+      ORDER BY g.created_at DESC
       LIMIT $2;
     `;
     const values = [userId, limit];

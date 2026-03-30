@@ -10,15 +10,25 @@ const payments = require('./routes/payment');
 const userRoutes = require('./routes/user');
 const accountRoutes = require('./routes/account');
 const otpAuthRoutes = require('./routes/otp');
+const adminRoutes = require('./routes/admin');
 
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
 
+
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { 
+    cors: { 
+        origin: '*',
+        methods: ["GET", "POST"]
+    } 
+});
 
-app.use(cors());
+app.use(cors({
+    origin: "*", // You can lock this to your Vercel URL later
+    methods: ["GET", "POST", "PUT", "DELETE"]
+}));
 app.use(express.json());
 app.use('/payments', payments);
 // Health
@@ -29,6 +39,8 @@ app.use("/webhook/:provider", bodyParser.raw({ type: "*/*" }));
 app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
+app.use('/admin', adminRoutes);
+
 // app.post("/webhook/:provider", async (req, res) => {
 //   try {
 //     const providerCode = req.params.provider;

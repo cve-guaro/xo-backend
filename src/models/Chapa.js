@@ -1,14 +1,18 @@
 // chapa.js
 const crypto = require('crypto');
 const { Readable } = require('stream');
+const { CHAPA } = require('../env'); // Import CHAPA config
 
 const CHAPA_BASE = 'https://api.chapa.co/v1';
 
 async function chapaFetch(path, method, bodyJson, secretKey) {
+  // Use passed key or fallback to env
+  const authKey = secretKey || CHAPA.secret; 
+  
   const res = await fetch(`${CHAPA_BASE}${path}`, {
     method,
     headers: {
-      'Authorization': `Bearer CHASECK-gn0RFezIBSCzmMnZyrb2rGgTCfQCLBVy`,
+      'Authorization': `Bearer ${authKey}`,
       'Content-Type': 'application/json',
     },
     body: bodyJson ? JSON.stringify(bodyJson) : undefined,

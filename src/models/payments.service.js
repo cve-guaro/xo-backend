@@ -19,11 +19,13 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
     try {
       await client.query(SQL.ensureWallet, [userId]);
 
+      const amountCents = Math.round(Number(amount) * 100);
+
       // PENDING deposit, no idempotency needed here
       const { rows } = await client.query(SQL.applyTx, [
         userId,
         "DEPOSIT",
-        Number(amount),
+        amountCents,
         "PENDING",
         crypto.randomUUID(), // internal only
         "CHAPA",
@@ -120,11 +122,13 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     try {
       await client.query(SQL.ensureWallet, [userId]);
 
+      const amountCents = Math.round(Number(amount) * 100);
+
       // Reserve funds right now (COMPLETED -> apply)
       const txRes = await client.query(SQL.applyTx, [
         userId,
         "WITHDRAW_REQUEST",
-        Number(amount),
+        amountCents,
         "COMPLETED",
         idem,
         null,
@@ -137,7 +141,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
 
       const reqRes = await client.query(SQL.createWithdrawRequest, [
         userId,
-        Number(amount),
+        amountCents,
         payoutMethod,
         payoutDestination,
         reserveTxId,

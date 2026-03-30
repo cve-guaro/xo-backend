@@ -34,15 +34,15 @@ const ROOMS_CONFIG = {
     name: "Room 2 - Intermediate",
     betRange: [100, 250, 500, 999], // Valid bet amounts for this room
     houseCutPercent: 15, // 15% cut
-    timerDuration: 25, // 20 seconds per turn
-    description: "Medium bets - 15% house cut - 20s timer"
+    timerDuration: 30, // 30 seconds per turn
+    description: "Medium bets - 15% house cut - 30s timer"
   },
   3: {
     name: "Room 3 - Advanced",
     betRange: [1000, 2500, 5000, 7500, 10000], // Base bet amounts
     houseCutPercent: 10, // 10% cut
-    timerDuration: 20, // 15 seconds per turn
-    description: "Large bets - 10% house cut - 15s timer"
+    timerDuration: 30, // 30 seconds per turn
+    description: "Large bets - 10% house cut - 30s timer"
   }
 };
 
@@ -435,30 +435,53 @@ function clearQueueTimeout(socketId) {
 async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
   return tx(async (client) => {
     const ids = [playerXId, playerOId];
-    await client.query(
-      `SELECT user_id, available_balance FROM wallets WHERE user_id = ANY($1::uuid[]) FOR UPDATE`,
+
+    // Lock both wallet rows
+    const walletRes = await client.query(
+      `SELECT user_id, available_balance, bonus_balance FROM wallets WHERE user_id = ANY($1::uuid[]) FOR UPDATE`,
       [ids]
     );
 
-    const updRes = await client.query(
-      `UPDATE wallets
-         SET available_balance = available_balance - $1
-       WHERE user_id = ANY($2::uuid[])
-         AND available_balance >= $1
-       RETURNING user_id`,
-      [betAmount, ids]
-    );
+    if (walletRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
 
-    const updateWithdrawableRes = await client.query(
-      `UPDATE wallets
-          SET withdrawable_balance = withdrawable_balance - $1
-        WHERE user_id = ANY($2::uuid[])
-          AND withdrawable_balance >= $1
-        RETURNING user_id`,
-      [betAmount, ids]
-    );
+    // For each player, apply bonus-first deduction
+    for (const wallet of walletRes.rows) {
+      const avail = Number(wallet.available_balance);
+      const bonus = Number(wallet.bonus_balance);
+      const userId = wallet.user_id;
 
-    if (updRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
+      const bonusToUse = Math.min(bonus, betAmount);
+      const availToUse = betAmount - bonusToUse;
+
+      if (avail < availToUse) throw new Error("INSUFFICIENT_BALANCE");
+
+      if (bonusToUse > 0 && availToUse > 0) {
+        // Use partial bonus + some available
+        await client.query(
+          `UPDATE wallets
+             SET bonus_balance      = bonus_balance      - $1,
+                 available_balance  = available_balance  - $2,
+                 withdrawable_balance = GREATEST(withdrawable_balance - $2, 0)
+           WHERE user_id = $3`,
+          [bonusToUse, availToUse, userId]
+        );
+      } else if (bonusToUse >= betAmount) {
+        // Entire bet covered by bonus
+        await client.query(
+          `UPDATE wallets SET bonus_balance = bonus_balance - $1 WHERE user_id = $2`,
+          [betAmount, userId]
+        );
+      } else {
+        // No bonus — deduct entirely from available (original behaviour)
+        await client.query(
+          `UPDATE wallets
+             SET available_balance    = available_balance    - $1,
+                 withdrawable_balance = GREATEST(withdrawable_balance - $1, 0)
+           WHERE user_id = $2`,
+          [betAmount, userId]
+        );
+      }
+    }
 
     await client.query(
       `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at)
@@ -478,14 +501,41 @@ async function saveMove(gameId, moveObj) {
 
 async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
   return tx(async (client) => {
+    // Get game details to determine room
+    const gameRes = await client.query(`SELECT bet_amount, player_x, player_o FROM games WHERE id = $1`, [gameId]);
+    const game = gameRes.rows[0];
+
     await client.query(
       `UPDATE games SET status = $1, winner = $2, finished_at = NOW() WHERE id = $3`,
       [status, winnerUserId || null, gameId]
     );
+
     if (winnerUserId) {
       creditPrize({
         userId: winnerUserId, amount: prizeAmount, meta: { gameid: gameId }
-      })
+      });
+
+      // Track room_1_wins for the winner (Room 1 bets: 10, 25, 50, 99 ETB)
+      if (game && ROOMS_CONFIG[1].betRange.includes(Number(game.bet_amount))) {
+        const bet = Number(game.bet_amount);
+        let tierCol = "";
+        if (bet === 10) tierCol = "r1_10_wins";
+        else if (bet === 25) tierCol = "r1_25_wins";
+        else if (bet === 50) tierCol = "r1_50_wins";
+        else if (bet === 99) tierCol = "r1_99_wins";
+
+        await client.query(
+          `UPDATE users SET room_1_wins = room_1_wins + 1${tierCol ? `, ${tierCol} = ${tierCol} + 1` : ''} WHERE id = $1`,
+          [winnerUserId]
+        ).catch(err => console.error('[game] room_1_wins increment error:', err));
+      }
+    } else if (status === "draw") {
+      // Refund the initial bet to both players if the game is a draw
+      await client.query(`
+        UPDATE wallets 
+        SET available_balance = available_balance + $1, updated_at = NOW()
+        WHERE user_id IN ($2, $3)
+      `, [game.bet_amount, game.player_x, game.player_o]);
     }
   });
 }
@@ -623,15 +673,36 @@ function setupGameSocket(io) {
           return;
         }
 
-        // pre-queue balance check
-        const balRes = await pool.query(`SELECT available_balance FROM wallets WHERE user_id = $1`, [userId]);
+        // Room 1 stake-lock check: tier-specific locks after 25 wins
+        if (roomNumber === 1 && ROOMS_CONFIG[1].betRange.includes(Number(betAmount))) {
+          const betNum = Number(betAmount);
+          const colMap = { 10: 'r1_10_wins', 25: 'r1_25_wins', 50: 'r1_50_wins', 99: 'r1_99_wins' };
+          const col = colMap[betNum];
+          
+          if (col) {
+            const lockRes = await pool.query(`SELECT ${col} FROM users WHERE id = $1`, [userId]).catch(() => ({ rows: [] }));
+            const wins = Number(lockRes.rows?.[0]?.[col] ?? 0);
+            if (wins >= 25) {
+              dbg(ctx, "STAKE_LOCKED", { userId, betAmount, wins });
+              if (typeof ack === "function") ack({ ok: true, data: { state: "STAKE_LOCKED", betAmount, wins } });
+              socket.emit("error", { code: "STAKE_LOCKED", message: `Stake ${betAmount / 100} ETB is locked after 25 wins. Try a different stake amount.` });
+              return;
+            }
+          }
+        }
+
+        // pre-queue balance check (bonus_balance + available_balance must cover betAmount)
+        const balRes = await pool.query(`SELECT available_balance, COALESCE(bonus_balance, 0) AS bonus_balance FROM wallets WHERE user_id = $1`, [userId]);
         const avail = Number(balRes.rows?.[0]?.available_balance ?? 0);
-        dbg(ctx, "prequeue balance", { avail, required: betAmount });
-        if (!balRes.rows.length || avail < betAmount) {
+        const bonus = Number(balRes.rows?.[0]?.bonus_balance ?? 0);
+        const effectiveBalance = avail + bonus;
+        dbg(ctx, "prequeue balance", { avail, bonus, effectiveBalance, required: betAmount });
+        if (!balRes.rows.length || effectiveBalance < betAmount) {
           if (typeof ack === "function") ack({ ok: true, data: { state: "INSUFFICIENT_BALANCE" } });
           socket.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" });
           return;
         }
+
 
         const queueKey = `queue:${betAmount}`;
         await redis.sadd(MM_QUEUES_SET, queueKey).catch(() => { });
