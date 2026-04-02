@@ -136,7 +136,7 @@ router.get('/transactions', auth, async (req, res) => {
         created_at
       FROM payment_transactions
       WHERE user_id = $1
-        AND type IN ('deposit', 'withdrawal')
+        AND (LOWER(type) IN ('deposit', 'withdrawal', 'withdraw_request'))
         AND (bank IS NULL OR bank != 'PRIZE')
       ORDER BY created_at DESC
       LIMIT 100
@@ -148,7 +148,7 @@ router.get('/transactions', auth, async (req, res) => {
         id: tx.id,
         type: tx.type,
         amount: Number(tx.amount),
-        status: tx.status,
+        status: tx.status?.toLowerCase() || 'pending',
         method: tx.bank || 'Chapa',
         ref: tx.tx_ref,
         createdAt: tx.created_at,
