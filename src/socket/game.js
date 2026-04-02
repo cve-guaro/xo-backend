@@ -28,21 +28,21 @@ const ROOMS_CONFIG = {
     betRange: [10, 25, 50, 99], // Valid bet amounts for this room
     houseCutPercent: 20, // 20% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Small bets - 20% house cut - 30s timer"
+    description: "Small bets - 40% total (20% each) - 30s timer"
   },
   2: {
     name: "Room 2 - Intermediate",
     betRange: [100, 250, 500, 999], // Valid bet amounts for this room
     houseCutPercent: 15, // 15% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Medium bets - 15% house cut - 30s timer"
+    description: "Medium bets - 30% total (15% each) - 30s timer"
   },
   3: {
     name: "Room 3 - Advanced",
     betRange: [1000, 2500, 5000, 7500, 10000], // Base bet amounts
     houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Large bets - 10% house cut - 30s timer"
+    description: "Large bets - 20% total (10% each) - 30s timer"
   }
 };
 
@@ -79,7 +79,8 @@ function calculatePrize(betAmount) {
   const totalPot = betAmount * 2;
 
   // Determine which room this bet belongs to
-  const roomNumber = determineRoomByBetAmount(betAmount);
+  const betBirr = Number(betAmount);
+  const roomNumber = determineRoomByBetAmount(betBirr);
 
   if (!roomNumber) {
     // Fallback to original tiered logic if room not found
@@ -98,6 +99,8 @@ function calculatePrize(betAmount) {
   const roomConfig = ROOMS_CONFIG[roomNumber];
   const pct = roomConfig.houseCutPercent;
   const prize = Math.floor(totalPot * (1 - pct / 100));
+
+  console.log(`[FINANCE] calculatePrize: room=${roomNumber} bet=${betAmount} pot=${totalPot} pct=${pct} prize=${prize}`);
 
   return {
     prize,
@@ -507,36 +510,47 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
 
     await client.query(
       `UPDATE games SET status = $1, winner = $2, finished_at = NOW() WHERE id = $3`,
-      [status, winnerUserId || null, gameId]
+      [status === 'X' || status === 'O' ? 'completed' : status, winnerUserId || null, gameId]
     );
 
     if (winnerUserId) {
-      creditPrize({
-        userId: winnerUserId, amount: prizeAmount, meta: { gameid: gameId }
-      });
+      // Direct wallet update — MUST succeed before ledger
+      await client.query(`
+        UPDATE wallets 
+        SET available_balance = available_balance + $1,
+            withdrawable_balance = withdrawable_balance + $1,
+            updated_at = NOW()
+        WHERE user_id = $2
+      `, [prizeAmount, winnerUserId]);
+
+      // Ledger record — non-critical; do NOT let this roll back the wallet credit! Use pool.query so it's a separate transaction.
+      await pool.query(`
+        INSERT INTO payment_transactions (id, user_id, type, status, amount, bank, tx_ref, provider_payload)
+        VALUES (gen_random_uuid(), $1, 'deposit', 'success', $2, 'PRIZE', $3, $4::jsonb)
+      `, [winnerUserId, prizeAmount, 'game-' + gameId + '-' + Date.now(), JSON.stringify({ gameId })]
+      ).catch(err => console.error('[finishAndPayout] ledger insert failed (non-fatal):', err));
+
+      // Update global wins for winner and losses for opponent - REMOVED since wins/losses are dynamically calculated
+      const loserUserId = (winnerUserId === game.player_x) ? game.player_o : game.player_x;
 
       // Track room_1_wins for the winner (Room 1 bets: 10, 25, 50, 99 ETB)
-      if (game && ROOMS_CONFIG[1].betRange.includes(Number(game.bet_amount))) {
-        const bet = Number(game.bet_amount);
+      const betBirr = game ? Math.round(Number(game.bet_amount)) : 0;
+      if (game && ROOMS_CONFIG[1].betRange.includes(betBirr)) {
         let tierCol = "";
-        if (bet === 10) tierCol = "r1_10_wins";
-        else if (bet === 25) tierCol = "r1_25_wins";
-        else if (bet === 50) tierCol = "r1_50_wins";
-        else if (bet === 99) tierCol = "r1_99_wins";
+        if (betBirr === 10) tierCol = "r1_10_wins";
+        else if (betBirr === 25) tierCol = "r1_25_wins";
+        else if (betBirr === 50) tierCol = "r1_50_wins";
+        else if (betBirr === 99) tierCol = "r1_99_wins";
 
         await client.query(
           `UPDATE users SET room_1_wins = room_1_wins + 1${tierCol ? `, ${tierCol} = ${tierCol} + 1` : ''} WHERE id = $1`,
           [winnerUserId]
         ).catch(err => console.error('[game] room_1_wins increment error:', err));
+        
+        console.log(`[ACHIEVEMENT] Room 1 win recorded: User=${winnerUserId} Bet=${game.bet_amount} Birr=${betBirr} Tier=${tierCol}`);
       }
-    } else if (status === "draw") {
-      // Refund the initial bet to both players if the game is a draw
-      await client.query(`
-        UPDATE wallets 
-        SET available_balance = available_balance + $1, updated_at = NOW()
-        WHERE user_id IN ($2, $3)
-      `, [game.bet_amount, game.player_x, game.player_o]);
     }
+    // No draw payouts — winner takes all, game always continues until a winner
   });
 }
 
@@ -605,13 +619,19 @@ function startTimer(io, matchId) {
     io.to(matchId).emit("timer_update", { timers: g.timers });
     if (g.timers[g.turn] <= 0) {
       clearInterval(g.timerInterval);
-      const winnerSymbol = g.turn === "X" ? "O" : "X";
+      const loserSymbol = g.turn;
+      const winnerSymbol = (loserSymbol === "X" ? "O" : "X");
       const winnerId = g.players[winnerSymbol];
+      
       const { prize } = calculatePrize(g.betAmount); // use room-specific cut
-      finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
-        console.error("finishAndPayout timeout err:", err)
-      );
-      io.to(matchId).emit("game_won", { winnerSymbol, winnerId, reason: "timeout", prizeAmount: prize });
+      const prizeBirr = Number(prize); // TRANSLATOR: Send Birr
+      
+      if (winnerId) {
+        finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
+          console.error("finishAndPayout win err:", err)
+        );
+        io.to(matchId).emit("game_won", { winnerSymbol, winnerId, reason: "win", prizeAmount: prizeBirr });
+      }
       cleanupGame(matchId);
     }
   }, 1000);
@@ -636,18 +656,19 @@ function setupGameSocket(io) {
     socket.on("find_match", async ({ token, betAmount }, ack) => {
       const rid = shortId();
       let userId = null;
-      console.log("find_match called with token: ", token, " and betAmount: ", betAmount);
-      logAlways(`ENTER find_match rid=${rid} sid=${socket.id} bet=${betAmount}`);
+      
+      const platform = (socket.handshake.headers['x-platform'] || '').toLowerCase();
+      const isWeb = platform === 'web';
+
+      console.log("find_match called with token:", token, "betAmount:", betAmount, "platform:", platform);
+      logAlways(`ENTER find_match rid=${rid} sid=${socket.id} bet=${betAmount} platform=${platform}`);
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.sub;
         rememberUser(userId);
         rememberUserSocket(socket, userId); // track user online
         const username = decoded.username || "";
-        const ctx = `rid=${rid} sid=${socket.id} uid=${userId} bet=${betAmount}`;
-        dbg(ctx, "verified token");
-
-        // Validate bet amount against rooms
+        // After validation → Normalize and store as cents internally
         const roomNumber = determineRoomByBetAmount(betAmount);
         if (!roomNumber) {
           const validBets = [
@@ -663,6 +684,23 @@ function setupGameSocket(io) {
           });
           return;
         }
+
+        // --- PLATFORM TIMER LOGIC ---
+        let timerDuration = 30; // Default
+        if (isWeb) {
+          timerDuration = 30; // Web is always 30s
+        } else {
+          // Mobile tiered: R1=30, R2=25, R3=20
+          if (roomNumber === 1) timerDuration = 30;
+          else if (roomNumber === 2) timerDuration = 25;
+          else if (roomNumber === 3) timerDuration = 20;
+        }
+
+        // --- TRANSLATOR: Convert Birr to Cents for DB/Logic ---
+        const betAmountCents = Math.round(Number(betAmount));
+        
+        const ctx = `rid=${rid} sid=${socket.id} uid=${userId} bet=${betAmountCents} isWeb=${isWeb}`;
+        dbg(ctx, "verified token and room");
 
         // already in a game? -> NON-ERROR resume
         const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
@@ -695,7 +733,7 @@ function setupGameSocket(io) {
             if (wins >= 25) {
               dbg(ctx, "STAKE_LOCKED", { userId, betAmount, wins });
               if (typeof ack === "function") ack({ ok: true, data: { state: "STAKE_LOCKED", betAmount, wins } });
-              socket.emit("error", { code: "STAKE_LOCKED", message: `Stake ${betAmount / 100} ETB is locked after 25 wins. Try a different stake amount.` });
+              socket.emit("error", { code: "STAKE_LOCKED", message: `Stake ${betAmountCents} ETB is locked after 25 wins. Try a different stake amount.` });
               return;
             }
           }
@@ -706,15 +744,15 @@ function setupGameSocket(io) {
         const avail = Number(balRes.rows?.[0]?.available_balance ?? 0);
         const bonus = Number(balRes.rows?.[0]?.bonus_balance ?? 0);
         const effectiveBalance = avail + bonus;
-        dbg(ctx, "prequeue balance", { avail, bonus, effectiveBalance, required: betAmount });
-        if (!balRes.rows.length || effectiveBalance < betAmount) {
+        dbg(ctx, "prequeue balance", { avail, bonus, effectiveBalance, required: betAmountCents });
+        if (!balRes.rows.length || effectiveBalance < betAmountCents) {
           if (typeof ack === "function") ack({ ok: true, data: { state: "INSUFFICIENT_BALANCE" } });
           socket.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" });
           return;
         }
 
 
-        const queueKey = `queue:${betAmount}`;
+        const queueKey = `queue:${betAmountCents}`;
         await redis.sadd(MM_QUEUES_SET, queueKey).catch(() => { });
         dbg(ctx, "queueKey", queueKey);
 
@@ -737,9 +775,9 @@ function setupGameSocket(io) {
           socketId: socket.id,
           joinedAt: Date.now(),
           rid,
-          betAmount,
+          betAmount: betAmountCents,
           room: roomNumber,
-          timerDuration: ROOMS_CONFIG[roomNumber].timerDuration
+          timerDuration: timerDuration
         };
         await redis.rpush(queueKey, JSON.stringify(entry));
         socketSearching.set(socket.id, queueKey);
@@ -748,8 +786,8 @@ function setupGameSocket(io) {
           searching: true,
           room: roomNumber,
           roomName: ROOMS_CONFIG[roomNumber].name,
-          betAmount,
-          timerDuration: ROOMS_CONFIG[roomNumber].timerDuration,
+          betAmount: betAmountCents,
+          timerDuration: timerDuration,
           houseCutPercent: ROOMS_CONFIG[roomNumber].houseCutPercent
         });
         emitDebug(socket, "queued", { queueKey, entry });
@@ -761,8 +799,8 @@ function setupGameSocket(io) {
             ttlMs: QUEUE_TTL,
             room: roomNumber,
             roomName: ROOMS_CONFIG[roomNumber].name,
-            betAmount,
-            timerDuration: ROOMS_CONFIG[roomNumber].timerDuration,
+            betAmount: betAmountCents,
+            timerDuration: timerDuration,
             houseCutPercent: ROOMS_CONFIG[roomNumber].houseCutPercent
           }
         });
@@ -814,7 +852,7 @@ function setupGameSocket(io) {
             dbg(ctx, "lockAndStartMatch: try", { matchId, p1: p1.userId, p2: p2.userId });
 
             try {
-              await lockAndStartMatch(matchId, p1.userId, p2.userId, betAmount);
+              await lockAndStartMatch(matchId, p1.userId, p2.userId, betAmountCents);
               dbg(ctx, "lockAndStartMatch: OK", { matchId });
             } catch (e) {
               dbg(ctx, "lockAndStartMatch: FAIL", String(e));
@@ -843,9 +881,7 @@ function setupGameSocket(io) {
             const players = { X: p1.userId, O: p2.userId };
             const sockets = { X: s1, O: s2 };
 
-            // Get room configuration
-            const roomNumber = determineRoomByBetAmount(betAmount);
-            const initialTimer = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
+            const initialTimer = timerDuration;
 
             const game = {
               id: matchId,
@@ -854,12 +890,13 @@ function setupGameSocket(io) {
               players,
               sockets,
               timers: { X: initialTimer, O: initialTimer },
-              betAmount,
+              betAmount: betAmountCents,
               room: roomNumber,
               timerInterval: null,
               reconnectTimeout: null,
               startTimeout: null,
               status: "countdown", // will start after 3s
+              round: 1, // track rounds for history display
             };
             activeGames.set(matchId, game);
 
@@ -883,15 +920,24 @@ function setupGameSocket(io) {
             await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
             await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
 
-            // payloads with room info
+            // payloads with room info — fetch real usernames to avoid UUID display
+            const nameRes = await pool.query(
+              `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
+              [[players.X, players.O]]
+            ).catch(() => ({ rows: [] }));
+            const nameMap = new Map(nameRes.rows.map(r => [String(r.id), r.display_name]));
+            const nameX = nameMap.get(String(players.X)) || p1.username || players.X.slice(0, 8);
+            const nameO = nameMap.get(String(players.O)) || p2.username || players.O.slice(0, 8);
+
             const payloadX = {
               matchId,
               youAre: "X",
               symbol: "X",
               opponentId: players.O,
+              opponentUsername: nameO,
               opponentSymbol: "O",
               players,
-              betAmount,
+              betAmount: Number(betAmountCents), // TRANSLATOR: Send Birr to client
               room: roomNumber,
               roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
               timerDuration: initialTimer,
@@ -902,9 +948,10 @@ function setupGameSocket(io) {
               youAre: "O",
               symbol: "O",
               opponentId: players.X,
+              opponentUsername: nameX,
               opponentSymbol: "X",
               players,
-              betAmount,
+              betAmount: Number(betAmountCents), // TRANSLATOR: Send Birr to client
               room: roomNumber,
               roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
               timerDuration: initialTimer,
@@ -982,16 +1029,18 @@ function setupGameSocket(io) {
       if (checkWin(game.board, symbol)) {
         clearInterval(game.timerInterval);
         const { prize } = calculatePrize(game.betAmount); // use room-specific cut
+        const prizeBirr = Number(prize); // TRANSLATOR: Send Birr to client
         finishAndPayout(matchId, symbol, userId, prize).catch(err =>
           console.error("finishAndPayout win err:", err)
         );
-        io.to(matchId).emit("game_won", { winnerSymbol: symbol, winnerId: userId, reason: "win", prizeAmount: prize });
+        io.to(matchId).emit("game_won", { winnerSymbol: symbol, winnerId: userId, reason: "win", prizeAmount: prizeBirr });
         cleanupGame(matchId);
         return;
       }
 
       if (checkDraw(game.board)) {
-        // reset, swap, notify, restart
+        // Board is full — no winner yet, so start the next round automatically
+        game.round = (game.round || 1) + 1;
         game.board = [...INITIAL_BOARD];
         game.turn = "X";
         game.timers = { X: game.timers.O, O: game.timers.X };
@@ -1004,8 +1053,7 @@ function setupGameSocket(io) {
         if (game.sockets.X) game.sockets.X.data = { ...game.sockets.X.data, symbol: "X" };
         if (game.sockets.O) game.sockets.O.data = { ...game.sockets.O.data, symbol: "O" };
 
-        io.to(matchId).emit("game_draw", { reason: "draw", newTurn: game.turn, newPlayers: game.players });
-
+        // Emit new_round to both players — no draw event, game continues automatically
         const roundPayloadX = {
           id: game.id,
           board: game.board,
@@ -1017,6 +1065,7 @@ function setupGameSocket(io) {
           opponentSymbol: "O",
           youAre: "X",
           room: game.room,
+          roundNumber: game.round,
           roomName: game.room ? ROOMS_CONFIG[game.room].name : null
         };
         const roundPayloadO = {
@@ -1030,6 +1079,7 @@ function setupGameSocket(io) {
           opponentSymbol: "X",
           youAre: "O",
           room: game.room,
+          roundNumber: game.round,
           roomName: game.room ? ROOMS_CONFIG[game.room].name : null
         };
 
@@ -1055,10 +1105,11 @@ function setupGameSocket(io) {
         const opponentSymbol = opposite(mySymbol);
         const winnerId = game.players[opponentSymbol];
         const { prize } = calculatePrize(game.betAmount); // use room-specific cut
+        const prizeBirr = Number(prize); // TRANSLATOR: Send Birr
 
         await finishAndPayout(matchId, opponentSymbol, winnerId, prize).catch(e => console.error(e));
-        if (game.sockets[opponentSymbol]) game.sockets[opponentSymbol].emit("opponent_forfeited", { prizeAmount: prize });
-        io.to(matchId).emit("game_won", { winnerSymbol: opponentSymbol, winnerId, reason: "opponent_left", prizeAmount: prize });
+        if (game.sockets[opponentSymbol]) game.sockets[opponentSymbol].emit("opponent_forfeited", { prizeAmount: prizeBirr });
+        io.to(matchId).emit("game_won", { winnerSymbol: opponentSymbol, winnerId, reason: "opponent_left", prizeAmount: prizeBirr });
         cleanupGame(matchId);
         if (typeof ack === "function") ack({ ok: true, data: { done: true } });
       } catch (e) {

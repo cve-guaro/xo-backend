@@ -56,7 +56,7 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     customization: { title: 'Wallet Top-up', description: `Deposit via ${bank}` },
   };
 
-  return chapaFetch('/transaction/initialize', 'POST', payload, 'CHASECK-gn0RFezIBSCzmMnZyrb2rGgTCfQCLBVy');
+  return chapaFetch('/transaction/initialize', 'POST', payload, secretKey);
 }
 
 /**

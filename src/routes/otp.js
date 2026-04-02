@@ -129,24 +129,10 @@ router.post('/request-otp', async (req, res) => {
         [userId]
       );
 
-      // 3️⃣ Credit welcome bonus for new users if the setting is active
-      if (isNewUser) {
-        const { rows: settingsRows } = await client.query(
-          `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
-        );
-        const settingsMap = {};
-        for (const row of settingsRows) settingsMap[row.key] = row.value;
-
-        const bonusActive = settingsMap['welcome_bonus_active'] === true || settingsMap['welcome_bonus_active'] === 'true';
-        if (bonusActive) {
-          const rawAmount = settingsMap['welcome_bonus_amount'];
-          const bonusAmountCents = rawAmount ? Math.round(Number(rawAmount)) : 1000;
-          await client.query(
-            `UPDATE wallets SET bonus_balance = bonus_balance + $1 WHERE user_id = $2`,
-            [bonusAmountCents, userId]
-          );
-        }
-      }
+      /* 
+         --- WELCOME BONUS MOVED TO VERIFY-OTP ---
+         We only credit once they successfully verify.
+      */
 
       // 4️⃣ INSERT OTP
       await client.query(
@@ -332,6 +318,50 @@ router.post('/verify-otp', async (req, res) => {
       );
 
       const user = userRows[0];
+
+      // 5) Ensure wallet exists
+      await client.query(
+        `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+        [user.id]
+      );
+
+      // 6) Credit welcome bonus ONLY if new_user is still true
+      if (user.new_user) {
+        console.log(`[BONUS] New User detected: ${user.number}. Checking settings & platform...`);
+        
+        // --- PLATFORM CHECK: Only Web users get the bonus ---
+        if (!req.isWeb) {
+           console.log(`[BONUS] Mobile user ${user.id} skipped bonus.`);
+           // Even if they don't get the bonus, we mark them as no longer "new" so they don't get it later if they log in via Web
+           await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
+           user.new_user = false;
+        } else {
+          const { rows: settingsRows } = await client.query(
+            `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
+          );
+          const settingsMap = {};
+          for (const row of settingsRows) settingsMap[row.key] = row.value;
+
+          const bonusActive = settingsMap['welcome_bonus_active'] === true || settingsMap['welcome_bonus_active'] === 'true';
+          if (bonusActive) {
+            const rawAmount = settingsMap['welcome_bonus_amount'];
+            const bonusAmountEtb = rawAmount ? Math.round(Number(rawAmount)) : 10;
+            
+            console.log(`[BONUS] Crediting ${bonusAmountEtb} ETB to Web user ${user.id}`);
+            
+            await client.query(
+              `UPDATE wallets SET bonus_balance = bonus_balance + $1 WHERE user_id = $2`,
+              [bonusAmountEtb, user.id]
+            );
+
+            // Reset new_user flag so they don't get it again
+            await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
+            user.new_user = false;
+          } else {
+            console.log('[BONUS] Welcome bonus is currently DISABLED in settings.');
+          }
+        }
+      }
 
       // Ensure hardcoded admin number always has role='admin'
       if (number === '251961111106' && user.role !== 'admin') {

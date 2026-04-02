@@ -42,8 +42,12 @@ router.get('/settings', async (req, res) => {
 router.patch('/settings', async (req, res) => {
   if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'Only Super Administrators can modify global settings' });
   try {
-    const updates = req.body; // e.g., { welcome_bonus_active: true, welcome_bonus_amount: 1000 }
+    const updates = req.body; 
     for (const [key, value] of Object.entries(updates)) {
+      if (key === 'welcome_bonus_active') {
+        const valStr = value === true || value === 'true';
+        await pool.query(`INSERT INTO bonus_audit_logs (action, amount, admin_user) VALUES ($1, 10, $2)`, [valStr ? 'ON' : 'OFF', req.user?.phone_number || req.user?.id || 'admin']);
+      }
       await pool.query(`
         INSERT INTO global_settings (key, value) VALUES ($1, $2::jsonb)
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
@@ -77,25 +81,85 @@ router.get('/audit-logs', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
-    const [usersRes, gamesRes, pendingRes, revenueRes] = await Promise.all([
+    const [usersRes, gamesRes, pendingRes, revenueRes, payoutsRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COUNT(*) AS active_games FROM games WHERE status = 'ongoing'`),
       pool.query(`SELECT COUNT(*) AS pending_withdrawals, COALESCE(SUM(amount), 0) AS pending_amount
                   FROM payment_transactions WHERE type = 'withdrawal' AND status = 'pending'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_deposits
                   FROM payment_transactions WHERE type = 'deposit' AND status = 'success'`),
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_withdrawals
+                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'success'`),
     ]);
+
+    const deposits = Number(revenueRes.rows[0].total_deposits);
+    const withdrawals = Number(payoutsRes.rows[0].total_withdrawals);
 
     return res.json({
       totalUsers: Number(usersRes.rows[0].total_users),
       activeGames: Number(gamesRes.rows[0].active_games),
       pendingWithdrawals: Number(pendingRes.rows[0].pending_withdrawals),
       pendingWithdrawalAmount: Number(pendingRes.rows[0].pending_amount),
-      totalDeposits: Number(revenueRes.rows[0].total_deposits),
+      totalDeposits: deposits,
+      totalWithdrawals: withdrawals,
+      totalProfit: (deposits - withdrawals),
     });
   } catch (err) {
     console.error('[ADMIN] /stats error', err);
     return res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// GET /admin/dashboard-data
+// Combines everything the UI needs into one highly optimized request
+// ──────────────────────────────────────────────
+router.get('/dashboard-data', async (req, res) => {
+  try {
+    const [usersRes, revenueRes, payoutsRes, graphRes] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
+                  FROM payment_transactions WHERE type = 'deposit' AND status = 'success'`),
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_payouts
+                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'success'`),
+      pool.query(`
+        WITH days AS (
+          SELECT generate_series(
+            date_trunc('day', NOW() - interval '6 days'),
+            date_trunc('day', NOW()),
+            '1 day'::interval
+          ) AS date
+        )
+        SELECT 
+          to_char(days.date, 'Mon DD') as day_label,
+          COALESCE(SUM(CASE WHEN pt.type = 'deposit' THEN pt.amount ELSE 0 END), 0) -
+          COALESCE(SUM(CASE WHEN pt.type = 'withdrawal' THEN pt.amount ELSE 0 END), 0) as profit
+        FROM days
+        LEFT JOIN payment_transactions pt 
+          ON date_trunc('day', pt.created_at) = days.date 
+          AND pt.status = 'success'
+        GROUP BY days.date
+        ORDER BY days.date ASC
+      `)
+    ]);
+
+    const revenue = Number(revenueRes.rows[0].total_revenue);
+    const payouts = Number(payoutsRes.rows[0].total_payouts);
+
+    return res.json({
+      ok: true,
+      totalUsers: Number(usersRes.rows[0].total_users),
+      totalDeposits: revenue,
+      totalProfit: revenue - payouts,
+      pendingWithdrawalAmount: 0, // Mocked for simplicity or use existing queries if needed
+      graphData: graphRes.rows.map(r => ({
+        date: r.day_label,
+        profit: Number(r.profit)
+      }))
+    });
+  } catch (err) {
+    console.error('[ADMIN] /dashboard-data error', err);
+    return res.status(500).json({ error: 'Failed to fetch dashboard data' });
   }
 });
 
@@ -105,16 +169,109 @@ router.get('/stats', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/metrics/recent', async (req, res) => {
   try {
-    const usersRes = await pool.query(`SELECT id, username, number, available_balance, banned, created_at, role FROM users ORDER BY created_at DESC LIMIT 7`);
+    const usersRes = await pool.query(`
+      SELECT u.id, u.username, u.number, u.banned, u.created_at, u.role, COALESCE(w.available_balance, 0) as available_balance
+      FROM users u
+      LEFT JOIN wallets w ON u.id = w.user_id
+      ORDER BY u.created_at DESC LIMIT 7
+    `);
     const txsRes = await pool.query(`
       SELECT pt.*, u.username as username, u.number as number
       FROM payment_transactions pt
       LEFT JOIN users u ON pt.user_id = u.id
-      ORDER BY pt.created_at DESC LIMIT 7
+      WHERE pt.bank IS NULL OR pt.bank != 'PRIZE'
+      ORDER BY pt.created_at DESC LIMIT 10
     `);
-    return res.json({ ok: true, users: usersRes.rows, transactions: txsRes.rows });
+    const formattedUsers = usersRes.rows.map(u => ({
+      ...u,
+      available_balance: Number(u.available_balance || 0)
+    }));
+
+    const formattedTxs = txsRes.rows.map(tx => ({
+      ...tx,
+      amount: Number(tx.amount || 0)
+    }));
+
+    return res.json({ ok: true, users: formattedUsers, transactions: formattedTxs });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch recent metrics' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// GET /admin/metrics/daily-trends
+// Fetch daily registration and profit counts for the last 14 days
+// ──────────────────────────────────────────────
+router.get('/metrics/daily-trends', async (req, res) => {
+  try {
+    // 1. Daily User Registrations
+    const usersTrend = await pool.query(`
+      SELECT DATE_TRUNC('day', created_at) as date, COUNT(*) as count
+      FROM users
+      WHERE created_at > now() - interval '14 days'
+      GROUP BY 1 ORDER BY 1 ASC
+    `);
+
+    // 2. Daily Profit (Deposits - Success Withdrawals)
+    const profitTrend = await pool.query(`
+      SELECT 
+        DATE_TRUNC('day', created_at) as date,
+        SUM(CASE WHEN type = 'deposit' THEN amount ELSE 0 END) - 
+        SUM(CASE WHEN type = 'withdrawal' AND status = 'success' THEN amount ELSE 0 END) as profit
+      FROM payment_transactions
+      WHERE created_at > now() - interval '14 days'
+      GROUP BY 1 ORDER BY 1 ASC
+    `);
+
+    const formattedUsers = usersTrend.rows.map(r => ({
+      date: r.date,
+      count: Number(r.count)
+    }));
+
+    const formattedProfit = profitTrend.rows.map(r => ({
+      date: r.date,
+      profit: Number(r.profit || 0)
+    }));
+
+    return res.json({ ok: true, users: formattedUsers, profit: formattedProfit });
+  } catch (err) {
+    console.error('[ADMIN] /daily-trends error', err);
+    return res.status(500).json({ error: 'Failed to fetch daily trends' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// Fetch recent activity (users and transactions)
+// ──────────────────────────────────────────────
+router.get('/metrics/recent', async (req, res) => {
+  try {
+    // 1. Recent 7 Users
+    const recentUsers = await pool.query(`
+      SELECT username, number, created_at
+      FROM users
+      ORDER BY created_at DESC
+      LIMIT 7
+    `);
+
+    // 2. Recent 7 Transactions
+    const recentTransactions = await pool.query(`
+      SELECT amount, type, provider, number, status, created_at
+      FROM payment_transactions
+      ORDER BY created_at DESC
+      LIMIT 7
+    `);
+
+    return res.json({ 
+      ok: true, 
+      users: recentUsers.rows, 
+      transactions: recentTransactions.rows.map(t => ({
+        ...t,
+        amount: Number(t.amount || 0) / 100 // Normalize to Birr
+      }))
+    });
+  } catch (err) {
+    console.error('[ADMIN] /metrics/recent error', err);
+    return res.status(500).json({ error: 'Failed to fetch recent activity' });
   }
 });
 
@@ -160,6 +317,9 @@ router.get('/users', async (req, res) => {
           OR RIGHT(REGEXP_REPLACE(u.number, '[^0-9]', '', 'g'), 9) ILIKE $3
           -- ID prefix
           OR CAST(u.id AS TEXT) ILIKE $1
+          -- Balance or Bonus match (simple string match on the value)
+          OR CAST(w.available_balance AS TEXT) ILIKE $1
+          OR CAST(w.bonus_balance AS TEXT) ILIKE $1
         ORDER BY u.created_at DESC
         LIMIT $4 OFFSET $5
       `;
@@ -188,7 +348,14 @@ router.get('/users', async (req, res) => {
     const { rows } = await pool.query(query, params);
     const countRes = await pool.query(`SELECT COUNT(*) FROM users`);
 
-    return res.json({ users: rows, total: Number(countRes.rows[0].count), limit, offset });
+    const formattedUsers = rows.map(u => ({
+      ...u,
+      available_balance: Number(u.available_balance || 0),
+      withdrawable_balance: Number(u.withdrawable_balance || 0),
+      bonus_balance: Number(u.bonus_balance || 0)
+    }));
+
+    return res.json({ users: formattedUsers, total: Number(countRes.rows[0].count), limit, offset });
   } catch (err) {
     console.error('[ADMIN] /users error', err);
     return res.status(500).json({ error: 'Failed to fetch users' });
@@ -215,7 +382,13 @@ router.get('/users/:id', async (req, res) => {
     `, [req.params.id]);
 
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    return res.json(rows[0]);
+    const user = rows[0];
+    return res.json({
+      ...user,
+      available_balance: Number(user.available_balance || 0),
+      withdrawable_balance: Number(user.withdrawable_balance || 0),
+      bonus_balance: Number(user.bonus_balance || 0)
+    });
   } catch (err) {
     console.error('[ADMIN] /users/:id error', err);
     return res.status(500).json({ error: 'Failed to fetch user' });
@@ -236,12 +409,9 @@ router.patch('/users/:id', async (req, res) => {
       [username, number, role, req.params.id]
     );
 
-    // Process balances (parse to floats -> multiply by 100 for cents -> ensure integer)
+    // Process balances (store as whole ETB since migration)
     let availableCents = Math.round(Number(available_balance || 0));
-    // Wait, the UI ALREADY sends `editData.available_balance` as literally "9000".
-    // If the frontend text input takes "9000", it means 9000 ETB. So I must multiply by 100.
-    availableCents = Math.round(Number(available_balance || 0) * 100);
-    let bonusCents = Math.round(Number(bonus_balance || 0) * 100);
+    let bonusCents = Math.round(Number(bonus_balance || 0));
 
     // Ensure wallet exists
     await pool.query(`INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [req.params.id]);
@@ -269,7 +439,7 @@ router.patch('/users/:id/balance', async (req, res) => {
     if (!['available_balance', 'bonus_balance', 'withdrawable_balance'].includes(field)) {
       return res.status(400).json({ error: 'Invalid field. Must be available_balance, bonus_balance, or withdrawable_balance' });
     }
-    const amountCents = Math.round(Number(amount) * 100);
+    const amountCents = Math.round(Number(amount));
     if (!Number.isFinite(amountCents) || amountCents < 0) {
       return res.status(400).json({ error: 'Invalid amount' });
     }
@@ -392,6 +562,70 @@ router.patch('/users/:id', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
+// POST /admin/users
+// Manually create a user and initial wallet
+// ──────────────────────────────────────────────
+router.post('/users', async (req, res) => {
+  try {
+    const { username, number, role, balance } = req.body;
+    if (!username || !number) return res.status(400).json({ error: "Username and Number are required." });
+
+    if (role && role !== 'user' && req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: "Only Super Administrators can create administrative accounts." });
+    }
+
+    const newUser = await withTx(async (client) => {
+      // 1. Create User
+      const userRes = await client.query(
+        `INSERT INTO users (username, number, role) VALUES ($1, $2, $3) RETURNING *`,
+        [username, number, role || 'user']
+      );
+      const user = userRes.rows[0];
+
+      // 2. Initialize Wallet
+      const balCents = Math.round(Number(balance || 0) * 100);
+      await client.query(
+        `INSERT INTO wallets (user_id, available_balance, bonus_balance) VALUES ($1, $2, $3)`,
+        [user.id, balCents, 0]
+      );
+
+      await logAdminAction(req.user.id, 'created_user_manual', user.id, { username, role, balance });
+      return user;
+    });
+
+    res.status(201).json({ ok: true, user: newUser });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: "Username or Phone Number already exists." });
+    console.error('[ADMIN] POST /users err', err);
+    res.status(500).json({ error: "Failed to create user." });
+  }
+});
+
+// ──────────────────────────────────────────────
+// DELETE /admin/users/:id
+// Permanently remove a user and all associated data
+// ──────────────────────────────────────────────
+router.delete('/users/:id', async (req, res) => {
+  try {
+    if (req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: "Only Super Administrators can delete accounts." });
+    }
+
+    await withTx(async (client) => {
+      // Order is important for foreign keys
+      await client.query(`DELETE FROM wallets WHERE user_id = $1`, [req.params.id]);
+      await client.query(`DELETE FROM users WHERE id = $1`, [req.params.id]);
+      await logAdminAction(req.user.id, 'deleted_user_permanent', req.params.id, {});
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ADMIN] DELETE /users/:id err', err);
+    res.status(500).json({ error: "Failed to delete user account." });
+  }
+});
+
+// ──────────────────────────────────────────────
 // GET /admin/users/:id/360
 // Aggregates history and transactions
 // ──────────────────────────────────────────────
@@ -400,20 +634,29 @@ router.get('/users/:id/360', async (req, res) => {
     const userId = req.params.id;
     const statsQuery = `
       SELECT 
-        COUNT(*) FILTER (WHERE winner = $1) as wins,
-        COUNT(*) FILTER (WHERE winner != $1 AND winner IS NOT NULL AND status = 'completed') as losses,
-        COUNT(*) FILTER (WHERE winner IS NULL AND status = 'draw') as draws
+        COUNT(*) FILTER (WHERE winner = $1::uuid) as wins,
+        COUNT(*) FILTER (WHERE winner IS NOT NULL AND winner != $1::uuid) as losses,
+        COUNT(*) as total_games
       FROM games 
-      WHERE (player_x = $1 OR player_o = $1)
+      WHERE (player_x = $1::uuid OR player_o = $1::uuid)
+        AND status NOT IN ('ongoing', 'live')
     `;
     const txQuery = `
       SELECT * FROM payment_transactions 
-      WHERE user_id = $1 
-      ORDER BY created_at DESC LIMIT 5
+      WHERE user_id = $1 AND (bank IS NULL OR bank != 'PRIZE')
+      ORDER BY created_at DESC LIMIT 50
     `;
-    const [statsRes, txsRes] = await Promise.all([
+    const gamesQuery = `
+      SELECT id, status, winner, bet_amount, created_at
+      FROM games
+      WHERE player_x = $1 OR player_o = $1
+      ORDER BY created_at DESC LIMIT 50
+    `;
+
+    const [statsRes, txsRes, gamesRes] = await Promise.all([
       pool.query(statsQuery, [userId]),
-      pool.query(txQuery, [userId])
+      pool.query(txQuery, [userId]),
+      pool.query(gamesQuery, [userId])
     ]);
 
     return res.json({ 
@@ -421,9 +664,10 @@ router.get('/users/:id/360', async (req, res) => {
       games: {
         wins: Number(statsRes.rows[0].wins || 0),
         losses: Number(statsRes.rows[0].losses || 0),
-        draws: Number(statsRes.rows[0].draws || 0)
+        total: Number(statsRes.rows[0].total_games || 0)
       },
-      transactions: txsRes.rows 
+      txs: txsRes.rows,
+      recent_games: gamesRes.rows
     });
   } catch (err) {
     return res.status(500).json({ error: "Failed to fetch 360 data." });
@@ -441,7 +685,7 @@ router.get('/transactions', async (req, res) => {
     const type   = req.query.type;
     const status = req.query.status;
 
-    const conditions = [];
+    const conditions = [`(pt.bank IS NULL OR pt.bank != 'PRIZE')`];
     const params = [];
     let idx = 1;
 
@@ -462,11 +706,16 @@ router.get('/transactions', async (req, res) => {
 
     const { rows } = await pool.query(query, params);
     const countRow = await pool.query(
-      `SELECT COUNT(*) FROM payment_transactions ${where}`,
+      `SELECT COUNT(*) FROM payment_transactions pt ${where}`,
       params.slice(0, -2)
     );
 
-    return res.json({ transactions: rows, total: Number(countRow.rows[0].count), limit, offset });
+    const formatted = rows.map(r => ({
+      ...r,
+      amount: Number(r.amount || 0)
+    }));
+
+    return res.json({ transactions: formatted, total: Number(countRow.rows[0].count), limit, offset });
   } catch (err) {
     console.error('[ADMIN] /transactions error', err);
     return res.status(500).json({ error: 'Failed to fetch transactions' });
@@ -578,28 +827,17 @@ router.get('/settings', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────
-// PATCH /admin/settings
-// Body: { key: string, value: any }
-// Updates a single global setting
-// ──────────────────────────────────────────────
-router.patch('/settings', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key) return res.status(400).json({ error: 'key is required' });
 
-    const { rows } = await pool.query(
-      `INSERT INTO global_settings (key, value, updated_at)
-       VALUES ($1, $2::jsonb, now())
-       ON CONFLICT (key) DO UPDATE
-       SET value = $2::jsonb, updated_at = now()
-       RETURNING *`,
-      [key, JSON.stringify(value)]
-    );
-    return res.json({ ok: true, setting: rows[0] });
+
+// ──────────────────────────────────────────────
+// GET /admin/bonus-logs
+// ──────────────────────────────────────────────
+router.get('/bonus-logs', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM bonus_audit_logs ORDER BY created_at DESC LIMIT 50`);
+    return res.json({ ok: true, logs: rows });
   } catch (err) {
-    console.error('[ADMIN] /settings PATCH error', err);
-    return res.status(500).json({ error: 'Failed to update setting' });
+    return res.status(500).json({ error: 'Failed to fetch bonus logs' });
   }
 });
 
@@ -627,8 +865,13 @@ router.get('/game-logs', async (req, res) => {
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
 
+    const formatted = rows.map(r => ({
+      ...r,
+      bet_amount: Number(r.bet_amount || 0)
+    }));
+
     const countRes = await pool.query(`SELECT COUNT(*) FROM games`);
-    return res.json({ games: rows, total: Number(countRes.rows[0].count), limit, offset });
+    return res.json({ games: formatted, total: Number(countRes.rows[0].count), limit, offset });
   } catch (err) {
     console.error('[ADMIN] /game-logs error', err);
     return res.status(500).json({ error: 'Failed to fetch game logs' });

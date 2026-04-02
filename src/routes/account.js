@@ -73,27 +73,90 @@ router.post('/history', auth, async (req, res) => {
     const userId = req.user?.id || req.user?.sub || req.user?.userId;
     const limit = parseInt(req.body.limit, 10) || 50;
 
+    // NOTE: is_winner is computed on the backend to avoid UUID comparison
+    // issues on the client (type mismatch, casing, etc.)
     const query = `
       SELECT 
-        g.id, g.bet_amount, g.winner, g.status, g.created_at, g.finished_at, g.moves, 
-        (g.player_x, g.player_o) as players,
-        ux.username as px_name, uo.username as po_name,
-        ux.number as px_num, uo.number as po_num
+        g.id,
+        g.bet_amount,
+        g.winner,
+        g.status,
+        g.created_at,
+        g.finished_at,
+        g.moves,
+        ARRAY[g.player_x::text, g.player_o::text] AS players,
+        ux.username AS px_name,
+        uo.username AS po_name,
+        ux.number   AS px_num,
+        uo.number   AS po_num,
+        -- Server-side win/loss flag: avoids UUID comparison bugs in client
+        CASE
+          WHEN g.winner IS NULL THEN 'abandoned'
+          WHEN g.winner::text = $1::text THEN 'win'
+          ELSE 'loss'
+        END AS result
       FROM games g
       LEFT JOIN users ux ON g.player_x = ux.id
       LEFT JOIN users uo ON g.player_o = uo.id
-      WHERE g.player_x = $1 OR g.player_o = $1
+      WHERE g.player_x = $1::uuid OR g.player_o = $1::uuid
       ORDER BY g.created_at DESC
       LIMIT $2;
     `;
     const values = [userId, limit];
 
-    const result = await pool.query(query, values);
-    console.log("History query executed with values:", result.rows);
-    res.json({ ok: true, history: result.rows });
+    const dbResult = await pool.query(query, values);
+    const formattedHistory = dbResult.rows.map(row => ({
+      ...row,
+      bet_amount: Number(row.bet_amount),
+      // Expose clean boolean for frontend
+      is_winner: row.result === 'win',
+      is_abandoned: row.result === 'abandoned',
+    }));
+
+    res.json({ ok: true, history: formattedHistory });
   } catch (err) {
     console.error("History retrieval error:", err);
     res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ─── GET /account/transactions ──────────────────────────────────────
+// Returns the user's payment history (deposits + withdrawals only)
+router.get('/transactions', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(`
+      SELECT 
+        id,
+        type,
+        amount,
+        status,
+        bank,
+        tx_ref,
+        created_at
+      FROM payment_transactions
+      WHERE user_id = $1
+        AND type IN ('deposit', 'withdrawal')
+        AND (bank IS NULL OR bank != 'PRIZE')
+      ORDER BY created_at DESC
+      LIMIT 100
+    `, [userId]);
+
+    return res.json({
+      ok: true,
+      transactions: result.rows.map(tx => ({
+        id: tx.id,
+        type: tx.type,
+        amount: Number(tx.amount),
+        status: tx.status,
+        method: tx.bank || 'Chapa',
+        ref: tx.tx_ref,
+        createdAt: tx.created_at,
+      }))
+    });
+  } catch (err) {
+    console.error('[account] /transactions error:', err);
+    return res.status(500).json({ message: 'Server error' });
   }
 });
 

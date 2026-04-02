@@ -14,6 +14,7 @@ const adminRoutes = require('./routes/admin');
 
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
+const { platformDetection } = require('./middleware/Detection');
 
 
 const app = express();
@@ -24,7 +25,7 @@ const server = http.createServer(app);
 const corsOptions = {
   origin: "*",
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-access-token"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-access-token", "x-platform"],
   credentials: false,
 };
 app.use(cors(corsOptions));
@@ -37,6 +38,9 @@ const io = new Server(server, {
 
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────
 app.use(express.json());
+
+// ─── DETECTION ─────────────────────────────────────────────────────────────────
+app.use(platformDetection);
 
 // ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() }));

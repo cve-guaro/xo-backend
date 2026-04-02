@@ -51,9 +51,23 @@ async function auth(req, res, next) {
  */
 function adminAuth(req, res, next) {
   auth(req, res, () => {
-    if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
+    // 1. Must be authenticated
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    // 2. Must be an admin
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+    if (!isAdmin) {
       return res.status(403).json({ error: 'Forbidden: Admin access required' });
     }
+
+    // 3. PLATFORM CHECK: Admin access ONLY allowed via Web
+    if (!req.isWeb) {
+      console.warn(`[ADMIN_BLOCK] Admin attempt from non-web platform for user ${req.user.id}`);
+      return res.status(403).json({ error: 'Forbidden: Admin dashboard only available on Web' });
+    }
+
     next();
   });
 }

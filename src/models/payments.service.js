@@ -19,13 +19,13 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
     try {
       await client.query(SQL.ensureWallet, [userId]);
 
-      const amountCents = Math.round(Number(amount) * 100);
+      const amountEtb = Math.round(Number(amount));
 
       // PENDING deposit, no idempotency needed here
       const { rows } = await client.query(SQL.applyTx, [
         userId,
         "DEPOSIT",
-        amountCents,
+        amountEtb,
         "PENDING",
         crypto.randomUUID(), // internal only
         "CHAPA",
@@ -48,7 +48,8 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
 
       return { txId: rows[0].tx_id, checkout_url: url };
     } catch (err) {
-      throw new Error("deposit failed");
+      console.error("[ERROR] initDeposit internal failure:", err);
+      throw new Error(`Deposit service error: ${err.message}`);
     }
   });
 }
@@ -70,11 +71,18 @@ async function completeDeposit(providerRef, provider) {
     const txId = txRow.id;
     const userId = txRow.user_id;
 
+    console.log(`[DB TEST] Processing txId: ${txId} for userId: ${userId}`);
+
     await client.query(SQL.markTxCompletedById, [providerRef, "CHAPA", txId]);
+    console.log(`[DB TEST] Transaction ${txId} marked as COMPLETED.`);
+
     await client.query(SQL.applyExistingTx, [providerRef]); // providerRef == tx_id
+    console.log(`[DB TEST] Balance applied to userId: ${userId} via providerRef: ${providerRef}`);
 
     // 4) Fetch wallet by userId (you need userId for this query)
     const walletRes = await client.query(SQL.getWalletByUserId, [userId]);
+    const finalBalance = walletRes.rows[0]?.available_balance;
+    console.log(`[DB TEST] Final Available Balance for userId ${userId}: ${finalBalance}`);
 
     return { txId: txId, wallet: walletRes.rows[0] };
   });
@@ -118,53 +126,58 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   const anchor = `${payoutMethod}:${payoutDestination}:${amount}:${Date.now()}`;
   const idem = makeIdempotencyKey("WREQ", userId, anchor);
 
-  return withTx(async (client) => {
-    try {
-      await client.query(SQL.ensureWallet, [userId]);
+  const amountEtb = Math.round(Number(amount));
 
-      const amountCents = Math.round(Number(amount) * 100);
+  // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
+  const { reserveTxId, withdrawRequest, wallet } = await withTx(async (client) => {
+    await client.query(SQL.ensureWallet, [userId]);
 
-      // Reserve funds right now (COMPLETED -> apply)
-      const txRes = await client.query(SQL.applyTx, [
-        userId,
-        "WITHDRAW_REQUEST",
-        amountCents,
-        "COMPLETED",
-        idem,
-        null,
-        null,
-        { payoutMethod, payoutDestination },
-      ]);
+    const txRes = await client.query(SQL.applyTx, [
+      userId,
+      "WITHDRAW_REQUEST",
+      amountEtb,
+      "COMPLETED",
+      idem,
+      null,
+      null,
+      { payoutMethod, payoutDestination },
+    ]);
 
-      const reserveTxId = txRes.rows[0].tx_id;
-      const paymentData = txRes.rows[0]
+    const reserveTxId = txRes.rows[0].tx_id;
 
-      const reqRes = await client.query(SQL.createWithdrawRequest, [
-        userId,
-        amountCents,
-        payoutMethod,
-        payoutDestination,
-        reserveTxId,
-      ]);
+    const reqRes = await client.query(SQL.createWithdrawRequest, [
+      userId,
+      amountEtb,
+      payoutMethod,
+      payoutDestination,
+      reserveTxId,
+    ]);
 
-      const withdraw = await initChapaPayout(
-        paymentData.tx_id,
-        amount,
-        phoneNumber,
-        payoutMethod,
-        "xoet user",
-        'https://test.com',
-        ''
-      )
-
-      const walletRes = await client.query(SQL.getWallet, [userId]);
-      return { withdrawRequest: reqRes.rows[0], wallet: walletRes.rows[0] };
-    } catch (err) {
-      console.log(err)
-      throw new Error("withdraw failed");
-    }
+    const walletRes = await client.query(SQL.getWallet, [userId]);
+    return { reserveTxId, withdrawRequest: reqRes.rows[0], wallet: walletRes.rows[0] };
   });
+
+  // STEP 2: Attempt Chapa payout OUTSIDE the DB transaction
+  // If Chapa fails, the withdrawal is still recorded as pending for admin manual processing
+  let chapaStatus = 'pending_manual';
+  try {
+    await initChapaPayout(
+      reserveTxId,          // tx_ref (UUID)
+      amountEtb,            // amount in ETB
+      payoutDestination,    // account_number (phone)
+      payoutMethod,         // bank code
+      "xoet user",          // account_name
+      undefined             // use default CHAPA.secret from env
+    );
+    chapaStatus = 'submitted';
+  } catch (chapaErr) {
+    // Log for admin review — do NOT throw, the DB state is already committed
+    console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
+  }
+
+  return { withdrawRequest, wallet, chapaStatus };
 }
+
 
 module.exports = {
   initDeposit,
