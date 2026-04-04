@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { withTx } = require("../db/index.js");
 const { SQL } = require("./payments.sql.js");
 const { initChapaDeposit, initChapaPayout } = require("./Chapa.js");
+const { CHAPA } = require("../env.js");
 
 function hash20(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 20);
@@ -33,23 +34,28 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
         {},
       ]);
 
-      const paymentData = rows[0]
+      const paymentData = rows[0];
+      const callbackUrl = CHAPA.callbackUrl || 'https://xo-et-backend-production.up.railway.app/payments/webhook';
 
       const deposit = await initChapaDeposit(
         paymentData.tx_id,
         amount,
         phoneNumber,
         provider,
-        'https://test.com',
-        ''
-      )
+        callbackUrl,
+        '' // use default secret from env
+      );
 
-      const url = deposit.data.checkout_url || null
+      const url = (deposit && deposit.data && deposit.data.checkout_url) || null;
 
       return { txId: rows[0].tx_id, checkout_url: url };
     } catch (err) {
-      console.error("[ERROR] initDeposit internal failure:", err);
-      throw new Error(`Deposit service error: ${err.message}`);
+      // Surface Chapa's actual error message for easier debugging
+      const chapaMsg = err.response?.message || err.response?.data?.message || err.message;
+      console.error("[ERROR] initDeposit failure:", chapaMsg, err.response || '');
+      const errorInfo = new Error(`Deposit service error: ${chapaMsg}`);
+      errorInfo.status = 400;
+      throw errorInfo;
     }
   });
 }
@@ -123,14 +129,36 @@ async function creditPrize({ userId, amount, meta }) {
 
 // ----------- Withdraw request (reserve funds immediately) -----------
 async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payoutDestination }) {
-  const anchor = `${payoutMethod}:${payoutDestination}:${amount}:${Date.now()}`;
-  const idem = makeIdempotencyKey("WREQ", userId, anchor);
-
   const amountEtb = Math.round(Number(amount));
+  
+  // Validation
+  if (!amountEtb || amountEtb < 50) {
+    const err = new Error("Minimum withdrawal is 50 ETB");
+    err.status = 400;
+    throw err;
+  }
+  if (!payoutMethod || !payoutDestination) {
+    const err = new Error("Payout method and destination (phone) are required");
+    err.status = 400;
+    throw err;
+  }
+
+  const anchor = `${payoutMethod}:${payoutDestination}:${amountEtb}:${Date.now()}`;
+  const idem = makeIdempotencyKey("WREQ", userId, anchor);
 
   // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
   const { reserveTxId, withdrawRequest, wallet } = await withTx(async (client) => {
     await client.query(SQL.ensureWallet, [userId]);
+    
+    // Check balance first
+    const walletCheck = await client.query(SQL.getWallet, [userId]);
+    const currentWithdrawable = Number(walletCheck.rows[0]?.withdrawable_balance || 0);
+    
+    if (currentWithdrawable < amountEtb) {
+      const err = new Error("Insufficient withdrawable balance");
+      err.status = 400;
+      throw err;
+    }
 
     const txRes = await client.query(SQL.applyTx, [
       userId,
