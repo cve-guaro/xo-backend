@@ -182,24 +182,13 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
 
   return { withdrawRequest, wallet, chapaStatus, checkout_url };
 }
-  } catch (chapaErr) {
-    // Log for admin review — do NOT throw, the DB state is still committed
-    console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
-  }
-
-  return { withdrawRequest, wallet, chapaStatus, checkout_url };
-}
-
-  return { withdrawRequest, wallet, chapaStatus };
-}
-
 
 module.exports = {
   initDeposit,
   completeDeposit,
   creditPrize,
   requestWithdraw,
-  // exporting helpers is optional; remove if you don’t want them public
+  // exporting helpers is optional; remove if you don't want them public
   makeIdempotencyKey,
   hash20,
 };
