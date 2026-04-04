@@ -116,12 +116,14 @@ router.get('/stats', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/dashboard-data', async (req, res) => {
   try {
-    const [usersRes, revenueRes, payoutsRes, graphRes] = await Promise.all([
+    const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
                   FROM payment_transactions WHERE type = 'deposit' AND status = 'success'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_payouts
                   FROM payment_transactions WHERE type = 'withdrawal' AND status = 'success'`),
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS pending_amount
+                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'pending'`),
       pool.query(`
         WITH days AS (
           SELECT generate_series(
@@ -145,13 +147,14 @@ router.get('/dashboard-data', async (req, res) => {
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
     const payouts = Number(payoutsRes.rows[0].total_payouts);
+    const pending = Number(pendingRes.rows[0].pending_amount);
 
     return res.json({
       ok: true,
       totalUsers: Number(usersRes.rows[0].total_users),
       totalDeposits: revenue,
       totalProfit: revenue - payouts,
-      pendingWithdrawalAmount: 0, // Mocked for simplicity or use existing queries if needed
+      pendingWithdrawalAmount: pending,
       graphData: graphRes.rows.map(r => ({
         date: r.day_label,
         profit: Number(r.profit)
@@ -240,40 +243,7 @@ router.get('/metrics/daily-trends', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────
-// Fetch recent activity (users and transactions)
-// ──────────────────────────────────────────────
-router.get('/metrics/recent', async (req, res) => {
-  try {
-    // 1. Recent 7 Users
-    const recentUsers = await pool.query(`
-      SELECT username, number, created_at
-      FROM users
-      ORDER BY created_at DESC
-      LIMIT 7
-    `);
 
-    // 2. Recent 7 Transactions
-    const recentTransactions = await pool.query(`
-      SELECT amount, type, provider, number, status, created_at
-      FROM payment_transactions
-      ORDER BY created_at DESC
-      LIMIT 7
-    `);
-
-    return res.json({ 
-      ok: true, 
-      users: recentUsers.rows, 
-      transactions: recentTransactions.rows.map(t => ({
-        ...t,
-        amount: Number(t.amount || 0) / 100 // Normalize to Birr
-      }))
-    });
-  } catch (err) {
-    console.error('[ADMIN] /metrics/recent error', err);
-    return res.status(500).json({ error: 'Failed to fetch recent activity' });
-  }
-});
 
 // ──────────────────────────────────────────────
 // GET /admin/users?search=&limit=&offset=

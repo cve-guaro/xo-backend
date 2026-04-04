@@ -15,7 +15,7 @@ function makeIdempotencyKey(prefix, userId, anchor) {
 
 // ----------- Deposit (init) -----------
 // payments.service.js
-async function initDeposit({ userId, phoneNumber, amount, provider }) {
+async function initDeposit({ userId, phoneNumber, amount, provider, username, email }) {
   return withTx(async (client) => {
     try {
       await client.query(SQL.ensureWallet, [userId]);
@@ -43,7 +43,8 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
         phoneNumber,
         provider,
         callbackUrl,
-        '' // use default secret from env
+        '', // use default secret from env
+        { id: userId, username, email }
       );
 
       const url = (deposit && deposit.data && deposit.data.checkout_url) || null;

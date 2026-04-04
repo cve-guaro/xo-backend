@@ -85,6 +85,8 @@ router.post('/deposit', auth, async (req, res) => {
       amount: amountStr,
       provider: provider || "UNKNOWN",
       clientRef,
+      username: req.user.username,
+      email: req.user.email,
     });
 
     return res.json(out);

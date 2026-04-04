@@ -18,11 +18,11 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
     body: bodyJson ? JSON.stringify(bodyJson) : undefined,
   });
   const json = await res.json().catch(() => null);
-  console.log(json);
-  console.log(res)
   if (!res.ok) {
-    const err = new Error(`Chapa ${method} ${path} failed`);
+    console.error(`[CHAPA ERROR] ${method} ${path} | Status: ${res.status}`, json);
+    const err = new Error(`Chapa ${method} ${path} failed: ${json?.message || res.statusText}`);
     err.response = json;
+    err.status = res.status;
     throw err;
   }
   return json;
@@ -32,7 +32,7 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
  * Initialize a DEPOSIT with Chapa
  * Returns provider response (often includes checkout URL or instructions).
  */
-async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secretKey ) {
+async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secretKey, user = {} ) {
   // Map internal bank code to Chapa payment channel (adjust if your account differs)
   const methodMap = {
     TELEBIRR_USSD: 'telebirr',
@@ -40,18 +40,17 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     WEB_CHECKOUT: 'card', // generic checkout
   };
   const payment_method = methodMap[bank] || 'card';
-  console.log(amount, tx_ref, mobile)
-
+  
+  // Chapa requires email, first_name, last_name for initialization
   const payload = {
     amount,
     currency: 'ETB',
     tx_ref,
-    // Optional customer info (if you have it)
-    // email, first_name, last_name, phone_number,
+    email: user.email || `${user.username || 'user'}_${user.id || Date.now()}@xoet.com`,
+    first_name: user.username || 'XOET',
+    last_name: 'User',
     phone_number: mobile,
     callback_url,
-    // Some providers accept specifying payment channel
-    // For Chapa, "payment_method" is supported for some channels
     payment_method,
     customization: { title: 'Wallet Top-up', description: `Deposit via ${bank}` },
   };
@@ -59,23 +58,19 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
   return chapaFetch('/transaction/initialize', 'POST', payload, secretKey);
 }
 
-/**
- * Initiate a PAYOUT (withdrawal) with Chapa Business payouts.
- * You must have payouts enabled. Adjust fields to your KYC scope.
- */
 async function initChapaPayout(tx_ref, amount, account_number, bank, account_name, secretKey) {
-  const methodMap = {
-    TELEBIRR_USSD: 'telebirr',
-    CBE_BIRR: 'cbe',
-    WEB_CHECKOUT: 'card', // generic checkout
+  // Chapa Bank Codes: CBE = 855, Telebirr = 856 (approx, check Chapa docs for latest)
+  const bankCodeMap = {
+    'CBE_BIRR': '855',
+    'TELEBIRR_USSD': '856', // Telebirr code in Chapa
   };
-  const payment_method = methodMap[bank] || 'card';
-  // console.log(tx_ref, tx_ref.length)
-  console.log('dwithdraw data: ', tx_ref, amount, account_name, account_number)
+  const bank_code = bankCodeMap[bank] || '855';
+
+  console.log('payout data: ', tx_ref, amount, account_name, account_number, bank_code)
   const body = {
     "amount": amount,
     "reference": tx_ref,
-    "bank_code": 855,
+    "bank_code": bank_code,
     "account_name": account_name || "xo user",
     "account_number": account_number
   };
