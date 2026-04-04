@@ -104,16 +104,13 @@ router.post('/withdraw', auth, async (req, res) => {
     if (!amt || amt <= 0) {
       return res.status(400).json({ detail: "Invalid amount" });
     }
-    if (!payoutMethod || !payoutDestination) {
-      return res.status(400).json({ detail: "payoutMethod and payoutDestination required" });
-    }
 
     const out = await requestWithdraw({
       userId,
       amount: amt,
       phoneNumber: req.user.phone_number,
-      payoutMethod,
-      payoutDestination,
+      payoutMethod: payoutMethod || "chapa",
+      payoutDestination: payoutDestination || req.user.phone_number || "251900000000",
     });
 
     return res.json(out);

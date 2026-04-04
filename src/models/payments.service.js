@@ -160,8 +160,9 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   // STEP 2: Attempt Chapa payout OUTSIDE the DB transaction
   // If Chapa fails, the withdrawal is still recorded as pending for admin manual processing
   let chapaStatus = 'pending_manual';
+  let checkout_url = null;
   try {
-    await initChapaPayout(
+    const chapaRes = await initChapaPayout(
       reserveTxId,          // tx_ref (UUID)
       amountEtb,            // amount in ETB
       payoutDestination,    // account_number (phone)
@@ -170,10 +171,24 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       undefined             // use default CHAPA.secret from env
     );
     chapaStatus = 'submitted';
+    // If Chapa returns a checkout URL (for some payout methods)
+    if (chapaRes?.data?.checkout_url) {
+      checkout_url = chapaRes.data.checkout_url;
+    }
   } catch (chapaErr) {
-    // Log for admin review — do NOT throw, the DB state is already committed
+    // Log for admin review — do NOT throw, the DB state is still committed
     console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
   }
+
+  return { withdrawRequest, wallet, chapaStatus, checkout_url };
+}
+  } catch (chapaErr) {
+    // Log for admin review — do NOT throw, the DB state is still committed
+    console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
+  }
+
+  return { withdrawRequest, wallet, chapaStatus, checkout_url };
+}
 
   return { withdrawRequest, wallet, chapaStatus };
 }
