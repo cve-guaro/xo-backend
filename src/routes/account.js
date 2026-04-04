@@ -136,7 +136,7 @@ router.get('/transactions', auth, async (req, res) => {
         created_at
       FROM payment_transactions
       WHERE user_id = $1
-        AND (LOWER(type) IN ('deposit', 'withdrawal', 'withdraw_request'))
+        AND (LOWER(type::text) IN ('deposit', 'withdrawal', 'withdraw_request'))
         AND (bank IS NULL OR bank != 'PRIZE')
       ORDER BY created_at DESC
       LIMIT 100

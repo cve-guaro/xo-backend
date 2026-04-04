@@ -24,9 +24,9 @@ async function initDeposit({ userId, phoneNumber, amount, provider }) {
       // PENDING deposit, no idempotency needed here
       const { rows } = await client.query(SQL.applyTx, [
         userId,
-        "deposit",
+        "DEPOSIT",
         amountEtb,
-        "pending",
+        "PENDING",
         crypto.randomUUID(), // internal only
         "CHAPA",
         null,
@@ -134,9 +134,9 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
 
     const txRes = await client.query(SQL.applyTx, [
       userId,
-      "withdraw_request",
+      "WITHDRAW_REQUEST",
       amountEtb,
-      "success",
+      "SUCCESS",
       idem,
       null,
       null,
