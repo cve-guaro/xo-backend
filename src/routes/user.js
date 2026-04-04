@@ -77,4 +77,25 @@ router.get('/me', auth, async (req, res) => {
   }
 });
 
+/**
+ * GET /user/bonus-logs
+ */
+router.get('/bonus-logs', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, amount, reason, created_at 
+       FROM bonus_logs 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC 
+       LIMIT 100`,
+      [req.user.id]
+    );
+    return res.json({ ok: true, logs: rows });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to fetch bonus logs' });
+  }
+});
+
+
 module.exports = router;

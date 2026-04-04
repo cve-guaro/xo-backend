@@ -22,8 +22,9 @@ const LIMITS = {
 
 const CHAPA = {
   secret: process.env.CHAPA_SECRET_KEY || 'test-key',
-  callbackUrl: process.env.CHAPA_CALLBACK_UR || 'testkey',
+  callbackUrl: process.env.CHAPA_WEBHOOK_URL || 'https://xogpt-production.up.railway.app/payments/webhook',
 };
+
 
 if (!CHAPA.secret) throw new Error('CHAPA_SECRET_KEY is required');
 

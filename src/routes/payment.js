@@ -89,10 +89,12 @@ router.post('/deposit', auth, async (req, res) => {
 
     return res.json(out);
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ detail: "Deposit init failed" });
+    const errorMsg = e.response?.message || e.message || "Deposit init failed";
+    console.error("[DEPOSIT] Error:", e.response || e);
+    return res.status(e.status || 500).json({ detail: errorMsg });
   }
 });
+
 
 // 2) WITHDRAW
 router.post('/withdraw', auth, async (req, res) => {

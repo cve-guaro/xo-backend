@@ -354,9 +354,16 @@ router.post('/verify-otp', async (req, res) => {
               [bonusAmountEtb, user.id]
             );
 
+            // Log the bonus
+            await client.query(
+              `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+              [user.id, bonusAmountEtb, 'Welcome Bonus']
+            ).catch(err => console.error('[BONUS_LOG] Error logging welcome bonus:', err));
+
             // Reset new_user flag so they don't get it again
             await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
             user.new_user = false;
+
           } else {
             console.log('[BONUS] Welcome bonus is currently DISABLED in settings.');
           }

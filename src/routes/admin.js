@@ -451,8 +451,17 @@ router.patch('/users/:id/balance', async (req, res) => {
       `UPDATE wallets SET ${field} = $1 WHERE user_id = $2 RETURNING *`,
       [amountCents, req.params.id]
     );
+
+    if (field === 'bonus_balance') {
+      await pool.query(
+        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+        [req.params.id, amountCents, `Admin Adjustment (${req.user?.username || 'admin'})`]
+      ).catch(err => console.error('[BONUS_LOG] Admin log error:', err));
+    }
+
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     return res.json({ ok: true, wallet: rows[0] });
+
   } catch (err) {
     console.error('[ADMIN] /users/:id/balance error', err);
     return res.status(500).json({ error: 'Failed to update balance' });
