@@ -113,11 +113,24 @@ router.get('/stats', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
-// GET /admin/dashboard-data
-// Combines everything the UI needs into one highly optimized request
-// ──────────────────────────────────────────────
 router.get('/dashboard-data', async (req, res) => {
   try {
+    // ─── Timeframe Range Logic ───
+    const range = req.query.range || 'week';
+    let interval = '7 days';
+    let trunc = 'day';
+    let format = 'Mon DD';
+
+    if (range === 'day') {
+      interval = '24 hours';
+      trunc = 'hour';
+      format = 'HH24:00';
+    } else if (range === 'month') {
+      interval = '30 days';
+      trunc = 'day';
+      format = 'MM/DD';
+    }
+
     const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes, balanceRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
@@ -127,23 +140,23 @@ router.get('/dashboard-data', async (req, res) => {
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS pending_amount
                   FROM payment_transactions WHERE type = 'withdrawal' AND status = 'pending'`),
       pool.query(`
-        WITH days AS (
+        WITH points AS (
           SELECT generate_series(
-            date_trunc('day', NOW() - interval '6 days'),
-            date_trunc('day', NOW()),
-            '1 day'::interval
+            date_trunc('${trunc}', NOW() - interval '${interval}'),
+            date_trunc('${trunc}', NOW()),
+            '1 ${trunc}'::interval
           ) AS date
         )
         SELECT 
-          to_char(days.date, 'Mon DD') as day_label,
+          to_char(points.date, '${format}') as label,
           COALESCE(SUM(CASE WHEN pt.type = 'deposit' THEN pt.amount ELSE 0 END), 0) -
           COALESCE(SUM(CASE WHEN pt.type = 'withdrawal' THEN pt.amount ELSE 0 END), 0) as profit
-        FROM days
+        FROM points
         LEFT JOIN payment_transactions pt 
-          ON date_trunc('day', pt.created_at) = days.date 
+          ON date_trunc('${trunc}', pt.created_at) = points.date 
           AND pt.status = 'success'
-        GROUP BY days.date
-        ORDER BY days.date ASC
+        GROUP BY points.date
+        ORDER BY points.date ASC
       `),
       getChapaBalance(CHAPA.secret).catch(e => ({ data: { balance: 0 } })) // Defensive
     ]);
@@ -163,7 +176,7 @@ router.get('/dashboard-data', async (req, res) => {
       chapaBalance: Number(chapaBal),
       pendingWithdrawalAmount: pending,
       graphData: graphRes.rows.map(r => ({
-        date: r.day_label,
+        date: r.label,
         profit: Number(r.profit)
       }))
     });
