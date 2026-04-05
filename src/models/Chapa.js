@@ -84,4 +84,8 @@ async function verifyTx(tx_ref, secretKey) {
   return chapaFetch(`/transaction/verify/${encodeURIComponent(tx_ref)}`, 'GET', null, secretKey);
 }
 
-module.exports = { initChapaDeposit, initChapaPayout, verifyTx };
+async function getChapaBalance(secretKey) {
+  return chapaFetch('/balance', 'GET', null, secretKey);
+}
+
+module.exports = { initChapaDeposit, initChapaPayout, verifyTx, getChapaBalance };

@@ -5,6 +5,8 @@
 const express = require('express');
 const { pool, withTx } = require('../db/index');
 const { adminAuth } = require('../middleware/Auth');
+const { getChapaBalance } = require('../models/Chapa');
+const { CHAPA } = require('../env');
 
 const router = express.Router();
 
@@ -116,7 +118,7 @@ router.get('/stats', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/dashboard-data', async (req, res) => {
   try {
-    const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes] = await Promise.all([
+    const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes, balanceRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
                   FROM payment_transactions WHERE type = 'deposit' AND status = 'success'`),
@@ -142,18 +144,23 @@ router.get('/dashboard-data', async (req, res) => {
           AND pt.status = 'success'
         GROUP BY days.date
         ORDER BY days.date ASC
-      `)
+      `),
+      getChapaBalance(CHAPA.secret).catch(e => ({ data: { balance: 0 } })) // Defensive
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
     const payouts = Number(payoutsRes.rows[0].total_payouts);
     const pending = Number(pendingRes.rows[0].pending_amount);
+    
+    // Chapa balance access: check data structure
+    const chapaBal = balanceRes?.data?.balance || 0; 
 
     return res.json({
       ok: true,
       totalUsers: Number(usersRes.rows[0].total_users),
       totalDeposits: revenue,
       totalProfit: revenue - payouts,
+      chapaBalance: Number(chapaBal),
       pendingWithdrawalAmount: pending,
       graphData: graphRes.rows.map(r => ({
         date: r.day_label,
