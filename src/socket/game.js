@@ -981,13 +981,19 @@ function setupGameSocket(io) {
     // CANCEL SEARCH
     // -------------------------------------------------------
     socket.on("cancel_find_match", async ({ token }, ack) => {
-      console.log('cancel_find_match called with token:');
       let userId = null;
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.sub;
-        rememberUser(userId);
-        rememberUserSocket(socket, userId);
+        
+        // CRITICAL: If already matched/in-game, deny cancellation
+        const inGameId = await redis.get(`in_game:${userId}`).catch(() => null);
+        if (inGameId) {
+           console.log(`[MM] Denying cancel for ${userId} - Already matched in ${inGameId}`);
+           if (typeof ack === "function") ack({ ok: false, error: "ALREADY_MATCHED", matchId: inGameId });
+           socket.emit("error", { code: "ALREADY_MATCHED", message: "Match already found! Starting game..." });
+           return;
+        }
 
         const queueKey = socketSearching.get(socket.id);
         if (queueKey) {
