@@ -63,5 +63,6 @@ app.use('/admin', adminRoutes);
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+let PORT = parseInt(process.env.PORT, 10);
+if (isNaN(PORT)) PORT = 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
