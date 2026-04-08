@@ -79,6 +79,12 @@ router.post('/deposit', auth, async (req, res) => {
     const amountStr = amt.toFixed(2); // "10.00", "25.50"
 
 
+    // 1. Determine the return destination
+    // If web, go to Vercel. If mobile, let Chapa stay in the closed loop/handle return natively.
+    const platformReturnUrl = req.isWeb 
+       ? process.env.FRONTEND_URL 
+       : undefined; // Safer to pass undefined for mobile if no scheme is ready
+
     const out = await initDeposit({
       userId,
       phoneNumber: req.user.phone_number,
@@ -87,6 +93,8 @@ router.post('/deposit', auth, async (req, res) => {
       clientRef,
       username: req.user.username,
       email: req.user.email,
+      returnUrl: platformReturnUrl, // Pass the branched URL here
+      isWeb: req.isWeb
     });
 
     return res.json(out);

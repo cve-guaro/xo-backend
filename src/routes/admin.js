@@ -196,7 +196,7 @@ router.get('/metrics/recent', async (req, res) => {
       SELECT u.id, u.username, u.number, u.banned, u.created_at, u.role, COALESCE(w.available_balance, 0) as available_balance
       FROM users u
       LEFT JOIN wallets w ON u.id = w.user_id
-      ORDER BY u.created_at DESC LIMIT 7
+      ORDER BY u.created_at DESC LIMIT 10
     `);
     const txsRes = await pool.query(`
       SELECT pt.*, u.username as username, u.number as number
@@ -689,7 +689,17 @@ router.get('/transactions', async (req, res) => {
     let idx = 1;
 
     if (type)   { conditions.push(`pt.type = $${idx++}`);   params.push(type); }
-    if (status) { conditions.push(`pt.status = $${idx++}`); params.push(status); }
+    if (status) {
+      const statusList = status.split(',');
+      if (statusList.length > 1) {
+        const placeholders = statusList.map(() => `$${idx++}`).join(', ');
+        conditions.push(`pt.status IN (${placeholders})`);
+        params.push(...statusList);
+      } else {
+        conditions.push(`pt.status = $${idx++}`);
+        params.push(status);
+      }
+    }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 

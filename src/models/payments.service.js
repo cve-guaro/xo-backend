@@ -15,7 +15,7 @@ function makeIdempotencyKey(prefix, userId, anchor) {
 
 // ----------- Deposit (init) -----------
 // payments.service.js
-async function initDeposit({ userId, phoneNumber, amount, provider, username, email }) {
+async function initDeposit({ userId, phoneNumber, amount, provider, username, email, returnUrl, isWeb }) {
   return withTx(async (client) => {
     try {
       await client.query(SQL.ensureWallet, [userId]);
@@ -31,7 +31,7 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
         crypto.randomUUID(), // internal only
         "CHAPA",
         null,
-        {},
+        { isWeb },
       ]);
 
       const paymentData = rows[0];
@@ -44,7 +44,8 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
         provider,
         callbackUrl,
         '', // use default secret from env
-        { id: userId, username, email }
+        { id: userId, username, email },
+        returnUrl
       );
 
       const url = (deposit && deposit.data && deposit.data.checkout_url) || null;
@@ -147,16 +148,33 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   const anchor = `${payoutMethod}:${payoutDestination}:${amountEtb}:${Date.now()}`;
   const idem = makeIdempotencyKey("WREQ", userId, anchor);
 
-  // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
+    // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
   const { reserveTxId, withdrawRequest, wallet } = await withTx(async (client) => {
     await client.query(SQL.ensureWallet, [userId]);
     
-    // Check balance first
+    // 1) Verify user has played at least one match
+    const { rows: gameCountRows } = await client.query(
+      `SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, 
+      [userId]
+    );
+    const totalGames = Number(gameCountRows[0]?.total || 0);
+
+    if (totalGames === 0) {
+      const err = new Error("You must play at least one match before withdrawing funds.");
+      err.status = 400;
+      throw err;
+    }
+
+    // 2) Check balance - must exclude the 10 ETB bonus
     const walletCheck = await client.query(SQL.getWallet, [userId]);
-    const currentWithdrawable = Number(walletCheck.rows[0]?.withdrawable_balance || 0);
+    const walletData = walletCheck.rows[0];
+    const available = Number(walletData?.available_balance || 0);
+    
+    // The user can withdraw (Available - 10 Bonus)
+    const currentWithdrawable = Math.max(0, available - 10);
     
     if (currentWithdrawable < amountEtb) {
-      const err = new Error("Insufficient withdrawable balance");
+      const err = new Error("Insufficient withdrawable balance (Registration bonus is not withdrawable).");
       err.status = 400;
       throw err;
     }

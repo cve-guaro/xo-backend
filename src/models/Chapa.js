@@ -32,7 +32,7 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
  * Initialize a DEPOSIT with Chapa
  * Returns provider response (often includes checkout URL or instructions).
  */
-async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secretKey, user = {} ) {
+async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secretKey, user = {}, return_url ) {
   // Map internal bank code to Chapa payment channel (adjust if your account differs)
   const methodMap = {
     TELEBIRR_USSD: 'telebirr',
@@ -51,6 +51,7 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     last_name: 'User',
     phone_number: mobile,
     callback_url,
+    return_url,
     payment_method,
     customization: { title: 'Wallet Top-up', description: `Deposit via ${bank}` },
   };

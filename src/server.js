@@ -37,7 +37,13 @@ const io = new Server(server, {
 });
 
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    if (req.originalUrl.includes('/webhook')) {
+      req.rawBody = buf; // Store the exact raw buffer exclusively for webhooks
+    }
+  }
+}));
 
 // ─── DETECTION ─────────────────────────────────────────────────────────────────
 app.use(platformDetection);
@@ -49,7 +55,6 @@ app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() })
 app.use('/payments', payments);
 app.use('/api/auth', authRoutes);
 app.use("/api/transactions", txRoutes);
-app.use("/webhook/:provider", bodyParser.raw({ type: "*/*" }));
 app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
