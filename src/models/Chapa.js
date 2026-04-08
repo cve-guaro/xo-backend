@@ -32,6 +32,10 @@ async function chapaFetch(path, method, bodyJson, secretKey) {
  * Initialize a DEPOSIT with Chapa
  * Returns provider response (often includes checkout URL or instructions).
  */
+function isValidEmail(email) {
+  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secretKey, user = {}, return_url ) {
   // Map internal bank code to Chapa payment channel (adjust if your account differs)
   const methodMap = {
@@ -41,12 +45,17 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
   };
   const payment_method = methodMap[bank] || 'card';
   
+  // Always guarantee a valid email — Chapa strictly validates this field
+  const safeEmail = isValidEmail(user.email) 
+    ? user.email 
+    : `xoetuser${String(user.id || Date.now())}@gmail.com`;
+
   // Chapa requires email, first_name, last_name for initialization
   const payload = {
     amount,
     currency: 'ETB',
     tx_ref,
-    email: user.email || `user${String(user.id || Date.now())}@gmail.com`,
+    email: safeEmail,
     first_name: user.username || 'XOET',
     last_name: 'User',
     phone_number: mobile,
@@ -56,6 +65,7 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     customization: { title: 'Wallet Top-up', description: `Deposit via ${bank}` },
   };
 
+  console.log('[CHAPA DEBUG] Payload email:', safeEmail, '| user.email was:', user.email);
   return chapaFetch('/transaction/initialize', 'POST', payload, secretKey);
 }
 
