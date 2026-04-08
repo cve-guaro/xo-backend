@@ -6,8 +6,8 @@ const { CHAPA } = require('../env'); // Import CHAPA config
 const CHAPA_BASE = 'https://api.chapa.co/v1';
 
 async function chapaFetch(path, method, bodyJson, secretKey) {
-  // Use passed key or fallback to env
-  const authKey = secretKey || CHAPA.secret; 
+  // Use passed key or fallback to env, trimming whitespace explicitly
+  const authKey = String(secretKey || CHAPA.secret || '').trim();
   
   const res = await fetch(`${CHAPA_BASE}${path}`, {
     method,
