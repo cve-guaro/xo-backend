@@ -154,7 +154,7 @@ router.get('/transactions', auth, async (req, res) => {
         created_at
       FROM wallet_transactions
       WHERE user_id = $1
-        AND (LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled'))
+        AND (LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled', 'prize'))
       ORDER BY created_at DESC
       LIMIT 100
     `, [userId]);
