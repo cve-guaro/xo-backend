@@ -20,7 +20,6 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
   
   console.log("[WEBHOOK DEBUG] Signature header:", expectedSig || "NONE");
   console.log("[WEBHOOK DEBUG] Raw body exists:", !!rawBodyBuffer, "| Length:", rawBodyBuffer?.length || 0);
-  console.log("[WEBHOOK DEBUG] All headers:", JSON.stringify(Object.keys(headers)));
 
   // If Chapa doesn't send a signature header, allow but log warning
   if (!expectedSig) {
@@ -28,9 +27,10 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
     return true;
   }
 
-  // Hash the pure raw Buffer directly. DO NOT use JSON.stringify()
-  const hash = crypto.createHmac('sha256', secretKey).update(rawBodyBuffer).digest('hex');
-  console.log("[WEBHOOK DEBUG] Computed hash:", hash, "| Expected:", expectedSig);
+  // Chapa signs webhooks using SHA256(secretKey), NOT HMAC(body, secretKey)
+  // The signature is a fixed hash of your webhook secret key
+  const hash = crypto.createHash('sha256').update(secretKey).digest('hex');
+  console.log("[WEBHOOK DEBUG] SHA256(secret):", hash, "| Expected:", expectedSig);
   
   return (hash === expectedSig);
 };
