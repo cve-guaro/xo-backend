@@ -74,7 +74,9 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
   // Chapa Bank Codes: CBE = 855, Telebirr = 856 (approx, check Chapa docs for latest)
   const bankCodeMap = {
     'CBE_BIRR': '855',
-    'TELEBIRR_USSD': '856', // Telebirr code in Chapa
+    'TELEBIRR_USSD': '856', 
+    'MPESA': '857', // Example for M-Pesa
+    'CHAPA': '855', // Fallback to CBE for now if CHAPA is generic
   };
   const bank_code = bankCodeMap[bank] || '855';
 

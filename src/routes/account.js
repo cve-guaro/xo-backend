@@ -146,16 +146,15 @@ router.get('/transactions', auth, async (req, res) => {
     const result = await pool.query(`
       SELECT 
         id,
-        type,
+        tx_type AS type,
         amount,
         status,
-        bank,
-        tx_ref,
+        provider AS bank,
+        provider_ref AS tx_ref,
         created_at
-      FROM payment_transactions
+      FROM wallet_transactions
       WHERE user_id = $1
-        AND (LOWER(type::text) IN ('deposit', 'withdrawal', 'withdraw_request'))
-        AND (bank IS NULL OR bank != 'PRIZE')
+        AND (LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request'))
       ORDER BY created_at DESC
       LIMIT 100
     `, [userId]);

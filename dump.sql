@@ -67,8 +67,8 @@ BEGIN
   )
   RETURNING id INTO v_tx_id;
 
-  -- Apply wallet changes only if COMPLETED
-  IF p_status <> 'COMPLETED' THEN
+  -- Apply wallet changes only if COMPLETED (or if it's a WITHDRAW_REQUEST being initialized)
+  IF p_status <> 'COMPLETED' AND p_tx_type <> 'WITHDRAW_REQUEST' THEN
     RETURN v_tx_id;
   END IF;
 
