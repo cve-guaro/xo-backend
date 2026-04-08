@@ -136,8 +136,12 @@ router.post('/withdraw', auth, async (req, res) => {
       return res.status(409).json({ detail: "Insufficient available balance" });
     }
 
-    console.error(e);
-    return res.status(500).json({ detail: "Withdraw failed" });
+    if (e.status === 400) {
+      return res.status(400).json({ detail: msg || "Invalid withdrawal request" });
+    }
+
+    console.error("[WITHDRAW] Error:", e);
+    return res.status(e.status || 500).json({ detail: msg || "Withdraw failed" });
   }
 });
 
