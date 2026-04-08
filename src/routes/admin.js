@@ -131,7 +131,7 @@ router.get('/dashboard-data', async (req, res) => {
       format = 'MM/DD';
     }
 
-    const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes, balanceRes] = await Promise.all([
+    const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
                   FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
@@ -157,16 +157,15 @@ router.get('/dashboard-data', async (req, res) => {
           AND pt.status = 'COMPLETED'
         GROUP BY points.date
         ORDER BY points.date ASC
-      `),
-      getChapaBalance(CHAPA.secret).catch(e => ({ data: { balance: 0 } })) // Defensive
+      `)
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
     const payouts = Number(payoutsRes.rows[0].total_payouts);
     const pending = Number(pendingRes.rows[0].pending_amount);
     
-    // Chapa balance access: check data structure
-    const chapaBal = balanceRes?.data?.balance || 0; 
+    // Manual fallback for system balance if needed
+    const chapaBal = 0; 
 
     return res.json({
       ok: true,
@@ -688,9 +687,19 @@ router.get('/transactions', async (req, res) => {
     const params = [];
     let idx = 1;
 
-    if (type)   { conditions.push(`pt.tx_type = $${idx++}`);   params.push(type.toUpperCase()); }
+    if (type) {
+      let mappedType = type.toUpperCase();
+      if (mappedType === 'WITHDRAWAL') mappedType = 'WITHDRAW_REQUEST';
+      conditions.push(`pt.tx_type = $${idx++}`); 
+      params.push(mappedType); 
+    }
     if (status) {
-      const statusList = status.split(',').map(s => s.toUpperCase());
+      const statusList = status.split(',').map(s => {
+        let val = s.toUpperCase();
+        if (val === 'SUCCESS') return 'COMPLETED';
+        if (val === 'REJECTED') return 'FAILED';
+        return val;
+      });
       if (statusList.length > 1) {
         const placeholders = statusList.map(() => `$${idx++}`).join(', ');
         conditions.push(`pt.status IN (${placeholders})`);
@@ -745,7 +754,7 @@ router.patch('/transactions/:id/approve', async (req, res) => {
       if (!rows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
       const txn = rows[0];
 
-      if (txn.status !== 'pending') {
+      if (txn.status !== 'PENDING') {
         throw Object.assign(new Error(`Cannot approve a ${txn.status} transaction`), { status: 409 });
       }
 
@@ -756,7 +765,7 @@ router.patch('/transactions/:id/approve', async (req, res) => {
       );
 
       // For deposits: credit the wallet
-      if (txn.type === 'deposit') {
+      if (txn.type === 'DEPOSIT') {
         await client.query(
           `INSERT INTO wallets (user_id, available_balance, withdrawable_balance)
            VALUES ($1, $2, $2)
@@ -791,7 +800,7 @@ router.patch('/transactions/:id/reject', async (req, res) => {
       if (!rows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
       const txn = rows[0];
 
-      if (txn.status !== 'pending') {
+      if (txn.status !== 'PENDING') {
         throw Object.assign(new Error(`Cannot reject a ${txn.status} transaction`), { status: 409 });
       }
 
@@ -801,7 +810,7 @@ router.patch('/transactions/:id/reject', async (req, res) => {
       );
 
       // For withdrawals: refund the deducted balance
-      if (txn.type === 'withdrawal') {
+      if (txn.type === 'WITHDRAW_REQUEST') {
         await client.query(
           `UPDATE wallets
            SET available_balance    = available_balance    + $2,
