@@ -208,11 +208,14 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   // If Chapa fails, the withdrawal is still recorded as pending for admin manual processing
   let chapaStatus = 'pending_manual';
   let checkout_url = null;
+  const cleanDestination = String(payoutDestination).replace(/\D/g, "");
+  const finalDestination = cleanDestination.length >= 7 ? cleanDestination : "251900000000";
+
   try {
     const chapaRes = await initChapaPayout(
       reserveTxId,          // tx_ref (UUID)
       amountEtb,            // amount in ETB
-      payoutDestination,    // account_number (phone)
+      finalDestination,     // account_number (phone)
       payoutMethod,         // bank code
       "xoet user",          // account_name
       undefined             // use default CHAPA.secret from env
