@@ -183,7 +183,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       userId,
       "WITHDRAW_REQUEST",
       amountEtb,
-      "SUCCESS",
+      "PENDING", // Withdraw requests start as pending until admin approval
       idem,
       null,
       null,
