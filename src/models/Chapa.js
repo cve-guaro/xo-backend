@@ -46,9 +46,10 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
   const payment_method = methodMap[bank] || 'card';
   
   // Always guarantee a valid email — Chapa strictly validates this field
+  const shortId = String(user.id || Date.now()).replace(/-/g, '').slice(0, 8);
   const safeEmail = isValidEmail(user.email) 
     ? user.email 
-    : `xoetuser${String(user.id || Date.now())}@gmail.com`;
+    : `xo${shortId}@gmail.com`;
 
   // Chapa requires email, first_name, last_name for initialization
   const payload = {
