@@ -68,6 +68,24 @@ router.patch(
   }
 );
 
+// PATCH /account/settings
+router.patch("/settings", auth, async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?.sub || req.user?.userId;
+    const { soundMuted } = req.body;
+    
+    if (soundMuted === undefined) return res.status(400).json({ message: "No settings provided" });
+
+    const result = await pool.query(`UPDATE users SET sound_muted = $1 WHERE id = $2 RETURNING id, sound_muted`, [Boolean(soundMuted), userId]);
+    
+    if (result.rowCount === 0) return res.status(404).json({ message: "User not found" });
+    res.json({ ok: true, settings: result.rows[0] });
+  } catch (e) {
+    console.error("Settings update error:", e);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 router.post('/history', auth, async (req, res) => {
   try {
     const userId = req.user?.id || req.user?.sub || req.user?.userId;

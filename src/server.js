@@ -15,6 +15,7 @@ const adminRoutes = require('./routes/admin');
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
 const { platformDetection } = require('./middleware/Detection');
+const { pool } = require('./db/index');
 
 
 const app = express();
@@ -62,6 +63,16 @@ app.use('/admin', adminRoutes);
 
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
+
+// ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
+(async () => {
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sound_muted BOOLEAN DEFAULT false;`);
+    console.log('[DB] Migrations applied.');
+  } catch (err) {
+    console.error('[DB] Migration error:', err);
+  }
+})();
 
 let PORT = parseInt(process.env.PORT, 10);
 if (isNaN(PORT)) PORT = 3000;

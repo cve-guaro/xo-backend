@@ -210,7 +210,7 @@ router.post('/verify-otp', async (req, res) => {
          VALUES ($1, 'admin')
          ON CONFLICT (number)
          DO UPDATE SET role = 'admin'
-         RETURNING id, number, username, avatar, new_user, role`,
+         RETURNING id, number, username, avatar, new_user, role, sound_muted`,
         [number]
       );
       
@@ -243,6 +243,7 @@ router.post('/verify-otp', async (req, res) => {
           avatar: user.avatar,
           new_user: user.new_user,
           role: 'admin',
+          sound_muted: user.sound_muted,
         },
       });
     }
@@ -313,7 +314,7 @@ router.post('/verify-otp', async (req, res) => {
          VALUES ($1)
          ON CONFLICT (number)
          DO UPDATE SET number = EXCLUDED.number
-         RETURNING id, number, username, avatar, new_user, role`,
+         RETURNING id, number, username, avatar, new_user, role, sound_muted`,
         [number]
       );
 
@@ -426,6 +427,7 @@ router.post('/verify-otp', async (req, res) => {
         avatar: result.user.avatar,
         new_user: result.user.new_user,
         role: result.user.role || 'user',
+        sound_muted: result.user.sound_muted,
       },
     });
   } catch (err) {
