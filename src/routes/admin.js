@@ -715,10 +715,11 @@ router.get('/transactions', async (req, res) => {
       params.push(mappedType); 
     }
     if (status) {
-      const statusList = status.split(',').map(s => {
-        let val = s.toUpperCase();
-        if (val === 'SUCCESS') return 'COMPLETED';
-        if (val === 'REJECTED') return 'FAILED';
+      const statusList = String(status).split(',').map(s => {
+        let val = s.trim().toUpperCase();
+        if (val === 'SUCCESS' || val === 'SUCCEEDED' || val === 'COMPLETED' || val === 'PAID') return 'COMPLETED';
+        if (val === 'REJECTED' || val === 'FAILED' || val === 'FAILURE' || val === 'ERROR') return 'FAILED';
+        if (val === 'PENDING' || val === 'WAITING') return 'PENDING';
         return val;
       });
       if (statusList.length > 1) {
