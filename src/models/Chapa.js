@@ -46,7 +46,7 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     amount,
     currency: 'ETB',
     tx_ref,
-    email: user.email || `${user.username || 'user'}_${user.id || Date.now()}@xoet.com`,
+    email: user.email || `user${String(user.id || Date.now())}@gmail.com`,
     first_name: user.username || 'XOET',
     last_name: 'User',
     phone_number: mobile,
