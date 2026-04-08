@@ -739,7 +739,7 @@ router.patch('/transactions/:id/approve', async (req, res) => {
   try {
     await withTx(async (client) => {
       const { rows } = await client.query(
-        `SELECT * FROM payment_transactions WHERE id = $1 FOR UPDATE`,
+        `SELECT * FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
         [req.params.id]
       );
       if (!rows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
@@ -751,7 +751,7 @@ router.patch('/transactions/:id/approve', async (req, res) => {
 
       // Mark as success
       await client.query(
-        `UPDATE payment_transactions SET status = 'success', updated_at = now() WHERE id = $1`,
+        `UPDATE wallet_transactions SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
         [req.params.id]
       );
 
@@ -785,7 +785,7 @@ router.patch('/transactions/:id/reject', async (req, res) => {
   try {
     await withTx(async (client) => {
       const { rows } = await client.query(
-        `SELECT * FROM payment_transactions WHERE id = $1 FOR UPDATE`,
+        `SELECT * FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
         [req.params.id]
       );
       if (!rows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
@@ -796,7 +796,7 @@ router.patch('/transactions/:id/reject', async (req, res) => {
       }
 
       await client.query(
-        `UPDATE payment_transactions SET status = 'failed', updated_at = now() WHERE id = $1`,
+        `UPDATE wallet_transactions SET status = 'FAILED', updated_at = now() WHERE id = $1`,
         [req.params.id]
       );
 
