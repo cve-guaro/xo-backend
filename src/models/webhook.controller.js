@@ -3,6 +3,7 @@ const { completeDeposit } = require("./payments.service.js");
 const { CHAPA } = require("../env.js");
 require('dotenv').config();
 const crypto = require('crypto');
+const { pool } = require("../db/index");
 
 // Map provider payload -> { eventType, userId, amount, providerRef }
 function parseProviderEvent(body) {
@@ -39,10 +40,20 @@ async function handleWebhook(req, res) {
   try {
     const isValid = verifyChapaWebhookSignature(req.headers, req.rawBody, CHAPA.webhookSecret);
     if (!isValid) {
-      // HMAC mismatch — log but ALLOW through to not block real deposits.
-      // TODO: Once you add CHAPA_WEBHOOK_SECRET env var with the correct hash, 
-      // change this back to blocking (return 400).
-      console.warn("[WEBHOOK] Signature mismatch — allowing through for now. Set CHAPA_WEBHOOK_SECRET to fix.");
+      const details = {
+        headers: req.headers,
+        reason: 'Signature mismatch',
+        bodyShort: JSON.stringify(req.body || {}).slice(0, 200)
+      };
+      
+      // Log critical security alert
+      await pool.query(
+        `INSERT INTO system_alerts (event_type, details, severity, ip_address) 
+         VALUES ($1, $2, $3, $4)`,
+        ['WEBHOOK_SIGNATURE_MISMATCH', details, 'CRITICAL', req.ip || req.headers['x-forwarded-for']]
+      ).catch(e => console.error('[ALERTS] Failed to log alert:', e));
+
+      return res.status(403).json({ error: "Forbidden: Signature Mismatch" });
     }
 
     const { event, providerRef } = parseProviderEvent(req.body);

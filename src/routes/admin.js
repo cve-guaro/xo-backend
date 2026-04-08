@@ -87,11 +87,11 @@ router.get('/stats', async (req, res) => {
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COUNT(*) AS active_games FROM games WHERE status = 'ongoing'`),
       pool.query(`SELECT COUNT(*) AS pending_withdrawals, COALESCE(SUM(amount), 0) AS pending_amount
-                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'pending'`),
+                  FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_deposits
-                  FROM payment_transactions WHERE type = 'deposit' AND status = 'success'`),
+                  FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_withdrawals
-                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'success'`),
+                  FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
     ]);
 
     const deposits = Number(revenueRes.rows[0].total_deposits);
@@ -134,11 +134,11 @@ router.get('/dashboard-data', async (req, res) => {
     const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes, balanceRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
-                  FROM payment_transactions WHERE type = 'deposit' AND status = 'success'`),
+                  FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_payouts
-                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'success'`),
+                  FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS pending_amount
-                  FROM payment_transactions WHERE type = 'withdrawal' AND status = 'pending'`),
+                  FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING'`),
       pool.query(`
         WITH points AS (
           SELECT generate_series(
@@ -149,12 +149,12 @@ router.get('/dashboard-data', async (req, res) => {
         )
         SELECT 
           to_char(points.date, '${format}') as label,
-          COALESCE(SUM(CASE WHEN pt.type = 'deposit' THEN pt.amount ELSE 0 END), 0) -
-          COALESCE(SUM(CASE WHEN pt.type = 'withdrawal' THEN pt.amount ELSE 0 END), 0) as profit
+          COALESCE(SUM(CASE WHEN pt.tx_type = 'DEPOSIT' THEN pt.amount ELSE 0 END), 0) -
+          COALESCE(SUM(CASE WHEN pt.tx_type = 'WITHDRAW_SETTLED' THEN pt.amount ELSE 0 END), 0) as profit
         FROM points
-        LEFT JOIN payment_transactions pt 
+        LEFT JOIN wallet_transactions pt 
           ON date_trunc('${trunc}', pt.created_at) = points.date 
-          AND pt.status = 'success'
+          AND pt.status = 'COMPLETED'
         GROUP BY points.date
         ORDER BY points.date ASC
       `),
@@ -199,10 +199,10 @@ router.get('/metrics/recent', async (req, res) => {
       ORDER BY u.created_at DESC LIMIT 10
     `);
     const txsRes = await pool.query(`
-      SELECT pt.*, u.username as username, u.number as number
-      FROM payment_transactions pt
+      SELECT pt.id, pt.tx_type as type, pt.status, pt.amount, pt.provider as bank, pt.provider_ref as tx_ref, pt.created_at, u.username, u.number
+      FROM wallet_transactions pt
       LEFT JOIN users u ON pt.user_id = u.id
-      WHERE pt.bank IS NULL OR pt.bank != 'PRIZE'
+      WHERE pt.provider IS NULL OR pt.provider != 'PRIZE'
       ORDER BY pt.created_at DESC LIMIT 10
     `);
     const formattedUsers = usersRes.rows.map(u => ({
@@ -239,9 +239,9 @@ router.get('/metrics/daily-trends', async (req, res) => {
     const profitTrend = await pool.query(`
       SELECT 
         DATE_TRUNC('day', created_at) as date,
-        SUM(CASE WHEN type = 'deposit' THEN amount ELSE 0 END) - 
-        SUM(CASE WHEN type = 'withdrawal' AND status = 'success' THEN amount ELSE 0 END) as profit
-      FROM payment_transactions
+        SUM(CASE WHEN tx_type = 'DEPOSIT' THEN amount ELSE 0 END) - 
+        SUM(CASE WHEN tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END) as profit
+      FROM wallet_transactions
       WHERE created_at > now() - interval '14 days'
       GROUP BY 1 ORDER BY 1 ASC
     `);
@@ -641,8 +641,8 @@ router.get('/users/:id/360', async (req, res) => {
         AND status NOT IN ('ongoing', 'live')
     `;
     const txQuery = `
-      SELECT * FROM payment_transactions 
-      WHERE user_id = $1 AND (bank IS NULL OR bank != 'PRIZE')
+      SELECT id, tx_type as type, amount, status, provider as bank, provider_ref as tx_ref, created_at FROM wallet_transactions 
+      WHERE user_id = $1 AND (provider IS NULL OR provider != 'PRIZE')
       ORDER BY created_at DESC LIMIT 50
     `;
     const gamesQuery = `
@@ -684,28 +684,28 @@ router.get('/transactions', async (req, res) => {
     const type   = req.query.type;
     const status = req.query.status;
 
-    const conditions = [`(pt.bank IS NULL OR pt.bank != 'PRIZE')`];
+    const conditions = [`(pt.provider IS NULL OR pt.provider != 'PRIZE')`];
     const params = [];
     let idx = 1;
 
-    if (type)   { conditions.push(`pt.type = $${idx++}`);   params.push(type); }
+    if (type)   { conditions.push(`pt.tx_type = $${idx++}`);   params.push(type.toUpperCase()); }
     if (status) {
-      const statusList = status.split(',');
+      const statusList = status.split(',').map(s => s.toUpperCase());
       if (statusList.length > 1) {
         const placeholders = statusList.map(() => `$${idx++}`).join(', ');
         conditions.push(`pt.status IN (${placeholders})`);
         params.push(...statusList);
       } else {
         conditions.push(`pt.status = $${idx++}`);
-        params.push(status);
+        params.push(statusList[0]);
       }
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const query = `
-      SELECT pt.*, u.number, u.username, u.display_name
-      FROM payment_transactions pt
+      SELECT pt.id, pt.tx_type as type, pt.amount, pt.status, pt.provider as bank, pt.provider_ref as tx_ref, pt.created_at, u.number, u.username, u.display_name
+      FROM wallet_transactions pt
       LEFT JOIN users u ON u.id = pt.user_id
       ${where}
       ORDER BY pt.created_at DESC
@@ -715,7 +715,7 @@ router.get('/transactions', async (req, res) => {
 
     const { rows } = await pool.query(query, params);
     const countRow = await pool.query(
-      `SELECT COUNT(*) FROM payment_transactions pt ${where}`,
+      `SELECT COUNT(*) FROM wallet_transactions pt ${where}`,
       params.slice(0, -2)
     );
 
@@ -884,6 +884,23 @@ router.get('/game-logs', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] /game-logs error', err);
     return res.status(500).json({ error: 'Failed to fetch game logs' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// GET /admin/security/alerts
+// ──────────────────────────────────────────────
+router.get('/security/alerts', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT * FROM system_alerts 
+      ORDER BY created_at DESC 
+      LIMIT 100
+    `);
+    return res.json({ ok: true, alerts: rows });
+  } catch (err) {
+    console.error('[ADMIN] /security/alerts error', err);
+    return res.status(500).json({ error: 'Failed to fetch security alerts' });
   }
 });
 

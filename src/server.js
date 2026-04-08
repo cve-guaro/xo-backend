@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const bodyParser = require("body-parser"); 
 const cors = require('cors');
 require('dotenv').config();
+const rateLimit = require('express-rate-limit');
 const txRoutes = require("./routes/transactions");
 const { recordAndProcessWebhook } = require("./models/Transaction");
 const payments = require('./routes/payment');
@@ -37,6 +38,24 @@ const io = new Server(server, {
   cors: { origin: "*" }
 });
 
+// ─── RATE LIMITING (FIREWALL) ──────────────────────────────────────────────────
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+  message: { error: "Too many requests, please try again later." }
+});
+
+const paymentLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 5, // Limit each IP to 5 payment requests per minute
+  message: { error: "Security alert: Too many payment attempts. Please wait 1 minute." }
+});
+
+app.use('/payments/withdraw', paymentLimiter);
+app.use('/payments/deposit', paymentLimiter);
+app.use('/auth', paymentLimiter);
+app.use(generalLimiter);
+
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────
 app.use(express.json({
   verify: (req, res, buf) => {
@@ -68,6 +87,20 @@ setupGameSocket(io);
 (async () => {
   try {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sound_muted BOOLEAN DEFAULT false;`);
+    
+    // Create systems alerts table for security monitoring
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS system_alerts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type TEXT NOT NULL,
+        details JSONB DEFAULT '{}',
+        severity TEXT DEFAULT 'INFO',
+        ip_address TEXT,
+        resolved BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+    
     console.log('[DB] Migrations applied.');
   } catch (err) {
     console.error('[DB] Migration error:', err);
