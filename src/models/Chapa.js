@@ -96,7 +96,7 @@ async function verifyTx(tx_ref, secretKey) {
 }
 
 async function getChapaBalance(secretKey) {
-  return chapaFetch('/balance', 'GET', null, secretKey);
+  return chapaFetch('/accounts/balance', 'GET', null, secretKey);
 }
 
 module.exports = { initChapaDeposit, initChapaPayout, verifyTx, getChapaBalance };
