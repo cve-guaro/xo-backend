@@ -17,23 +17,30 @@ function parseProviderEvent(body) {
 function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
   if (!secretKey) throw new Error("Missing CHAPA secret key");
 
-  // Chapa might send the signature in different casing depending on the server environment
   const expectedSig = headers["chapa-signature"] || headers["x-chapa-signature"] || headers["Chapa-Signature"];
   
   if (!expectedSig) {
-    console.warn("[WEBHOOK] No signature header from Chapa — requiring signature for production safety.");
+    console.warn("[WEBHOOK] No signature header from Chapa.");
     return false;
   }
 
-  // Chapa signs webhooks using SHA256 of the Secret Key (verify this in Chapa docs)
-  const hash = crypto.createHash('sha256').update(secretKey).digest('hex');
+  if (!rawBodyBuffer) {
+    console.warn("[WEBHOOK SECURITY] Raw body buffer missing. Ensure bodyParser 'verify' is configured in server.js.");
+    return false;
+  }
+
+  // Chapa signs webhooks using HMAC-SHA256 of the raw request body with the Secret Key
+  const hash = crypto
+    .createHmac("sha256", secretKey)
+    .update(rawBodyBuffer)
+    .digest("hex");
   
   const isValid = (hash.toLowerCase() === expectedSig.toLowerCase());
   
   if (!isValid) {
     console.error("[WEBHOOK SECURITY] Signature mismatch!");
-    console.error(`- Received: ${expectedSig}`);
-    console.error(`- Calculated: ${hash}`);
+    console.error(`- Received from Chapa: ${expectedSig}`);
+    console.error(`- Calculated locally: ${hash}`);
     console.error("- Tip: Ensure CHAPA_WEBHOOK_SECRET in Railway matches your Chapa Dashboard Secret exactly.");
   }
   
