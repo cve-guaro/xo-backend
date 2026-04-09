@@ -184,8 +184,10 @@ function findSocketByUser(io, userId) {
   return null;
 }
 function emitToUser(io, userId, event, payload) {
-  console.log("Emitting to user:", userId, "room:", userRoom(userId));
-  io.to(userRoom(userId)).emit(event, payload);
+  const roomName = userRoom(userId);
+  console.log(`[EMIT] Sending '${event}' to user ${userId} in room ${roomName}`);
+  console.log(`[EMIT] Payload keys:`, Object.keys(payload || {}));
+  io.to(roomName).emit(event, payload);
 }
 
 // === REMATCH: helpers ===============================================
@@ -660,11 +662,12 @@ function setupGameSocket(io) {
       const platform = (socket.handshake.headers['x-platform'] || '').toLowerCase();
       const isWeb = platform === 'web';
 
-      console.log("find_match called with token:", token, "betAmount:", betAmount, "platform:", platform);
+      console.log("find_match called with token:", token ? token.substring(0, 20) + "..." : "NO_TOKEN", "betAmount:", betAmount, "platform:", platform);
       logAlways(`ENTER find_match rid=${rid} sid=${socket.id} bet=${betAmount} platform=${platform}`);
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.sub;
+        console.log(`[MM] Token verified for user: ${userId}`);
         rememberUser(userId);
         rememberUserSocket(socket, userId); // track user online
         const username = decoded.username || "";
@@ -816,6 +819,10 @@ function setupGameSocket(io) {
         }
 
         // matcher (with lock)
+        console.log(`[MM] Checking queue for betAmount: ${betAmountCents}, queueKey: ${queueKey}`);
+        const queueLen = await redis.llen(queueKey).catch(() => 0);
+        console.log(`[MM] Current queue length: ${queueLen}`);
+
         dbg(ctx, "matcher: try lock", { lock: `lock:matcher:${betAmount}` });
         const locked = await withRedisLock(redis, `lock:matcher:${betAmount}`, 2000, async () => {
           dbg(ctx, "matcher: lock acquired");
@@ -957,6 +964,13 @@ function setupGameSocket(io) {
               timerDuration: initialTimer,
               houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
             };
+
+            console.log('[MM] MATCH FOUND! Emitting to both players');
+            console.log('[MM] Player X:', players.X, 'Socket X:', !!sockets.X);
+            console.log('[MM] Player O:', players.O, 'Socket O:', !!sockets.O);
+            console.log('[MM] Match ID:', matchId);
+            console.log('[MM] Payload X sample:', { matchId, symbol: 'X', opponentUsername: nameO });
+            console.log('[MM] Payload O sample:', { matchId, symbol: 'O', opponentUsername: nameX });
 
             dbg(ctx, "emit match_found", { matchId, players });
             emitToUser(io, players.X, "match_found", payloadX);
