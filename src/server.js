@@ -26,10 +26,10 @@ const server = http.createServer(app);
 // ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
 // Must be FIRST, before any routes or other middleware.
 const corsOptions = {
-  origin: "*",
+  origin: ["https://xo-et-frontend.vercel.app", "http://localhost:3000", "http://localhost:8081"],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-access-token", "x-platform"],
-  credentials: false,
+  allowedHeaders: ["Content-Type", "Authorization", "x-access-token", "x-platform", "Idempotency-Key"],
+  credentials: true,
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests globally
