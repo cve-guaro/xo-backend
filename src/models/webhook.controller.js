@@ -15,7 +15,10 @@ function parseProviderEvent(body) {
 }
 
 function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
-  if (!secretKey) throw new Error("Missing CHAPA secret key");
+  if (!secretKey) {
+    console.error("[WEBHOOK SECURITY] CRITICAL: Missing CHAPA secret key in environment variables.");
+    throw new Error("Missing CHAPA secret key");
+  }
 
   const expectedSig = headers["chapa-signature"] || headers["x-chapa-signature"] || headers["Chapa-Signature"];
   
@@ -25,23 +28,29 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
   }
 
   if (!rawBodyBuffer) {
-    console.warn("[WEBHOOK SECURITY] Raw body buffer missing. Ensure bodyParser 'verify' is configured in server.js.");
+    console.warn("[WEBHOOK SECURITY] Raw body buffer missing. Check bodyParser 'verify' in server.js.");
     return false;
   }
 
   // Chapa signs webhooks using HMAC-SHA256 of the raw request body with the Secret Key
-  const hash = crypto
-    .createHmac("sha256", secretKey)
-    .update(rawBodyBuffer)
-    .digest("hex");
+  const hmac = crypto.createHmac("sha256", secretKey);
+  const hash = hmac.update(rawBodyBuffer).digest("hex");
   
   const isValid = (hash.toLowerCase() === expectedSig.toLowerCase());
   
   if (!isValid) {
     console.error("[WEBHOOK SECURITY] Signature mismatch!");
+    console.error(`- Payload Size: ${rawBodyBuffer.length} bytes`);
     console.error(`- Received from Chapa: ${expectedSig}`);
     console.error(`- Calculated locally: ${hash}`);
-    console.error("- Tip: Ensure CHAPA_WEBHOOK_SECRET in Railway matches your Chapa Dashboard Secret exactly.");
+    
+    // Masked secret key for verification without exposing it in logs
+    const maskedKey = secretKey.length > 8 
+       ? `****${secretKey.slice(-4)}` 
+       : "TOO_SHORT_CHECK_ENV";
+    console.error(`- Secret Key being used: ${maskedKey}`);
+    
+    console.error("- Tip: Ensure CHAPA_WEBHOOK_SECRET in Railway matches your Chapa Dashboard Secret (Settings -> API Keys -> Webhook Secret) exactly.");
   }
   
   return isValid;
