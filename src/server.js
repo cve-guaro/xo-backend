@@ -16,6 +16,7 @@ const adminRoutes = require('./routes/admin');
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
 const { platformDetection } = require('./middleware/Detection');
+const { systemLockdownCheck } = require('./middleware/Security');
 const { pool } = require('./db/index');
 
 
@@ -66,8 +67,9 @@ app.use(express.json({
   }
 }));
 
-// ─── DETECTION ─────────────────────────────────────────────────────────────────
+// ─── DETECTION & SECURITY ──────────────────────────────────────────────────────
 app.use(platformDetection);
+app.use(systemLockdownCheck);
 
 // ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() }));
