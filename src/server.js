@@ -109,5 +109,5 @@ setupGameSocket(io);
 })();
 
 let PORT = parseInt(process.env.PORT, 10);
-if (isNaN(PORT)) PORT = 3000;
+if (isNaN(PORT)) PORT = 2000;
 server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
