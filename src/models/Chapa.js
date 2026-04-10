@@ -73,16 +73,16 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
 async function initChapaPayout(tx_ref, amount, account_number, bank, account_name, secretKey) {
   // Verified Chapa Transfer Bank Codes (API v1)
   const bankCodeMap = {
-    'TELEBIRR':      '1001', // Telebirr 
-    'TELEBIRR_USSD': '1001', // alias
-    'CBE_BIRR':      '001',  // Commercial Bank of Ethiopia
-    'CBE':           '001',  // alias
-    'MPESA':         '1002', // M-Pesa
-    'AWASH':         '004',  // Awash Bank
-    'AWASH_BANK':    '004',  // alias
-    'CHAPA':         '1001', // Default fallback -> Telebirr
+    'TELEBIRR':      '856',  // Telebirr 
+    'TELEBIRR_USSD': '856',  // alias
+    'CBE_BIRR':      '855',  // Commercial Bank of Ethiopia
+    'CBE':           '855',  // alias
+    'MPESA':         '857',  // M-Pesa
+    'AWASH':         '801',  // Awash Bank
+    'AWASH_BANK':    '801',  // alias
+    'CHAPA':         '856',  // Default fallback -> Telebirr
   };
-  const bank_code = bankCodeMap[String(bank).toUpperCase()] || '1001';
+  const bank_code = bankCodeMap[String(bank).toUpperCase()] || '856';
 
   console.log('[CHAPA PAYOUT] tx_ref:', tx_ref, '| amount:', amount, '| bank:', bank, '→ code:', bank_code, '| dest:', account_number);
   const body = {
