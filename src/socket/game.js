@@ -688,6 +688,19 @@ function setupGameSocket(io) {
           return;
         }
 
+        // --- GLOBAL MOBILE APP LOCKOUT CHECK ---
+        if (!isWeb) {
+          const lockRes = await pool.query(`SELECT value FROM global_settings WHERE key = 'mobile_app_lockout'`);
+          if (lockRes.rows.length > 0 && (lockRes.rows[0].value === true || lockRes.rows[0].value === 'true')) {
+            if (typeof ack === "function") ack({ ok: true, data: { state: "APP_DEPRECATED" } });
+            socket.emit("error", {
+              code: "APP_DEPRECATED",
+              message: "The mobile app is no longer supported. Please use the website to access your account."
+            });
+            return;
+          }
+        }
+
         // --- PLATFORM TIMER LOGIC ---
         let timerDuration = 30; // Default
         if (isWeb) {
