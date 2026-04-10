@@ -79,6 +79,8 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
     'CBE_BIRR':      '128',  // ✅ Verified: CBEBirr (mobile wallet, uses phone 09...)
     'CBE':           '128',
     'MPESA':         '266',  // ✅ Verified: M-Pesa (phone number)
+    'AWASH_BIRR':    '829',  // ✅ Verified: Awash Birr mobile wallet (phone number)
+    'AWASH':         '829',  // alias
     'CHAPA':         '855',  // Default to Telebirr
   };
   const bank_code = bankCodeMap[String(bank).toUpperCase()] || '855';
