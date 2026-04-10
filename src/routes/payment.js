@@ -136,6 +136,14 @@ router.post('/withdraw', auth, async (req, res) => {
       return res.status(400).json({ detail: "Invalid amount" });
     }
 
+    // Dynamic withdrawal limit check
+    const limitQuery = await pool.query(`SELECT value FROM global_settings WHERE key = 'min_withdraw_amount'`);
+    const dynMin = (limitQuery.rows.length && limitQuery.rows[0].value) ? Number(limitQuery.rows[0].value) : LIMITS.minPayout;
+    
+    if (amt < dynMin) {
+      return res.status(400).json({ detail: `Minimum withdrawal is ${dynMin} ETB` });
+    }
+
     // Lock payout destination to user's registered phone number to prevent money laundering
     const userPhone = req.user.phone_number || req.user.number;
     if (!userPhone) return res.status(400).json({ detail: "User phone number is missing." });

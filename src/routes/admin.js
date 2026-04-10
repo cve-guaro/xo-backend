@@ -48,7 +48,8 @@ router.patch('/settings', async (req, res) => {
     for (const [key, value] of Object.entries(updates)) {
       if (key === 'welcome_bonus_active') {
         const valStr = value === true || value === 'true';
-        await pool.query(`INSERT INTO bonus_audit_logs (action, amount, admin_user) VALUES ($1, 10, $2)`, [valStr ? 'ON' : 'OFF', req.user?.phone_number || req.user?.id || 'admin']);
+        const amt = updates.welcome_bonus_amount ? Number(updates.welcome_bonus_amount) : 10;
+        await pool.query(`INSERT INTO bonus_audit_logs (action, amount, admin_user) VALUES ($1, $2, $3)`, [valStr ? 'ON' : 'OFF', amt, req.user?.phone_number || req.user?.id || 'admin']);
       }
       await pool.query(`
         INSERT INTO global_settings (key, value) VALUES ($1, $2::jsonb)
@@ -134,7 +135,7 @@ router.get('/dashboard-data', async (req, res) => {
     }
 
     // ─── Fixed Promise.all with correct destructuring ───
-    const [usersRes, revenueRes, payoutsRes, pendingRes, metricsRes, graphRes, earningsRes] = await Promise.all([
+    const [usersRes, revenueRes, payoutsRes, pendingRes, metricsRes, graphRes, earningsRes, activeGamesRes, failedWdRes] = await Promise.all([
       // [0] Total users
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       // [1] Total completed deposits (money that came in via Chapa)
@@ -183,6 +184,10 @@ router.get('/dashboard-data', async (req, res) => {
         FROM games
         WHERE status = 'finished' AND winner IS NOT NULL
       `),
+      // [7] Active Games
+      pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('ongoing', 'live')`),
+      // [8] Failed withdrawals
+      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status IN ('FAILED', 'REJECTED')`)
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
@@ -203,6 +208,8 @@ router.get('/dashboard-data', async (req, res) => {
       pendingWithdrawalAmount: pending,
       volume24h,
       successRate,
+      activeGames: Number(activeGamesRes.rows[0].active_games),
+      failedWithdrawals: Number(failedWdRes.rows[0].failed_withdrawals),
       graphData: (graphRes.rows || []).map(r => ({
         date: r.label,
         profit: Number(r.profit)
@@ -513,8 +520,8 @@ router.patch('/users/:id/ban', async (req, res) => {
 // ──────────────────────────────────────────────
 router.patch('/users/:id/role', async (req, res) => {
   try {
-    if (req.user.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Only Super Administrators can modify roles' });
+    if (!['admin', 'superadmin'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions to modify roles' });
     }
     const targetRole = req.body.role;
     if (!['user', 'admin'].includes(targetRole)) {
@@ -541,8 +548,8 @@ router.patch('/users/:id', async (req, res) => {
     const { username, number, role, available_balance, bonus_balance, banned } = req.body;
     
     // Authorization check for structural edits
-    if (role && req.user.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Only Super Administrators can modify roles.' });
+    if (role && !['admin', 'superadmin'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions to modify roles.' });
     }
 
     await withTx(async (client) => {
@@ -599,8 +606,8 @@ router.post('/users', async (req, res) => {
     const { username, number, role, balance } = req.body;
     if (!username || !number) return res.status(400).json({ error: "Username and Number are required." });
 
-    if (role && role !== 'user' && req.user.role !== 'superadmin') {
-      return res.status(403).json({ error: "Only Super Administrators can create administrative accounts." });
+    if (role && role !== 'user' && !['admin', 'superadmin'].includes(req.user.role)) {
+      return res.status(403).json({ error: "Insufficient permissions to create administrative accounts." });
     }
 
     const newUser = await withTx(async (client) => {
@@ -636,12 +643,15 @@ router.post('/users', async (req, res) => {
 // ──────────────────────────────────────────────
 router.delete('/users/:id', async (req, res) => {
   try {
-    if (req.user.role !== 'superadmin') {
-      return res.status(403).json({ error: "Only Super Administrators can delete accounts." });
+    if (!['admin', 'superadmin'].includes(req.user.role)) {
+      return res.status(403).json({ error: "Insufficient permissions to delete accounts." });
     }
 
     await withTx(async (client) => {
       // Order is important for foreign keys
+      await client.query(`DELETE FROM games WHERE player_x = $1 OR player_o = $1 OR winner = $1`, [req.params.id]);
+      await client.query(`DELETE FROM wallet_transactions WHERE user_id = $1`, [req.params.id]);
+      await client.query(`DELETE FROM bonus_logs WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM wallets WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM users WHERE id = $1`, [req.params.id]);
       await logAdminAction(req.user.id, 'deleted_user_permanent', req.params.id, {});
@@ -897,7 +907,7 @@ router.get('/bonus-logs', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/game-logs', async (req, res) => {
   try {
-    const limit  = Math.min(Number(req.query.limit  || 20), 100);
+    const limit  = Math.min(Number(req.query.limit  || 20), 2000); // Increased max limit to 2000
     const offset = Number(req.query.offset || 0);
 
     const { rows } = await pool.query(`
