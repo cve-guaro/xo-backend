@@ -659,7 +659,13 @@ function setupGameSocket(io) {
       const rid = shortId();
       let userId = null;
       
-      const platform = (socket.handshake.headers['x-platform'] || '').toLowerCase();
+      // Railway proxy may strip extraHeaders on WS upgrade — check auth.platform as fallback
+      const platform = (
+        socket.handshake.headers['x-platform'] ||
+        socket.handshake.auth?.platform ||
+        socket.handshake.query?.platform ||
+        ''
+      ).toLowerCase();
       const isWeb = platform === 'web';
 
       console.log("find_match called with token:", token ? token.substring(0, 20) + "..." : "NO_TOKEN", "betAmount:", betAmount, "platform:", platform);
