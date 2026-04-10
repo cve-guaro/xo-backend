@@ -3,14 +3,17 @@ function platformDetection(req, res, next) {
   const userAgent = (req.headers['user-agent'] || '').toLowerCase();
 
   if (platform === 'web') {
+    // Explicit web header — always allow
     req.isWeb = true;
-  } else if (platform === 'mobile') {
+  } else if (platform === 'mobile-app') {
+    // Explicit native app header — block if lockout is on
     req.isWeb = false;
   } else {
-    // Fallback: Check User-Agent for common browser strings if x-platform is missing
-    const isBrowser = userAgent.includes('mozilla') || userAgent.includes('chrome') || userAgent.includes('safari');
-    const isMobileApp = userAgent.includes('expo') || userAgent.includes('mobile');
-    req.isWeb = isBrowser && !isMobileApp;
+    // Fallback heuristic: only flag as native app if UA contains "expo"
+    // NOTE: do NOT use "mobile" here — mobile browsers (Safari/Chrome on phones)
+    //       include "mobile" in their UA, which would wrongly block real users.
+    const isExpoApp = userAgent.includes('expo') || userAgent.includes('okhttp');
+    req.isWeb = !isExpoApp;
   }
 
   next();
