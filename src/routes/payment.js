@@ -194,7 +194,7 @@ router.get('/verify-pending', auth, async (req, res) => {
      
      // Find all pending deposits for this user
      const { rows } = await pool.query(
-        "SELECT tx_id FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'PENDING'",
+        "SELECT id AS tx_id FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'PENDING'",
         [req.user.id]
      );
      

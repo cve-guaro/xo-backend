@@ -7,14 +7,13 @@ const SQL = {
 
   // Find deposit tx by tx_id (which is what we send to Chapa as tx_ref)
   findDepositTxByProviderRef: `
-    SELECT id, user_id, status, tx_id
+    SELECT id, user_id, status, id AS tx_id
     FROM wallet_transactions
     WHERE tx_type = 'DEPOSIT'
       AND status = 'PENDING'
       AND (
-        tx_id::text = $2::text
+        id::text = $2::text
         OR provider_ref::text = $2::text
-        OR id::text = $2::text
       )
     ORDER BY created_at DESC
     LIMIT 1
