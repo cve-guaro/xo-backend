@@ -11,6 +11,7 @@ const SQL = {
     FROM wallet_transactions
     WHERE tx_type = 'DEPOSIT'
       AND status = 'PENDING'
+      AND provider = $1
       AND (
         id::text = $2::text
         OR provider_ref::text = $2::text
