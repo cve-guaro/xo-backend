@@ -74,6 +74,9 @@ app.use(systemLockdownCheck);
 // ─── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
+// ─── ONLINE PLAYERS ────────────────────────────────────────────────────────────
+app.get('/players/online', (_, res) => res.json({ count: io.engine.clientsCount || 0 }));
+
 // ─── ROUTES ────────────────────────────────────────────────────────────────────
 app.use('/payments', payments);
 app.use('/api/auth', authRoutes);

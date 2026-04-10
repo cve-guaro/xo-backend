@@ -12,13 +12,27 @@ async function systemLockdownCheck(req, res, next) {
       return next();
     }
 
-    const { rows } = await pool.query(`SELECT value FROM global_settings WHERE key = 'system_emergency_lockout'`);
-    const isLocked = rows.length > 0 && (rows[0].value === true || rows[0].value === 'true');
+    const { rows } = await pool.query(`SELECT key, value FROM global_settings WHERE key IN ('system_emergency_lockout', 'mobile_app_lockout')`);
+    
+    let isEmergencyLocked = false;
+    let isMobileLocked = false;
 
-    if (isLocked) {
+    for (const r of rows) {
+      if (r.key === 'system_emergency_lockout') isEmergencyLocked = (r.value === true || r.value === 'true');
+      if (r.key === 'mobile_app_lockout') isMobileLocked = (r.value === true || r.value === 'true');
+    }
+
+    if (isEmergencyLocked) {
       return res.status(503).json({ 
         error: 'System Maintenance', 
         message: 'The platform is temporarily locked for security maintenance. Please try again later.' 
+      });
+    }
+
+    if (isMobileLocked && req.isWeb === false) {
+      return res.status(403).json({
+        error: 'App Deprecated',
+        message: 'The mobile app is no longer supported. Please use the website to access your account.'
       });
     }
 
