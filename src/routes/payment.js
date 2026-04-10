@@ -63,6 +63,25 @@ const METHODS = [
   }
 });
 
+// 0) GET BANK CODES DIRECTLY FROM CHAPA
+router.get('/chapa-banks', async (req, res) => {
+  try {
+    const authKey = String(CHAPA.secret || '').trim();
+    if (!authKey) return res.status(500).json({ detail: "No Chapa secret configured" });
+    
+    // Using global fetch (Node 18+)
+    const r = await fetch('https://api.chapa.co/v1/banks', {
+      headers: { 'Authorization': `Bearer ${authKey}` }
+    });
+    
+    const d = await r.json();
+    return res.json(d);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ detail: "failed to fetch chapa banks", error: e.message });
+  }
+});
+
 // 1) DEPOSIT
 router.post('/deposit', auth, async (req, res) => {
   try {
