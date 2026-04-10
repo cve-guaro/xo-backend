@@ -74,14 +74,12 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
   // Official bank IDs verified from live /v1/banks endpoint
   // NOTE: Only these banks are enabled for this Chapa merchant account
   const bankCodeMap = {
-    'TELEBIRR':      '855',  // ✅ Verified: telebirr (phone number 09...)
+    'TELEBIRR':      '855',  // ✅ Verified: telebirr
     'TELEBIRR_USSD': '855',
-    'CBE_BIRR':      '128',  // ✅ Verified: CBEBirr (mobile wallet, uses phone 09...)
+    'CBE_BIRR':      '128',  // ✅ Verified: CBEBirr (phone wallet)
     'CBE':           '128',
-    'MPESA':         '266',  // ✅ Verified: M-Pesa (phone number)
-    'AWASH_BIRR':    '829',  // ✅ Verified: Awash Birr mobile wallet (phone number)
-    'AWASH':         '829',  // alias
-    'CHAPA':         '855',  // Default to Telebirr
+    'MPESA':         '266',  // ✅ Verified: M-Pesa
+    'CHAPA':         '855',  // Default
   };
   const bank_code = bankCodeMap[String(bank).toUpperCase()] || '855';
 
