@@ -186,4 +186,39 @@ router.get('/verify/:txRef', auth, async (req, res) => {
   }
 });
 
+router.get('/verify-pending', auth, async (req, res) => {
+  try {
+     const { verifyTx } = require('../models/Chapa');
+     const { completeDeposit } = require('../models/payments.service');
+     const { pool } = require('../db/index');
+     
+     // Find all pending deposits for this user
+     const { rows } = await pool.query(
+        "SELECT tx_id FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'PENDING'",
+        [req.user.id]
+     );
+     
+     let completedCount = 0;
+     for (const row of rows) {
+         try {
+             // Query Chapa to see if it actually succeeded
+             const chapaVer = await verifyTx(row.tx_id);
+             if (chapaVer?.status === 'success' && chapaVer?.data?.status === 'success') {
+                 try {
+                     await completeDeposit(row.tx_id, "CHAPA");
+                     completedCount++;
+                 } catch (e) { } // Ignore if already completed concurrently
+             }
+         } catch(e) {
+             console.error(`[VERIFY PENDING] Error verifying tx ${row.tx_id}`);
+         }
+     }
+     
+     return res.json({ ok: true, completedCount });
+  } catch (e) {
+     console.error("[VERIFY PENDING] Fatal Error:", e);
+     return res.status(500).json({ detail: "Background verification failed" });
+  }
+});
+
 module.exports = router;
