@@ -14,7 +14,7 @@ function parseProviderEvent(body) {
   return { event, providerRef };
 }
 
-function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
+function verifyChapaWebhookSignature(headers, rawBodyBuffer, parsedBody, secretKey) {
   if (!secretKey) {
     console.error("[WEBHOOK SECURITY] CRITICAL: Missing CHAPA secret key in environment variables.");
     throw new Error("Missing CHAPA secret key");
@@ -27,22 +27,27 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
     return false;
   }
 
-  if (!rawBodyBuffer) {
-    console.warn("[WEBHOOK SECURITY] Raw body buffer missing. Check bodyParser 'verify' in server.js.");
-    return false;
+  // 1: Standard verification (Raw Buffer)
+  let hash1 = "";
+  if (rawBodyBuffer) {
+    hash1 = crypto.createHmac("sha256", secretKey).update(rawBodyBuffer).digest("hex");
   }
 
-  // Chapa signs webhooks using HMAC-SHA256 of the raw request body with the Secret Key
-  const hmac = crypto.createHmac("sha256", secretKey);
-  const hash = hmac.update(rawBodyBuffer).digest("hex");
+  // 2: Chapa-specific fallback verification (Stringified JSON)
+  let hash2 = "";
+  if (parsedBody && Object.keys(parsedBody).length > 0) {
+    hash2 = crypto.createHmac("sha256", secretKey).update(JSON.stringify(parsedBody)).digest("hex");
+  }
   
-  const isValid = (hash.toLowerCase() === expectedSig.toLowerCase());
+  const isValid = (hash1.toLowerCase() === expectedSig.toLowerCase()) || 
+                  (hash2.toLowerCase() === expectedSig.toLowerCase());
   
   if (!isValid) {
     console.error("[WEBHOOK SECURITY] Signature mismatch!");
     console.error(`- Payload Size: ${rawBodyBuffer.length} bytes`);
     console.error(`- Received from Chapa: ${expectedSig}`);
-    console.error(`- Calculated locally: ${hash}`);
+    console.error(`- Calculated Hash 1 (Raw): ${hash1}`);
+    console.error(`- Calculated Hash 2 (JSON): ${hash2}`);
     
     // Masked secret key for verification without exposing it in logs
     const maskedKey = secretKey.length > 8 
@@ -58,7 +63,7 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, secretKey) {
 
 async function handleWebhook(req, res) {
   try {
-    const isValid = verifyChapaWebhookSignature(req.headers, req.rawBody, CHAPA.webhookSecret);
+    const isValid = verifyChapaWebhookSignature(req.headers, req.rawBody, req.body, CHAPA.webhookSecret);
     if (!isValid) {
       const details = {
         headers: req.headers,
