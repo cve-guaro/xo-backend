@@ -1044,13 +1044,16 @@ function setupGameSocket(io) {
     });
 
     // ---------------- Moves ----------------
-    socket.on("make_move", async ({ matchId, index, symbol }) => {
+    socket.on("make_move", async ({ matchId, index }) => {
       const game = activeGames.get(matchId);
       if (!game) return socket.emit("error", { message: "Invalid game" });
 
       const userId = socket.data?.userId;
-      if (!isValidMove(game, index, symbol) || game.players[symbol] !== userId) {
-        return
+      
+      // Derive symbol exclusively from server state to prevent client spoofing
+      const symbol = game.players.X === userId ? "X" : (game.players.O === userId ? "O" : null);
+      if (!symbol || !isValidMove(game, index, symbol)) {
+        return;
       }
 
       game.board[index] = symbol;

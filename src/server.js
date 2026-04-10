@@ -5,6 +5,7 @@ const bodyParser = require("body-parser");
 const cors = require('cors');
 require('dotenv').config();
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 const txRoutes = require("./routes/transactions");
 const { recordAndProcessWebhook } = require("./models/Transaction");
 const payments = require('./routes/payment');
@@ -23,6 +24,12 @@ const { pool } = require('./db/index');
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
+
+// ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable to prevent breaking existing inline scripts
+  crossOriginEmbedderPolicy: false
+}));
 
 // ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
 // Must be FIRST, before any routes or other middleware.
@@ -53,9 +60,16 @@ const paymentLimiter = rateLimit({
   message: { error: "Security alert: Too many payment attempts. Please wait 1 minute." }
 });
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // 20 requests per 15 min for auth
+  message: { error: "Security alert: Too many authentication attempts." }
+});
+
 app.use('/payments/withdraw', paymentLimiter);
 app.use('/payments/deposit', paymentLimiter);
-app.use('/auth', paymentLimiter);
+app.use('/api/auth', authLimiter);
+app.use('/auth', authLimiter);
 app.use(generalLimiter);
 
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────

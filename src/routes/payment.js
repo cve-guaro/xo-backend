@@ -136,12 +136,16 @@ router.post('/withdraw', auth, async (req, res) => {
       return res.status(400).json({ detail: "Invalid amount" });
     }
 
+    // Lock payout destination to user's registered phone number to prevent money laundering
+    const userPhone = req.user.phone_number || req.user.number;
+    if (!userPhone) return res.status(400).json({ detail: "User phone number is missing." });
+    
     const out = await requestWithdraw({
       userId,
       amount: amt,
-      phoneNumber: req.user.phone_number,
+      phoneNumber: userPhone,
       payoutMethod: payoutMethod || "chapa",
-      payoutDestination: payoutDestination || req.user.phone_number || "251900000000",
+      payoutDestination: userPhone,
     });
 
     return res.json(out);
