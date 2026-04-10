@@ -77,9 +77,9 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
     'TELEBIRR_USSD': '856',  // alias
     'CBE_BIRR':      '855',  // Commercial Bank of Ethiopia
     'CBE':           '855',  // alias
-    'MPESA':         '857',  // M-Pesa
-    'AWASH':         '801',  // Awash Bank
-    'AWASH_BANK':    '801',  // alias
+    'MPESA':         '1002', // M-Pesa (merchant spec)
+    'AWASH':         '004',  // Awash Bank (merchant spec)
+    'AWASH_BANK':    '004',  // alias
     'CHAPA':         '856',  // Default fallback -> Telebirr
   };
   const bank_code = bankCodeMap[String(bank).toUpperCase()] || '856';

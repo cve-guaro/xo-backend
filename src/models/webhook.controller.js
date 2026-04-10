@@ -62,19 +62,17 @@ async function handleWebhook(req, res) {
     if (!isValid) {
       const details = {
         headers: req.headers,
-        reason: 'Signature mismatch (HEALED)',
+        reason: 'Signature mismatch blocked',
         bodyShort: JSON.stringify(req.body || {}).slice(0, 200)
       };
       
-      // Log the security alert for admin review, but WE WILL NOT RETURN 403.
-      // We will allow it to proceed to unblock the user's money.
       await pool.query(
         `INSERT INTO system_alerts (event_type, details, severity, ip_address) 
          VALUES ($1, $2, $3, $4)`,
-        ['WEBHOOK_SIGNATURE_MISMATCH_HEALED', details, 'WARNING', req.ip || req.headers['x-forwarded-for']]
+        ['WEBHOOK_SIGNATURE_INVALID', details, 'CRITICAL', req.ip || req.headers['x-forwarded-for']]
       ).catch(e => console.error('[ALERTS] Failed to log alert:', e));
 
-      console.warn("[WEBHOOK HEALING] Signature mismatch detected, but allowing processing to ensure user balance updates.");
+      return res.status(403).json({ error: "Invalid signature" });
     }
 
     const { event, providerRef } = parseProviderEvent(req.body);
