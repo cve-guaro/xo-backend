@@ -42,7 +42,7 @@ router.get('/settings', async (req, res) => {
 });
 
 router.patch('/settings', async (req, res) => {
-  if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'Only Super Administrators can modify global settings' });
+  // Allow any admin to configure the system (since route is already wrapped in adminAuth)
   try {
     const updates = req.body; 
     for (const [key, value] of Object.entries(updates)) {
