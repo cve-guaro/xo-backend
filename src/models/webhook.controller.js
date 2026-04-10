@@ -33,6 +33,20 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, parsedBody, secretK
     hash1 = crypto.createHmac("sha256", secretKey).update(rawBodyBuffer).digest("hex");
   }
 
+  // 2: Chapa-specific fallback verification (Stringified JSON)
+  let hash2 = "";
+  if (parsedBody && Object.keys(parsedBody).length > 0) {
+    hash2 = crypto.createHmac("sha256", secretKey).update(JSON.stringify(parsedBody)).digest("hex");
+  }
+
+  // 3: Legacy Chapa verification (Raw SHA256 of secret concatenated with body)
+  let hash3 = "";
+  if (rawBodyBuffer) {
+    hash3 = crypto.createHash("sha256").update(secretKey + rawBodyBuffer).digest("hex");
+  } else if (parsedBody) {
+    hash3 = crypto.createHash("sha256").update(secretKey + JSON.stringify(parsedBody)).digest("hex");
+  }
+
   // 4: Fallback using API Secret Key instead of Webhook Secret Hash
   let hash4 = "";
   if (CHAPA.secret && rawBodyBuffer) {
