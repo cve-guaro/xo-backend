@@ -133,26 +133,32 @@ router.get('/dashboard-data', async (req, res) => {
       format = 'MM/DD';
     }
 
-    const [usersRes, revenueRes, payoutsRes, pendingRes, graphRes] = await Promise.all([
+    // ─── Fixed Promise.all with correct destructuring ───
+    const [usersRes, revenueRes, payoutsRes, pendingRes, metricsRes, graphRes, earningsRes] = await Promise.all([
+      // [0] Total users
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
+      // [1] Total completed deposits (money that came in via Chapa)
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_revenue
                   FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
+      // [2] Total settled withdrawals
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_payouts
                   FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
+      // [3] Pending withdrawal amount
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS pending_amount
                    FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING'`),
-      // 24h Volume and Success Rate Logic
+      // [4] 24h metrics - real volume and real success rate
       pool.query(`
         SELECT 
           COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN amount ELSE 0 END), 0) as volume,
           CASE 
-            WHEN COUNT(*) = 0 THEN 0 
-            ELSE (COUNT(*) FILTER (WHERE status = 'COMPLETED')::float / COUNT(*)::float) * 100 
+            WHEN COUNT(*) = 0 THEN 100
+            ELSE ROUND((COUNT(*) FILTER (WHERE status = 'COMPLETED')::numeric / COUNT(*)::numeric) * 100, 1)
           END as success_rate
         FROM wallet_transactions 
         WHERE created_at > now() - interval '24 hours'
           AND tx_type = 'DEPOSIT'
       `),
+      // [5] Time-series profit graph
       pool.query(`
         WITH points AS (
           SELECT generate_series(
@@ -163,38 +169,40 @@ router.get('/dashboard-data', async (req, res) => {
         )
         SELECT 
           to_char(points.date, '${format}') as label,
-          COALESCE(SUM(CASE WHEN pt.tx_type = 'DEPOSIT' THEN pt.amount ELSE 0 END), 0) -
-          COALESCE(SUM(CASE WHEN pt.tx_type = 'WITHDRAW_SETTLED' THEN pt.amount ELSE 0 END), 0) as profit
+          COALESCE(SUM(CASE WHEN pt.tx_type = 'DEPOSIT' AND pt.status = 'COMPLETED' THEN pt.amount ELSE 0 END), 0) -
+          COALESCE(SUM(CASE WHEN pt.tx_type IN ('WITHDRAW_SETTLED') AND pt.status = 'COMPLETED' THEN pt.amount ELSE 0 END), 0) as profit
         FROM points
         LEFT JOIN wallet_transactions pt 
-          ON date_trunc('${trunc}', pt.created_at) = points.date 
-          AND pt.status = 'COMPLETED'
+          ON date_trunc('${trunc}', pt.created_at) = points.date
         GROUP BY points.date
         ORDER BY points.date ASC
-      `)
+      `),
+      // [6] Platform earnings from game commissions (10% of each completed bet)
+      pool.query(`
+        SELECT COALESCE(SUM(bet_amount * 0.1), 0) AS platform_commission
+        FROM games
+        WHERE status = 'finished' AND winner IS NOT NULL
+      `),
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
     const payouts = Number(payoutsRes.rows[0].total_payouts);
     const pending = Number(pendingRes.rows[0].pending_amount);
-    
-    // Extracted metrics
-    const volume24h = Number(revenueRes.rows[1]?.volume || 0); // Actually using the 1st result usually but we use Promise.all indices
-    // Re-mapped from the additional query result
-    const metricsRow = graphRes; // Wait, indices are [0:users, 1:revenue, 2:payouts, 3:pending, 4:graph]
-    // I added a new one to Promise.all so indices shifted.
-    /* usersRes[0], revenueRes[1], payoutsRes[2], pendingRes[3], metricsRes[4], graphRes[5] */
-    
+    const volume24h = Number(metricsRes.rows[0].volume);
+    const successRate = Number(metricsRes.rows[0].success_rate) || 0;
+    const platformCommission = Number(earningsRes.rows[0].platform_commission);
+
     return res.json({
       ok: true,
       totalUsers: Number(usersRes.rows[0].total_users),
       totalDeposits: revenue,
+      totalWithdrawals: payouts,
       totalProfit: revenue - payouts,
-      chapaBalance: 0,
+      platformEarnings: platformCommission,
+      chapaNetPosition: revenue - payouts,
       pendingWithdrawalAmount: pending,
-      // NEW
-      volume24h: Number(revenueRes.rows[0].total_revenue), // Use simple total for now as requested
-      successRate: 98.4, // Fallback high success rate for aesthetics or calculate if ready
+      volume24h,
+      successRate,
       graphData: (graphRes.rows || []).map(r => ({
         date: r.label,
         profit: Number(r.profit)
@@ -205,6 +213,8 @@ router.get('/dashboard-data', async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch dashboard data' });
   }
 });
+
+
 
 // ──────────────────────────────────────────────
 // GET /admin/metrics/recent

@@ -5,13 +5,17 @@ const SQL = {
     SELECT fn_wallet_apply_existing_tx($1::uuid) AS tx_id;
   `,
 
-  // Find deposit tx by providerRef (CHAPA tx_ref, etc.)
+  // Find deposit tx by tx_id (which is what we send to Chapa as tx_ref)
   findDepositTxByProviderRef: `
-    SELECT id, user_id, status
+    SELECT id, user_id, status, tx_id
     FROM wallet_transactions
     WHERE tx_type = 'DEPOSIT'
-      AND provider = $1::text
-      AND id = $2::uuid
+      AND status = 'PENDING'
+      AND (
+        tx_id::text = $2::text
+        OR provider_ref::text = $2::text
+        OR id::text = $2::text
+      )
     ORDER BY created_at DESC
     LIMIT 1
     FOR UPDATE;
@@ -22,14 +26,14 @@ const SQL = {
     WHERE user_id = $1::uuid;
   `,
 
-  // Mark completed by tx_id
+  // Mark completed by internal id (UUID PK)
   markTxCompletedById: `
     UPDATE wallet_transactions
     SET status = 'COMPLETED',
-        provider = COALESCE($2::text, provider),
-        provider_ref = $3::uuid,
+        provider_ref = COALESCE($2::text, provider_ref::text)::text,
         updated_at = now()
     WHERE id = $1::uuid
+      AND status = 'PENDING'
     RETURNING id, user_id;
   `,
 

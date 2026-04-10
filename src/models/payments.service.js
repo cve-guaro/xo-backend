@@ -67,30 +67,34 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
 // payments.service.js
 async function completeDeposit(providerRef, provider) {
   return withTx(async (client) => {
-    // 1) Find the deposit tx row using providerRef
+    // 1) Find the deposit tx row using providerRef (which is our tx_id sent to Chapa)
     const found = await client.query(SQL.findDepositTxByProviderRef, [provider, providerRef]);
     const txRow = found.rows[0];
 
     if (!txRow) {
-      // This means you never created a DEPOSIT tx row with provider_ref = providerRef
+      // This means you never created a DEPOSIT tx row with tx_id = providerRef
       throw new Error(`Deposit tx not found for providerRef=${providerRef}`);
     }
 
-    const txId = txRow.id;
+    const txId = txRow.id; // internal UUID primary key
     const userId = txRow.user_id;
+    const txRef = txRow.tx_id; // the UUID we sent to Chapa
 
-    console.log(`[DB TEST] Processing txId: ${txId} for userId: ${userId}`);
+    console.log(`[WEBHOOK] Processing txId: ${txId} for userId: ${userId} (tx_ref: ${txRef})`);
 
-    await client.query(SQL.markTxCompletedById, [providerRef, "CHAPA", txId]);
-    console.log(`[DB TEST] Transaction ${txId} marked as COMPLETED.`);
+    // 2. Mark the transaction as COMPLETED
+    await client.query(SQL.markTxCompletedById, [txId, provider]);
+    console.log(`[WEBHOOK] Transaction ${txId} marked as COMPLETED.`);
 
-    await client.query(SQL.applyExistingTx, [providerRef]); // providerRef == tx_id
-    console.log(`[DB TEST] Balance applied to userId: ${userId} via providerRef: ${providerRef}`);
+    // 3. Apply the balance using the tx_id (UUID we sent Chapa, used as idempotency key in fn)
+    // fn_wallet_apply_existing_tx uses tx_id to credit the wallet
+    await client.query(SQL.applyExistingTx, [txRef || txId]);
+    console.log(`[WEBHOOK] Balance applied to userId: ${userId} via txRef: ${txRef || txId}`);
 
-    // 4) Fetch wallet by userId (you need userId for this query)
+    // 4) Fetch wallet by userId
     const walletRes = await client.query(SQL.getWalletByUserId, [userId]);
     const finalBalance = walletRes.rows[0]?.available_balance;
-    console.log(`[DB TEST] Final Available Balance for userId ${userId}: ${finalBalance}`);
+    console.log(`[WEBHOOK] Final Available Balance for userId ${userId}: ${finalBalance}`);
 
     return { txId: txId, wallet: walletRes.rows[0] };
   });
