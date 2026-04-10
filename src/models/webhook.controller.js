@@ -33,31 +33,33 @@ function verifyChapaWebhookSignature(headers, rawBodyBuffer, parsedBody, secretK
     hash1 = crypto.createHmac("sha256", secretKey).update(rawBodyBuffer).digest("hex");
   }
 
-  // 2: Chapa-specific fallback verification (Stringified JSON)
-  let hash2 = "";
-  if (parsedBody && Object.keys(parsedBody).length > 0) {
-    hash2 = crypto.createHmac("sha256", secretKey).update(JSON.stringify(parsedBody)).digest("hex");
+  // 4: Fallback using API Secret Key instead of Webhook Secret Hash
+  let hash4 = "";
+  if (CHAPA.secret && rawBodyBuffer) {
+    hash4 = crypto.createHmac("sha256", CHAPA.secret).update(rawBodyBuffer).digest("hex");
   }
 
-  // 3: Legacy Chapa verification (Raw SHA256 of secret concatenated with body)
-  let hash3 = "";
-  if (rawBodyBuffer) {
-    hash3 = crypto.createHash("sha256").update(secretKey + rawBodyBuffer).digest("hex");
-  } else if (parsedBody) {
-    hash3 = crypto.createHash("sha256").update(secretKey + JSON.stringify(parsedBody)).digest("hex");
+  // 5: Fallback legacy using API Secret Key
+  let hash5 = "";
+  if (CHAPA.secret && rawBodyBuffer) {
+    hash5 = crypto.createHash("sha256").update(CHAPA.secret + rawBodyBuffer).digest("hex");
   }
   
   const isValid = (hash1.toLowerCase() === expectedSig.toLowerCase()) || 
                   (hash2.toLowerCase() === expectedSig.toLowerCase()) ||
-                  (hash3.toLowerCase() === expectedSig.toLowerCase());
+                  (hash3.toLowerCase() === expectedSig.toLowerCase()) ||
+                  (hash4.toLowerCase() === expectedSig.toLowerCase()) ||
+                  (hash5.toLowerCase() === expectedSig.toLowerCase());
   
   if (!isValid) {
     console.error("[WEBHOOK SECURITY] Signature mismatch!");
     console.error(`- Payload Size: ${rawBodyBuffer.length} bytes`);
     console.error(`- Received from Chapa: ${expectedSig}`);
-    console.error(`- Calculated Hash 1 (Raw HMAC): ${hash1}`);
-    console.error(`- Calculated Hash 2 (JSON HMAC): ${hash2}`);
-    console.error(`- Calculated Hash 3 (SHA256): ${hash3}`);
+    console.error(`- Calculated Hash 1 (Raw HMAC - WHash): ${hash1}`);
+    console.error(`- Calculated Hash 2 (JSON HMAC - WHash): ${hash2}`);
+    console.error(`- Calculated Hash 3 (SHA256 - WHash): ${hash3}`);
+    console.error(`- Calculated Hash 4 (Raw HMAC - APIKey): ${hash4}`);
+    console.error(`- Calculated Hash 5 (SHA256 - APIKey): ${hash5}`);
     
     // Masked secret key for verification without exposing it in logs
     const maskedKey = secretKey.length > 8 

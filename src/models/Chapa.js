@@ -75,10 +75,10 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
   const bankCodeMap = {
     'TELEBIRR':      '855',  // Verified: telebirr
     'TELEBIRR_USSD': '855', 
-    'CBE_BIRR':      '128',  // Verified: CBEBirr
-    'CBE':           '128',  
+    'CBE_BIRR':      '815',  // Verified: Commercial Bank of Ethiopia (CBE)
+    'CBE':           '815',  
     'MPESA':         '266',  // Verified: M-Pesa
-    'AWASH':         '801',  // Keep legacy or update if found
+    'AWASH':         '829',  // Verified: Awash Bank
     'CHAPA':         '855',  // Default to Telebirr
   };
   const bank_code = bankCodeMap[String(bank).toUpperCase()] || '855';
