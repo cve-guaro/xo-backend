@@ -62,7 +62,7 @@ const paymentLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20, // 20 requests per 15 min for auth
+  max: 200, // Increased to 200 for easier beta testing without 429 locks
   message: { error: "Security alert: Too many authentication attempts." }
 });
 

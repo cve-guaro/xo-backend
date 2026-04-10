@@ -187,7 +187,7 @@ router.get('/dashboard-data', async (req, res) => {
       // [7] Active Games
       pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('ongoing', 'live')`),
       // [8] Failed withdrawals
-      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status IN ('FAILED', 'REJECTED')`)
+      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'FAILED'`)
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
