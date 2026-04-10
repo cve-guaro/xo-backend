@@ -71,14 +71,14 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
 }
 
 async function initChapaPayout(tx_ref, amount, account_number, bank, account_name, secretKey) {
-  // Official Live Bank IDs from /v1/banks
+  // Official bank IDs verified from live /v1/banks endpoint
+  // NOTE: Only these banks are enabled for this Chapa merchant account
   const bankCodeMap = {
-    'TELEBIRR':      '855',  // Verified: telebirr
-    'TELEBIRR_USSD': '855', 
-    'CBE_BIRR':      '815',  // Verified: Commercial Bank of Ethiopia (CBE)
-    'CBE':           '815',  
-    'MPESA':         '266',  // Verified: M-Pesa
-    'AWASH':         '829',  // Verified: Awash Bank
+    'TELEBIRR':      '855',  // ✅ Verified: telebirr (phone number 09...)
+    'TELEBIRR_USSD': '855',
+    'CBE_BIRR':      '128',  // ✅ Verified: CBEBirr (mobile wallet, uses phone 09...)
+    'CBE':           '128',
+    'MPESA':         '266',  // ✅ Verified: M-Pesa (phone number)
     'CHAPA':         '855',  // Default to Telebirr
   };
   const bank_code = bankCodeMap[String(bank).toUpperCase()] || '855';
