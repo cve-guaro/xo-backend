@@ -156,4 +156,34 @@ router.post('/withdrawal/approve', async (req, res) => {
   return res.status(200).json({ status: 'Not implemented' });
 });
 
+router.get('/verify/:txRef', auth, async (req, res) => {
+  try {
+     const { verifyTx } = require('../models/Chapa');
+     const { completeDeposit } = require('../models/payments.service');
+     const txRef = req.params.txRef;
+
+     // Verify via Chapa
+     const chapaVer = await verifyTx(txRef);
+     
+     if (chapaVer?.status === 'success' && chapaVer?.data?.status === 'success') {
+         try {
+             // If this succeeds, it was PENDING and is now COMPLETED
+             const out = await completeDeposit(txRef, "CHAPA");
+             return res.json({ ok: true, status: 'COMPLETED', ...out });
+         } catch (e) {
+             // If it throws "Deposit tx not found", it means it's already COMPLETED by a webhook
+             if (e.message && e.message.includes('not found')) {
+                 return res.json({ ok: true, status: 'ALREADY_COMPLETED' });
+             }
+             throw e;
+         }
+     }
+     
+     return res.json({ ok: false, status: 'PENDING' });
+  } catch (e) {
+     console.error("[VERIFY API] Error:", e);
+     return res.status(500).json({ detail: "Verification failed" });
+  }
+});
+
 module.exports = router;

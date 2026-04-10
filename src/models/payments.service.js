@@ -187,7 +187,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       userId,
       "WITHDRAW_REQUEST",
       amountEtb,
-      "PENDING", // Withdraw requests start as pending until admin approval
+      "COMPLETED", // Immediately complete so the balance cuts instantly
       idem,
       null,
       null,
