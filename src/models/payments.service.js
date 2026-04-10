@@ -138,8 +138,8 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   const amountEtb = Math.round(Number(amount));
   
   // Validation
-  if (!amountEtb || amountEtb < 50) {
-    const err = new Error("Minimum withdrawal is 50 ETB");
+  if (!amountEtb || amountEtb < 10) {
+    const err = new Error("Minimum withdrawal is 10 ETB");
     err.status = 400;
     throw err;
   }
@@ -219,19 +219,32 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     const chapaRes = await initChapaPayout(
       reserveTxId,          // tx_ref (UUID)
       amountEtb,            // amount in ETB
-      finalDestination,     // account_number (phone)
-      payoutMethod,         // bank code
-      "xoet user",          // account_name
+      finalDestination,     // account_number (phone/account)
+      payoutMethod,         // bank key (e.g. TELEBIRR, CBE_BIRR)
+      "XO ET User",         // account_name
       undefined             // use default CHAPA.secret from env
     );
     chapaStatus = 'submitted';
-    // If Chapa returns a checkout URL (for some payout methods)
     if (chapaRes?.data?.checkout_url) {
       checkout_url = chapaRes.data.checkout_url;
     }
   } catch (chapaErr) {
-    // Log for admin review — do NOT throw, the DB state is still committed
+    const chapaMsg = String(chapaErr?.response?.message || chapaErr?.message || '');
     console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
+    
+    // Surface critical Chapa errors back to user
+    if (chapaMsg.toLowerCase().includes('insufficient') || chapaMsg.toLowerCase().includes('balance')) {
+      const e = new Error('CHAPA_INSUFFICIENT_BALANCE');
+      e.status = 503;
+      throw e;
+    }
+    if (chapaMsg.toLowerCase().includes('invalid account') || chapaMsg.toLowerCase().includes('account not found')) {
+      const e = new Error('CHAPA_INVALID_ACCOUNT');
+      e.status = 422;
+      throw e;
+    }
+    // Non-critical: log but continue — DB committed, admin manually processes
+    chapaStatus = 'pending_manual';
   }
 
   return { withdrawRequest, wallet, chapaStatus, checkout_url };
