@@ -99,6 +99,8 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
  */
 async function verifyTx(tx_ref, secretKey) {
   return chapaFetch(`/transaction/verify/${encodeURIComponent(tx_ref)}`, 'GET', null, secretKey);
+}
+
 /**
  * Get Chapa balances
  */
