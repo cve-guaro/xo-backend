@@ -63,6 +63,44 @@ const METHODS = [
   }
 });
 
+// Intermediate Bounce Page for Telegram/WebView CSRF Fix
+router.get('/chapa-bounce/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query('SELECT metadata FROM payment_transactions WHERE id = $1', [id]);
+    if (!rows.length) return res.status(404).send('Not found');
+    
+    const url = rows[0].metadata?.checkout_url;
+    if (!url) return res.status(404).send('No checkout URL');
+
+    // This meta-refresh + JS structure forces WebViews (like Telegram) to treat 
+    // the navigation as a first-party document transition, fixing the SameSite/CSRF block on Chapa's Laravel backend.
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="refresh" content="0; url=${url}">
+        <title>Redirecting to Payment...</title>
+      </head>
+      <body style="background: #060814; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh;">
+        <div style="text-align: center;">
+           <p>Connecting to secure payment...</p>
+           <p style="font-size: 12px; color: #888;">If you are not redirected automatically, <a href="${url}" style="color: #00daf3;">click here</a>.</p>
+        </div>
+        <script>
+           setTimeout(function() {
+              window.location.href = "${url}";
+           }, 500);
+        </script>
+      </body>
+      </html>
+    `);
+  } catch (e) {
+    res.status(500).send('Error redirecting');
+  }
+});
+
 // 0) GET BANK CODES DIRECTLY FROM CHAPA
 router.get('/chapa-banks', async (req, res) => {
   try {
