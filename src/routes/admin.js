@@ -210,6 +210,20 @@ router.get('/dashboard-data', async (req, res) => {
     const successRate = Number(metricsRes.rows[0].success_rate) || 0;
     const platformCommission = Number(earningsRes.rows[0].platform_commission);
 
+    let realChapaBalance = revenue - payouts;
+    try {
+      const chapaBalances = await getChapaBalance(CHAPA.secret);
+      if (chapaBalances && chapaBalances.data && Array.isArray(chapaBalances.data)) {
+        const etbBalance = chapaBalances.data.find((b) => b.currency === 'ETB') || chapaBalances.data[0];
+        if (etbBalance) {
+          // Send back the actual available balance from Chapa
+          realChapaBalance = Number(etbBalance.available_balance || etbBalance.balance || 0);
+        }
+      }
+    } catch (apiErr) {
+      console.error('[ADMIN] Failed to fetch real Chapa balance:', apiErr.message);
+    }
+
     return res.json({
       ok: true,
       totalUsers: Number(usersRes.rows[0].total_users),
@@ -217,7 +231,7 @@ router.get('/dashboard-data', async (req, res) => {
       totalWithdrawals: payouts,
       totalProfit: revenue - payouts,
       platformEarnings: platformCommission,
-      chapaNetPosition: revenue - payouts,
+      chapaNetPosition: realChapaBalance,
       pendingWithdrawalAmount: pending,
       volume24h,
       successRate,

@@ -262,9 +262,12 @@ router.get('/verify-pending', auth, async (req, res) => {
      const { completeDeposit } = require('../models/payments.service');
      const { pool } = require('../db/index');
      
-     // Find all pending deposits for this user
+     // Find up to 2 most recent pending deposits for this user within the last 24 hours
      const { rows } = await pool.query(
-        "SELECT id AS tx_id FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'PENDING'",
+        `SELECT id AS tx_id 
+         FROM wallet_transactions 
+         WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'PENDING' AND created_at > now() - interval '24 hours'
+         ORDER BY created_at DESC LIMIT 2`,
         [req.user.id]
      );
      
@@ -279,6 +282,8 @@ router.get('/verify-pending', auth, async (req, res) => {
                      completedCount++;
                  } catch (e) { } // Ignore if already completed concurrently
              }
+             // Small delay between verify requests to prevent 429
+             await new Promise((r) => setTimeout(r, 600));
          } catch(e) {
              console.error(`[VERIFY PENDING] Error verifying tx ${row.tx_id}`);
          }
