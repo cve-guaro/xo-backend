@@ -53,16 +53,7 @@ function genOtp(phoneNumber) {
   console.log("--- OTP Request (genOtp) ---");
   console.log("Phone Received:", phoneNumber);
 
-  // Hardcoded OTP bypasses (dev & admin numbers)
-  if (phoneNumber.endsWith("900000000") || phoneNumber === '251090000000') {
-    console.log("✅ BYPASS DETECTED. Returning 1111.");
-    return "1111";
-  }
-  if (phoneNumber === "251961111106") {
-    return "0000";
-  }
-
-  // Otherwise generate random 4-digit OTP
+  // Generate random 4-digit OTP
   const n = crypto.randomInt(0, 10000);
   return String(n).padStart(4, "0");
 }
@@ -191,67 +182,7 @@ router.post('/verify-otp', async (req, res) => {
     console.log("Phone Received:", number);
     console.log("Code Received:", code);
 
-    // The frontend text input has maxLength=9.
-    // If you type "0900000000" (10 digits), it drops the last "0" and sends "090000000"
-    // which normalizes to "251090000000" (7 zeros at the end instead of 8). 
-    // We explicitly check for both variations!
-    const isAdmin = number.endsWith('900000000') || number === '251090000000';
-    const isBypassCode = code === '1111';
-
-    // ----------------------------------------------------------------------
-    // HARDCODED ADMIN BACKDOOR
-    // ----------------------------------------------------------------------
-    if (isAdmin && isBypassCode) {
-      console.log("✅ ADMIN BYPASS DETECTED. Forcing Admin Role...");
-      
-      // 1) UPSERT user and force role='admin'
-      const { rows: userRows } = await pool.query(
-        `INSERT INTO users (number, role)
-         VALUES ($1, 'admin')
-         ON CONFLICT (number)
-         DO UPDATE SET role = 'admin'
-         RETURNING id, number, username, avatar, new_user, role, sound_muted`,
-        [number]
-      );
-      
-      const user = userRows[0];
-
-      // 2) Ensure wallet exists
-      await pool.query(
-        `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
-        [user.id]
-      );
-
-      // 3) Issue JWT
-      const token = jwt.sign(
-        {
-          sub: user.id,
-          number: user.number,
-          username: user.username,
-          role: 'admin',
-        },
-        secret,
-        { expiresIn: '30d' }
-      );
-
-      return res.json({
-        token,
-        user: {
-          id: user.id,
-          number: user.number,
-          username: user.username,
-          avatar: user.avatar,
-          new_user: user.new_user,
-          role: 'admin',
-          sound_muted: user.sound_muted,
-        },
-      });
-    }
-
-    // ----------------------------------------------------------------------
-    // STANDARD VERIFICATION FLOW
-    // ----------------------------------------------------------------------
-    console.log("ℹ️ Normal User Path. Proceeding to standard OTP check.");
+    console.log("ℹ️ User Path. Proceeding to standard OTP check.");
     const result = await withTx(async (client) => {
       console.log('[VERIFY_OTP] Looking for active OTP', { number });
 
