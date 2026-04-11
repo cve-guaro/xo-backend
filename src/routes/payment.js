@@ -135,9 +135,10 @@ router.post('/deposit', auth, async (req, res) => {
 
 
     // 1. Determine the return destination
-    // If web, go to Vercel. If mobile, let Chapa stay in the closed loop/handle return natively.
+    // After Chapa payment finishes, redirect user back to the gameplay home page
+    const baseUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
     const platformReturnUrl = req.isWeb 
-       ? process.env.FRONTEND_URL 
+       ? `${baseUrl}/home/gameplay` 
        : undefined; // Safer to pass undefined for mobile if no scheme is ready
 
     const out = await initDeposit({
