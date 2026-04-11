@@ -63,6 +63,25 @@ router.patch('/settings', async (req, res) => {
   }
 });
 
+router.post('/giveaway/reset', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT value FROM global_settings WHERE key = 'current_giveaway_version'`);
+    let currentVersion = rows.length ? Number(rows[0].value) : 0;
+    const newVersion = currentVersion + 1;
+    
+    await pool.query(`
+      INSERT INTO global_settings (key, value) VALUES ('current_giveaway_version', $1::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+    `, [JSON.stringify(newVersion)]);
+    
+    await logAdminAction(req.user.id, 'reset_giveaway_version', null, { version: newVersion });
+    return res.json({ ok: true, newVersion });
+  } catch (err) {
+    console.error('[GIVEAWAY_RESET_ERR]', err);
+    return res.status(500).json({ error: 'Failed to reset giveaway' });
+  }
+});
+
 // ──────────────────────────────────────────────
 // GET /admin/stats
 // Overview KPI numbers
@@ -78,6 +97,11 @@ router.get('/stats', async (req, res) => {
                   FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_withdrawals
                   FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
+      pool.query(`
+        SELECT COUNT(*) as claims 
+        FROM users 
+        WHERE claimed_giveaway_version = (SELECT (value->>0)::int FROM global_settings WHERE key = 'current_giveaway_version' LIMIT 1)
+      `)
     ]);
 
     const deposits = Number(revenueRes.rows[0].total_deposits);
@@ -90,6 +114,7 @@ router.get('/stats', async (req, res) => {
       totalDeposits: deposits,
       totalWithdrawals: withdrawals,
       totalProfit: (deposits - withdrawals),
+      giveawayClaims: Number(giveawayRes.rows[0].claims || 0),
       // New real-time metrics for dashboard boxes
       volume24h: deposits, 
       successRate: (deposits > 0) ? (deposits / (deposits + Number(pendingRes.rows[0].pending_amount) * 1.5)) : 100,
@@ -171,8 +196,8 @@ router.get('/dashboard-data', async (req, res) => {
       `),
       // [7] Active Games
       pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('ongoing', 'live')`),
-      // [8] Failed withdrawals
-      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'FAILED'`)
+      // [8] Failed withdrawals (Count any withdrawal tx that didn't succeed)
+      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND (status = 'FAILED' OR status = 'ERROR')`)
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
@@ -570,8 +595,8 @@ router.patch('/users/:id', async (req, res) => {
       const walletParams = [];
       let wIdx = 1;
 
-      if (available_balance !== undefined) { walletUpdates.push(`available_balance = $${wIdx++}`); walletParams.push(Math.round(Number(available_balance) * 100)); } // Assume parsed ETH logic provided
-      if (bonus_balance !== undefined) { walletUpdates.push(`bonus_balance = $${wIdx++}`); walletParams.push(Math.round(Number(bonus_balance) * 100)); }
+      if (available_balance !== undefined) { walletUpdates.push(`available_balance = $${wIdx++}`); walletParams.push(Math.round(Number(available_balance))); }
+      if (bonus_balance !== undefined) { walletUpdates.push(`bonus_balance = $${wIdx++}`); walletParams.push(Math.round(Number(bonus_balance))); }
       
       let walletRes;
       if (walletUpdates.length > 0) {
@@ -613,7 +638,7 @@ router.post('/users', async (req, res) => {
       const user = userRes.rows[0];
 
       // 2. Initialize Wallet
-      const balCents = Math.round(Number(balance || 0) * 100);
+      const balCents = Math.round(Number(balance || 0));
       await client.query(
         `INSERT INTO wallets (user_id, available_balance, bonus_balance) VALUES ($1, $2, $3)`,
         [user.id, balCents, 0]
@@ -814,8 +839,10 @@ router.patch('/transactions/:id/approve', async (req, res) => {
         );
       }
 
-      await logAdminAction(req.user.id, 'approved_transaction', txn.user_id, { tx_id: req.params.id, type: txn.tx_type, amount: txn.amount });
+      await logAdminAction(req.user.id, 'approved_transaction', txn.user_id, { tx_id: req.params.id, amount: txn.amount, type: txn.tx_type });
     });
+
+    return res.json({ ok: true });
 
     return res.json({ ok: true });
   } catch (err) {
@@ -903,8 +930,8 @@ router.get('/audit-logs', async (req, res) => {
         u.number as admin_number,
         COALESCE(t.username, t.number, l.target_id::text) as target_name
       FROM admin_audit_logs l
-      LEFT JOIN users u ON l.admin_id = u.id
-      LEFT JOIN users t ON l.target_id = t.id
+      LEFT JOIN users u ON l.admin_id::text = u.id::text
+      LEFT JOIN users t ON l.target_id::text = t.id::text
       ORDER BY l.created_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);

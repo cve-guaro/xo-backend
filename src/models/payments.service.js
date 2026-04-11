@@ -169,15 +169,12 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       throw err;
     }
 
-    // 2) Check balance - must exclude the 10 ETB bonus
+    // 2) Check balance - use the withdrawable_balance column which excludes bonuses
     const walletCheck = await client.query(SQL.getWallet, [userId]);
     const walletData = walletCheck.rows[0];
-    const available = Number(walletData?.available_balance || 0);
+    const withdrawable = Number(walletData?.withdrawable_balance || 0);
     
-    // The user can withdraw (Available - 10 Bonus)
-    const currentWithdrawable = Math.max(0, available - 10);
-    
-    if (currentWithdrawable < amountEtb) {
+    if (withdrawable < amountEtb) {
       const err = new Error("Insufficient withdrawable balance (Registration bonus is not withdrawable).");
       err.status = 400;
       throw err;

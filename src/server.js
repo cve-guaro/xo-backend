@@ -73,13 +73,19 @@ app.use('/auth', authLimiter);
 app.use(generalLimiter);
 
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────
-app.use(express.json({
-  verify: (req, res, buf) => {
-    if (req.originalUrl.includes('/webhook')) {
-      req.rawBody = buf; // Store the exact raw buffer exclusively for webhooks
+// Enable raw body capture for all JSON requests to support webhook HMAC signature verification
+app.use(express.raw({ type: 'application/json' }));
+app.use((req, res, next) => {
+  if (req.body instanceof Buffer) {
+    req.rawBody = req.body; // Store exact raw buffer for HMAC checks
+    try {
+      req.body = JSON.parse(req.body.toString());
+    } catch (e) {
+      req.body = {}; // Handle malformed JSON gracefully
     }
   }
-}));
+  next();
+});
 
 // ─── DETECTION & SECURITY ──────────────────────────────────────────────────────
 app.use(platformDetection);
@@ -106,8 +112,19 @@ setupGameSocket(io);
 // ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
 (async () => {
   try {
+    // Basic user preferences
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sound_muted BOOLEAN DEFAULT false;`);
     
+    // Performance & Maintenance giveaway system
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_giveaway_version INTEGER DEFAULT 0;`);
+    
+    // Initialize global giveaway settings if not exists
+    await pool.query(`
+      INSERT INTO global_settings (key, value) 
+      VALUES ('current_giveaway_version', '1'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
+    `);
+
     // Create systems alerts table for security monitoring
     await pool.query(`
       CREATE TABLE IF NOT EXISTS system_alerts (

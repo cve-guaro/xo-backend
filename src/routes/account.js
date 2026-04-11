@@ -177,4 +177,83 @@ router.get('/transactions', auth, async (req, res) => {
   }
 });
 
+// PATCH /account/welcome-seen -> Refactored to "Claim Giveaway"
+router.patch("/welcome-seen", auth, async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?.sub || req.user?.userId;
+
+    // 1. Get current giveaway configuration
+    const settingsRes = await pool.query(`
+      SELECT key, value FROM global_settings 
+      WHERE key IN ('current_giveaway_version', 'welcome_bonus_amount', 'welcome_bonus_active')
+    `);
+    const config = {};
+    for (const r of settingsRes.rows) config[r.key] = r.value;
+
+    const currentVersion = Number(config.current_giveaway_version || 1);
+    const bonusAmount = Number(config.welcome_bonus_amount || 10);
+    const isActive = config.welcome_bonus_active === true || config.welcome_bonus_active === 'true';
+
+    if (!isActive) {
+      return res.status(403).json({ message: "Giveaway is currently inactive" });
+    }
+
+    // 2. Atomic check and update using a transaction or a single robust query
+    // We update the user and wallet only if the user hasn't claimed the current version yet.
+    const result = await pool.query(`
+      WITH updated_user AS (
+        UPDATE users 
+        SET claimed_giveaway_version = $1, has_seen_welcome_bonus = TRUE
+        WHERE id = $2 AND (claimed_giveaway_version IS NULL OR claimed_giveaway_version < $1)
+        RETURNING id
+      )
+      UPDATE wallets
+      SET bonus_balance = bonus_balance + $3
+      WHERE user_id IN (SELECT id FROM updated_user)
+      RETURNING user_id;
+    `, [currentVersion, userId, bonusAmount]);
+
+    if (result.rowCount === 0) {
+      // Either user doesn't exist or already claimed this version
+      return res.status(400).json({ message: "Giveaway already claimed or user not found" });
+    }
+
+    // 3. Log the bonus
+    await pool.query(
+      `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+      [userId, bonusAmount, `Giveaway v${currentVersion} Claimed`]
+    ).catch(err => console.error('[BONUS_LOG] Claim log error:', err));
+
+    res.json({ ok: true, amount: bonusAmount, version: currentVersion });
+  } catch (e) {
+    console.error("Giveaway claim error:", e);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// GET /account/config -> Returns public/user-level settings
+router.get("/config", auth, async (req, res) => {
+  try {
+    const settingsRes = await pool.query(`
+      SELECT key, value FROM global_settings 
+      WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount')
+    `);
+    const config = {};
+    for (const r of settingsRes.rows) {
+      // Postgres jsonb might already be parsed depending on driver, but we'll be safe
+      config[r.key] = typeof r.value === 'string' ? JSON.parse(r.value) : r.value;
+    }
+    
+    res.json({
+      ok: true,
+      current_giveaway_version: Number(config.current_giveaway_version || 1),
+      welcome_bonus_active: config.welcome_bonus_active === true || config.welcome_bonus_active === 'true',
+      welcome_bonus_amount: Number(config.welcome_bonus_amount || 10)
+    });
+  } catch (e) {
+    console.error("Config fetch error:", e);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 module.exports = router;
