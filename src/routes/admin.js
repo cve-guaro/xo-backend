@@ -100,7 +100,9 @@ router.get('/stats', async (req, res) => {
       pool.query(`
         SELECT COUNT(*) as claims 
         FROM users 
-        WHERE claimed_giveaway_version = (SELECT (value->>0)::int FROM global_settings WHERE key = 'current_giveaway_version' LIMIT 1)
+        WHERE claimed_giveaway_version = COALESCE(
+          (SELECT value::text::int FROM global_settings WHERE key = 'current_giveaway_version' LIMIT 1), 1
+        )
       `)
     ]);
 
@@ -129,7 +131,8 @@ router.get('/stats', async (req, res) => {
 router.get('/dashboard-data', async (req, res) => {
   try {
     // ─── Timeframe Range Logic ───
-    const range = req.query.range || 'week';
+    const rawRange = req.query.range || 'week';
+    const range = ['day', 'week', 'month'].includes(rawRange) ? rawRange : 'week';
     let interval = '7 days';
     let trunc = 'day';
     let format = 'Mon DD';
@@ -197,7 +200,7 @@ router.get('/dashboard-data', async (req, res) => {
       // [7] Active Games
       pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('ongoing', 'live')`),
       // [8] Failed withdrawals (Count any withdrawal tx that didn't succeed)
-      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND (status = 'FAILED' OR status = 'ERROR')`)
+      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND status = 'FAILED'`)
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);

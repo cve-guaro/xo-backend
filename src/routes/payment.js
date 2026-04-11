@@ -148,12 +148,12 @@ router.post('/withdraw', auth, async (req, res) => {
     // Respect the user's provided payout destination; fallback to registered phone only if destination is null/undefined/empty
     const destination = (payoutDestination && String(payoutDestination).trim() !== "") 
       ? payoutDestination 
-      : userPhone;
+      : req.user.phone_number;
     
     const out = await requestWithdraw({
       userId,
       amount: amt,
-      phoneNumber: userPhone,
+      phoneNumber: req.user.phone_number,
       payoutMethod: payoutMethod || "chapa",
       payoutDestination: destination,
     });
