@@ -144,16 +144,15 @@ router.post('/withdraw', auth, async (req, res) => {
       return res.status(400).json({ detail: `Minimum withdrawal is ${dynMin} ETB` });
     }
 
-    // Lock payout destination to user's registered phone number to prevent money laundering
+    // Lock payout destination to user's registered phone number only if not provided
     const userPhone = req.user.phone_number || req.user.number;
-    if (!userPhone) return res.status(400).json({ detail: "User phone number is missing." });
     
     const out = await requestWithdraw({
       userId,
       amount: amt,
       phoneNumber: userPhone,
       payoutMethod: payoutMethod || "chapa",
-      payoutDestination: userPhone,
+      payoutDestination: payoutDestination || userPhone,
     });
 
     return res.json(out);

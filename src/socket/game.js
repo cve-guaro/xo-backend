@@ -599,6 +599,33 @@ function scheduleGameStart(io, matchId) {
   game.startTimeout = setTimeout(() => {
     const g = activeGames.get(matchId);
     if (!g) return;
+
+    // ✅ PREVENT GHOST MATCHES: Check if both players are still connected
+    const sX = g.sockets.X;
+    const sO = g.sockets.O;
+    if (!sX || !sO || sX.disconnected || sO.disconnected) {
+      logAlways(`[MM] Ghost Match Cleaning matchId=${matchId}: X disconnected? ${!sX || sX.disconnected}, O disconnected? ${!sO || sO.disconnected}`);
+      
+      const loserSymbol = (!sX || sX.disconnected) ? "X" : "O";
+      const winnerSymbol = (loserSymbol === "X" ? "O" : "X");
+      const winnerId = g.players[winnerSymbol];
+      const { prize } = calculatePrize(g.betAmount);
+      
+      if (winnerId) {
+        finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
+          console.error("Ghost cleanup payout err:", err)
+        );
+        io.to(matchId).emit("game_won", { 
+          winnerSymbol, 
+          winnerId, 
+          reason: "opponent_left", 
+          prizeAmount: Number(prize) 
+        });
+      }
+      cleanupGame(matchId);
+      return;
+    }
+
     g.status = "live"; // allow moves now
     io.to(matchId).emit("match_started", {
       matchId,

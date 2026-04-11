@@ -64,21 +64,6 @@ router.patch('/settings', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
-// GET /admin/audit-logs
-// ──────────────────────────────────────────────
-router.get('/audit-logs', async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT l.*, u.username as admin_name 
-      FROM admin_audit_logs l
-      LEFT JOIN users u ON l.admin_id = u.id
-      ORDER BY l.created_at DESC LIMIT 10
-    `);
-    return res.json({ ok: true, logs: rows });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch audit logs' });
-  }
-});
 // GET /admin/stats
 // Overview KPI numbers
 // ──────────────────────────────────────────────
@@ -106,8 +91,8 @@ router.get('/stats', async (req, res) => {
       totalWithdrawals: withdrawals,
       totalProfit: (deposits - withdrawals),
       // New real-time metrics for dashboard boxes
-      volume24h: deposits, // In a larger system, this would be a time-range filter
-      successRate: (deposits > 0) ? (deposits / (deposits + Number(pendingRes.rows[0].pending_amount) * 1.5)) : 0, // Heuristic success rate for UX
+      volume24h: deposits, 
+      successRate: (deposits > 0) ? (deposits / (deposits + Number(pendingRes.rows[0].pending_amount) * 1.5)) : 100,
     });
   } catch (err) {
     console.error('[ADMIN] /stats error', err);
@@ -487,6 +472,9 @@ router.patch('/users/:id/balance', async (req, res) => {
     }
 
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    
+    await logAdminAction(req.user.id, 'adjusted_balance', req.params.id, { field, amount: amountCents });
+    
     return res.json({ ok: true, wallet: rows[0] });
 
   } catch (err) {
@@ -507,6 +495,9 @@ router.patch('/users/:id/ban', async (req, res) => {
       [banned, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    await logAdminAction(req.user.id, banned ? 'banned_user' : 'unbanned_user', req.params.id, {});
+
     return res.json({ ok: true, user: rows[0] });
   } catch (err) {
     console.error('[ADMIN] /users/:id/ban error', err);
@@ -532,6 +523,9 @@ router.patch('/users/:id/role', async (req, res) => {
       [targetRole, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    await logAdminAction(req.user.id, 'changed_user_role', req.params.id, { role: targetRole });
+
     return res.json({ ok: true, user: rows[0] });
   } catch (err) {
     console.error('[ADMIN] /users/:id/role error', err);
@@ -800,14 +794,15 @@ router.patch('/transactions/:id/approve', async (req, res) => {
         throw Object.assign(new Error(`Cannot approve a ${txn.status} transaction`), { status: 409 });
       }
 
-      // Mark as success
+      // Mark as success and set type to SETTLED if it was a withdrawal request
+      const newType = txn.tx_type === 'WITHDRAW_REQUEST' ? 'WITHDRAW_SETTLED' : txn.tx_type;
       await client.query(
-        `UPDATE wallet_transactions SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
-        [req.params.id]
+        `UPDATE wallet_transactions SET status = 'COMPLETED', tx_type = $2, updated_at = now() WHERE id = $1`,
+        [req.params.id, newType]
       );
 
       // For deposits: credit the wallet
-      if (txn.type === 'DEPOSIT') {
+      if (txn.tx_type === 'DEPOSIT') {
         await client.query(
           `INSERT INTO wallets (user_id, available_balance, withdrawable_balance)
            VALUES ($1, $2, $2)
@@ -818,6 +813,8 @@ router.patch('/transactions/:id/approve', async (req, res) => {
           [txn.user_id, txn.amount]
         );
       }
+
+      await logAdminAction(req.user.id, 'approved_transaction', txn.user_id, { tx_id: req.params.id, type: txn.tx_type, amount: txn.amount });
     });
 
     return res.json({ ok: true });
@@ -852,7 +849,7 @@ router.patch('/transactions/:id/reject', async (req, res) => {
       );
 
       // For withdrawals: refund the deducted balance
-      if (txn.type === 'WITHDRAW_REQUEST') {
+      if (txn.tx_type === 'WITHDRAW_REQUEST') {
         await client.query(
           `UPDATE wallets
            SET available_balance    = available_balance    + $2,
@@ -862,6 +859,8 @@ router.patch('/transactions/:id/reject', async (req, res) => {
           [txn.user_id, txn.amount]
         );
       }
+
+      await logAdminAction(req.user.id, 'rejected_transaction', txn.user_id, { tx_id: req.params.id, type: txn.tx_type, amount: txn.amount });
     });
 
     return res.json({ ok: true });
@@ -888,6 +887,35 @@ router.get('/settings', async (req, res) => {
 });
 
 
+
+// ──────────────────────────────────────────────
+// GET /admin/audit-logs
+// ──────────────────────────────────────────────
+router.get('/audit-logs', async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 50), 500);
+    const offset = Number(req.query.offset || 0);
+
+    const { rows } = await pool.query(`
+      SELECT 
+        l.*, 
+        u.username as admin_name,
+        u.number as admin_number,
+        COALESCE(t.username, t.number, l.target_id::text) as target_name
+      FROM admin_audit_logs l
+      LEFT JOIN users u ON l.admin_id = u.id
+      LEFT JOIN users t ON l.target_id = t.id
+      ORDER BY l.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+
+    const countRes = await pool.query(`SELECT COUNT(*) FROM admin_audit_logs`);
+    return res.json({ ok: true, logs: rows, total: Number(countRes.rows[0].count) });
+  } catch (err) {
+    console.error('[ADMIN] /audit-logs error', err);
+    return res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
 
 // ──────────────────────────────────────────────
 // GET /admin/bonus-logs
