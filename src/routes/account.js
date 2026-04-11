@@ -203,7 +203,7 @@ router.patch("/welcome-seen", auth, async (req, res) => {
     const result = await pool.query(`
       WITH updated_user AS (
         UPDATE users 
-        SET claimed_giveaway_version = $1, has_seen_welcome_bonus = TRUE
+        SET claimed_giveaway_version = $1
         WHERE id = $2 AND (claimed_giveaway_version IS NULL OR claimed_giveaway_version < $1)
         RETURNING id
       )

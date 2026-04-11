@@ -88,7 +88,7 @@ router.post('/giveaway/reset', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
-    const [usersRes, gamesRes, pendingRes, revenueRes, payoutsRes] = await Promise.all([
+    const [usersRes, gamesRes, pendingRes, revenueRes, payoutsRes, giveawayRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COUNT(*) AS active_games FROM games WHERE status = 'ongoing'`),
       pool.query(`SELECT COUNT(*) AS pending_withdrawals, COALESCE(SUM(amount), 0) AS pending_amount
