@@ -64,14 +64,12 @@ const METHODS = [
 });
 
 // Intermediate Bounce Page for Telegram/WebView CSRF Fix
-router.get('/chapa-bounce/:id', async (req, res) => {
+router.get('/chapa-bounce', async (req, res) => {
   try {
-    const { id } = req.params;
-    const { rows } = await pool.query('SELECT metadata FROM payment_transactions WHERE id = $1', [id]);
-    if (!rows.length) return res.status(404).send('Not found');
-    
-    const url = rows[0].metadata?.checkout_url;
-    if (!url) return res.status(404).send('No checkout URL');
+    const url = req.query.url;
+    if (!url || !url.startsWith('https://checkout.chapa.co/')) {
+      return res.status(400).send('Invalid Chapa checkout URL');
+    }
 
     // This meta-refresh + JS structure forces WebViews (like Telegram) to treat 
     // the navigation as a first-party document transition, fixing the SameSite/CSRF block on Chapa's Laravel backend.
@@ -81,17 +79,17 @@ router.get('/chapa-bounce/:id', async (req, res) => {
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <meta http-equiv="refresh" content="0; url=${url}">
-        <title>Redirecting to Payment...</title>
+        <title>Redirecting to Secure Payment...</title>
       </head>
-      <body style="background: #060814; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh;">
+      <body style="background: #060814; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
         <div style="text-align: center;">
-           <p>Connecting to secure payment...</p>
-           <p style="font-size: 12px; color: #888;">If you are not redirected automatically, <a href="${url}" style="color: #00daf3;">click here</a>.</p>
+           <p style="font-weight: bold; font-size: 16px;">Connecting to secure payment...</p>
+           <p style="font-size: 13px; color: #888;">If you are not redirected automatically, <a href="${url}" style="color: #a78bfa;">click here</a>.</p>
         </div>
         <script>
            setTimeout(function() {
               window.location.href = "${url}";
-           }, 500);
+           }, 200);
         </script>
       </body>
       </html>
