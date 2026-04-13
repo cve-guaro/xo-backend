@@ -1050,9 +1050,8 @@ function setupGameSocket(io) {
         const inGameId = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGameId) {
            console.log(`[MM] Denying cancel for ${userId} - Already matched in ${inGameId}`);
-           if (typeof ack === "function") ack({ ok: false, error: "ALREADY_MATCHED", matchId: inGameId });
-           socket.emit("error", { code: "ALREADY_MATCHED", message: "Match already found! Starting game..." });
-           return;
+            if (typeof ack === "function") ack({ ok: false, error: "ALREADY_MATCHED", matchId: inGameId });
+            return;
         }
 
         const queueKey = socketSearching.get(socket.id);

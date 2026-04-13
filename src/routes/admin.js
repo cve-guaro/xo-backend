@@ -330,57 +330,26 @@ router.get('/metrics/daily-trends', async (req, res) => {
 
 
 // ──────────────────────────────────────────────
-// GET /admin/users?search=&limit=&offset=
+// GET /admin/users?search=&limit=&offset=&role=&status=
 // Searchable paginated user list
 // ──────────────────────────────────────────────
 router.get('/users', async (req, res) => {
   try {
-    const limit  = Math.min(Number(req.query.limit  || 200), 500);
-    const offset = Number(req.query.offset || 0);
+    const { limit = 100, offset = 0, search = '', role = 'all', status = 'all' } = req.query;
+    const rawSearch = search.trim();
+    
+    let whereClauses = [];
+    let queryParams = [];
+    let paramIdx = 1;
 
-    // Normalize the raw search term: strip +, spaces, dashes, parens
-    const rawSearch = (req.query.search || '').toString().trim();
-    // Normalized: digits only (for phone comparison)
-    const normSearch = rawSearch.replace(/[\s\-\+\(\)]/g, '');
-    // Strip Ethiopian country code prefix for a simpler 9-digit tail match
-    const tail9 = normSearch.replace(/^251/, '').replace(/^0/, '');
-
-    let query, params;
+    // Base searchable fields
     if (rawSearch) {
+      const normSearch = rawSearch.replace(/[\s\-\+\(\)]/g, '');
+      const tail9      = normSearch.length >= 9 ? normSearch.slice(-9) : null;
       const likePat     = `%${rawSearch}%`;
       const normLike    = normSearch ? `%${normSearch}%` : null;
       const tail9Like   = tail9     ? `%${tail9}%`     : null;
 
-      query = `
-        SELECT u.id, u.number, u.username, u.display_name, u.avatar,
-               u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins, u.created_at,
-               COALESCE(w.available_balance, 0)    AS available_balance,
-               COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
-               COALESCE(w.bonus_balance, 0)        AS bonus_balance
-        FROM users u
-        LEFT JOIN wallets w ON w.user_id = u.id
-        WHERE
-          -- username / display_name freetext
-          u.username     ILIKE $1
-          OR u.display_name ILIKE $1
-          -- raw phone match
-          OR u.number    ILIKE $1
-          -- normalized digits match (strips +/spaces from stored number)
-          OR REGEXP_REPLACE(u.number, '[^0-9]', '', 'g') ILIKE $2
-          -- last-9-digits tail match (handles 0961… vs 961… vs 251961…)
-          OR RIGHT(REGEXP_REPLACE(u.number, '[^0-9]', '', 'g'), 9) ILIKE $3
-          -- ID prefix
-          OR CAST(u.id AS TEXT) ILIKE $1
-          -- Balance or Bonus match (simple string match on the value)
-          OR CAST(w.available_balance AS TEXT) ILIKE $1
-          OR CAST(w.bonus_balance AS TEXT) ILIKE $1
-        ORDER BY u.created_at DESC
-        LIMIT $4 OFFSET $5
-      `;
-      params = [
-        likePat,
-        normLike   || likePat,
-        tail9Like  || likePat,
         limit,
         offset,
       ];
