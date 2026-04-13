@@ -4,12 +4,18 @@ require('dotenv').config();
 const crypto = require('crypto');
 const { pool } = require("../db/index");
 
-// Map provider payload -> { eventType, userId, amount, providerRef }
+// Map provider payload -> { eventType, providerRef, realReference }
 function parseProviderEvent(body) {
   const event = body && body.event;
-  // charge.success has tx_ref, payout.success has reference
-  const providerRef = (body && body.tx_ref) || (body && body.reference);
-  return { event, providerRef };
+  const data = body && body.data;
+
+  // Internal Ref (what we sent as tx_ref)
+  const internalRef = (data && data.tx_ref) || (body && body.tx_ref) || (data && data.reference) || (body && body.reference);
+  
+  // Real Provider Ref (what Chapa uses for receipts)
+  const realRef = (data && data.reference) || (body && body.reference) || internalRef;
+
+  return { event, providerRef: internalRef, realReference: realRef };
 }
 
 /**
@@ -144,17 +150,18 @@ async function handleWebhook(req, res) {
       // return res.status(403).json({ error: "Invalid signature" });
     }
 
-    const { event, providerRef } = parseProviderEvent(req.body);
+    const { event, providerRef, realReference } = parseProviderEvent(req.body);
     if (!event || !providerRef) {
       console.warn("[WEBHOOK] Missing event or providerRef. Body:", JSON.stringify(req.body).slice(0, 300));
       return res.status(400).json({ detail: "Invalid webhook payload" });
     }
 
-    console.log(`[WEBHOOK] Event: ${event} | Ref: ${providerRef}`);
+    console.log(`[WEBHOOK] Event: ${event} | InternalRef: ${providerRef} | ProviderRef: ${realReference}`);
 
     if (event === "charge.success") {
       console.log("[WEBHOOK] Processing charge.success deposit for ref:", providerRef);
-      const out = await completeDeposit(providerRef, "CHAPA");
+      // Pass the real provider reference (e.g. 'CHAPA-xxxx') so receipt links work
+      const out = await completeDeposit(providerRef, "CHAPA", realReference);
       console.log("[WEBHOOK] Deposit completed:", out);
       return res.json({ ok: true, ...out });
     }

@@ -64,7 +64,12 @@ const paymentLimiter = rateLimit({
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 30, // 30 OTP attempts per 15 min is plenty
-  message: { error: "Security alert: Too many authentication attempts." }
+  message: {
+    error: "TOO_MANY_REQUESTS",
+    message: "Too many login attempts. For security, please wait 15 minutes before trying again."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 // Dedicated high-capacity limiter for authenticated profile polling

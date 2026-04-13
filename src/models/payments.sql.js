@@ -7,10 +7,9 @@ const SQL = {
 
   // Find deposit tx by tx_id (which is what we send to Chapa as tx_ref)
   findDepositTxByProviderRef: `
-    SELECT id, user_id, status, id AS tx_id
+    SELECT id, user_id, status, tx_id
     FROM wallet_transactions
     WHERE tx_type = 'DEPOSIT'
-      AND status = 'PENDING'
       AND provider = $1
       AND (
         id::text = $2::text

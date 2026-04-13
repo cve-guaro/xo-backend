@@ -363,9 +363,9 @@ router.get('/users', async (req, res) => {
       paramIdx += 3;
     }
 
-    // Role Filter
+    // Role Filter (Case-insensitive)
     if (role !== 'all') {
-      whereClauses.push(`u.role = $${paramIdx}`);
+      whereClauses.push(`u.role ILIKE $${paramIdx}`);
       queryParams.push(role);
       paramIdx++;
     }
@@ -376,6 +376,18 @@ router.get('/users', async (req, res) => {
       queryParams.push(status === 'banned');
       paramIdx++;
     }
+
+    // Dynamic Sorting
+    const { sortBy = 'created_at', order = 'DESC' } = req.query;
+    const allowedCols = {
+      'created_at': 'u.created_at',
+      'username': 'u.username',
+      'balance': 'available_balance',
+      'wins': 'u.total_wins',
+      'games': 'u.total_games'
+    };
+    const sortCol = allowedCols[sortBy] || 'u.created_at';
+    const sortDir = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
     const whereStr = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
@@ -388,7 +400,7 @@ router.get('/users', async (req, res) => {
       FROM users u
       LEFT JOIN wallets w ON w.user_id = u.id
       ${whereStr}
-      ORDER BY u.created_at DESC
+      ORDER BY ${sortCol} ${sortDir}
       LIMIT $${paramIdx} OFFSET $${paramIdx+1}
     `;
     const finalParams = [...queryParams, Number(limit), Number(offset)];

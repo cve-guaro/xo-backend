@@ -65,29 +65,37 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
 
 // ----------- Deposit (complete via webhook) -----------
 // payments.service.js
-async function completeDeposit(providerRef, provider) {
+async function completeDeposit(txIdOrRef, provider, realReference = null) {
   return withTx(async (client) => {
-    // 1) Find the deposit tx row using providerRef (which is our tx_id sent to Chapa)
-    const found = await client.query(SQL.findDepositTxByProviderRef, [provider, providerRef]);
+    // 1) Find the deposit tx row using txIdOrRef (which is our internal UUID sent to Chapa as tx_ref)
+    const found = await client.query(SQL.findDepositTxByProviderRef, [provider, txIdOrRef]);
     const txRow = found.rows[0];
 
     if (!txRow) {
-      // This means you never created a DEPOSIT tx row with tx_id = providerRef
-      throw new Error(`Deposit tx not found for providerRef=${providerRef}`);
+      throw new Error(`Deposit tx not found for providerRef=${txIdOrRef}`);
     }
 
     const txId = txRow.id; // internal UUID primary key
     const userId = txRow.user_id;
     const txRef = txRow.tx_id; // the UUID we sent to Chapa
+    const currentStatus = txRow.status;
 
-    console.log(`[WEBHOOK] Processing txId: ${txId} for userId: ${userId} (tx_ref: ${txRef})`);
+    // IDEMPOTENCY: If already completed, don't throw, just return success
+    if (currentStatus === 'COMPLETED' || currentStatus === 'success') {
+      console.log(`[WEBHOOK] Idempotency triggered: Transaction ${txId} already COMPLETED.`);
+      const walletRes = await client.query(SQL.getWalletByUserId, [userId]);
+      return { txId: txId, wallet: walletRes.rows[0], alreadyCompleted: true };
+    }
 
-    // 2. Mark the transaction as COMPLETED
-    await client.query(SQL.markTxCompletedById, [txId, provider]);
-    console.log(`[WEBHOOK] Transaction ${txId} marked as COMPLETED.`);
+    console.log(`[WEBHOOK] Processing txId: ${txId} for userId: ${userId} (tx_ref: ${txRef}) | New Ref: ${realReference || 'N/A'}`);
+
+    // 2. Mark the transaction as COMPLETED & Store the REAL provider reference
+    // We use realReference if provided, otherwise fallback to provider (e.g. 'CHAPA') which is old behaviour
+    const referenceToStore = realReference || provider; 
+    await client.query(SQL.markTxCompletedById, [txId, referenceToStore]);
+    console.log(`[WEBHOOK] Transaction ${txId} marked as COMPLETED with ref: ${referenceToStore}`);
 
     // 3. Apply the balance using the tx_id (UUID we sent Chapa, used as idempotency key in fn)
-    // fn_wallet_apply_existing_tx uses tx_id to credit the wallet
     await client.query(SQL.applyExistingTx, [txRef || txId]);
     console.log(`[WEBHOOK] Balance applied to userId: ${userId} via txRef: ${txRef || txId}`);
 
