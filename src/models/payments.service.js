@@ -164,18 +164,20 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     const totalGames = Number(gameCountRows[0]?.total || 0);
 
     if (totalGames === 0) {
-      const err = new Error("You must play at least one match before withdrawing funds.");
+      const err = new Error("You need to play at least one game to enable withdraw");
       err.status = 400;
       throw err;
     }
 
-    // 2) Check balance - use the withdrawable_balance column which excludes bonuses
+    // 2) Check balance - include bonus_balance as requested ("can also withdrow the bonnes money")
     const walletCheck = await client.query(SQL.getWallet, [userId]);
     const walletData = walletCheck.rows[0];
     const withdrawable = Number(walletData?.withdrawable_balance || 0);
+    const bonus = Number(walletData?.bonus_balance || 0);
+    const totalWithdrawable = withdrawable + bonus;
     
-    if (withdrawable < amountEtb) {
-      const err = new Error("Insufficient withdrawable balance (Registration bonus is not withdrawable).");
+    if (totalWithdrawable < amountEtb) {
+      const err = new Error("Insufficient balance for withdrawal.");
       err.status = 400;
       throw err;
     }
@@ -192,6 +194,21 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     ]);
 
     const reserveTxId = txRes.rows[0].tx_id;
+
+    // IMMEDIATELY reserve/lock funds! Since fn_wallet_apply_tx ignores PENDING, we deduct manually.
+    let deductW = Math.min(withdrawable, amountEtb);
+    let deductB = amountEtb - deductW;
+
+    await client.query(`
+      UPDATE wallets 
+      SET available_balance = available_balance - $1, 
+          withdrawable_balance = withdrawable_balance - $2,
+          bonus_balance = bonus_balance - $3
+      WHERE user_id = $4
+    `, [amountEtb, deductW, deductB, userId]);
+
+    // Set applied_at = now() so future approval (webhooks calling fn_wallet_apply_existing_tx) doesn't duplicate the deduction.
+    await client.query(`UPDATE wallet_transactions SET applied_at = now() WHERE id = $1`, [reserveTxId]);
 
     const reqRes = await client.query(SQL.createWithdrawRequest, [
       userId,
