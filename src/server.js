@@ -50,8 +50,9 @@ const io = new Server(server, {
 // ─── RATE LIMITING (FIREWALL) ──────────────────────────────────────────────────
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window
-  message: { error: "Too many requests, please try again later." }
+  max: 500, // Raised from 100 → 500 to accommodate normal SPA usage
+  message: { error: "Too many requests, please try again later." },
+  skip: (req) => req.path === '/health' // Never throttle health checks
 });
 
 const paymentLimiter = rateLimit({
@@ -62,14 +63,22 @@ const paymentLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200, // Increased to 200 for easier beta testing without 429 locks
+  max: 30, // 30 OTP attempts per 15 min is plenty
   message: { error: "Security alert: Too many authentication attempts." }
+});
+
+// Dedicated high-capacity limiter for authenticated profile polling
+const profileLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 60, // 60 profile fetches/min per IP — covers all active tabs
+  message: { error: "Too many profile requests, please slow down." }
 });
 
 app.use('/payments/withdraw', paymentLimiter);
 app.use('/payments/deposit', paymentLimiter);
 app.use('/api/auth', authLimiter);
 app.use('/auth', authLimiter);
+app.use('/user/me', profileLimiter); // Dedicated limiter for hot polling endpoint
 app.use(generalLimiter);
 
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────
