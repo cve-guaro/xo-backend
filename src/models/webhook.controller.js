@@ -160,7 +160,15 @@ async function handleWebhook(req, res) {
     }
 
     if (event === "payout.success") {
-      console.log("[WEBHOOK] Payout success for ref:", providerRef, "— no action needed (already debited).");
+      console.log("[WEBHOOK] Payout success for ref:", providerRef, "— updating transaction status to COMPLETED.");
+      
+      await pool.query(
+        `UPDATE wallet_transactions 
+         SET status = 'COMPLETED', updated_at = now() 
+         WHERE id = $1 AND status = 'PENDING'`,
+        [providerRef]
+      );
+      
       return res.json({ ok: true, event: "payout.success", ref: providerRef });
     }
 

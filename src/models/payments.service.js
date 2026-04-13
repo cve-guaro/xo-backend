@@ -242,6 +242,14 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     if (chapaRes?.data?.checkout_url) {
       checkout_url = chapaRes.data.checkout_url;
     }
+
+    // If Chapa synchronously accepts and completes the transfer right away, mark it COMPLETED!
+    if (chapaRes?.status === 'success') {
+      await pool.query(
+        `UPDATE wallet_transactions SET status = 'COMPLETED', updated_at = now() WHERE id = $1`,
+        [reserveTxId]
+      );
+    }
   } catch (chapaErr) {
     const chapaMsg = String(chapaErr?.response?.message || chapaErr?.message || '');
     console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
