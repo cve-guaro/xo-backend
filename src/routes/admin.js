@@ -350,26 +350,58 @@ router.get('/users', async (req, res) => {
       const normLike    = normSearch ? `%${normSearch}%` : null;
       const tail9Like   = tail9     ? `%${tail9}%`     : null;
 
-        limit,
-        offset,
-      ];
-    } else {
-      query = `
-        SELECT u.id, u.number, u.username, u.display_name, u.avatar,
-               u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins, u.created_at,
-               COALESCE(w.available_balance, 0)    AS available_balance,
-               COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
-               COALESCE(w.bonus_balance, 0)        AS bonus_balance
-        FROM users u
-        LEFT JOIN wallets w ON w.user_id = u.id
-        ORDER BY u.created_at DESC
-        LIMIT $1 OFFSET $2
-      `;
-      params = [limit, offset];
+      whereClauses.push(`(
+        u.username ILIKE $${paramIdx} 
+        OR u.display_name ILIKE $${paramIdx} 
+        OR u.number ILIKE $${paramIdx}
+        OR REGEXP_REPLACE(u.number, '[^0-9]', '', 'g') ILIKE $${paramIdx+1}
+        OR RIGHT(REGEXP_REPLACE(u.number, '[^0-9]', '', 'g'), 9) ILIKE $${paramIdx+2}
+        OR CAST(u.id AS TEXT) ILIKE $${paramIdx}
+        OR CAST(w.available_balance AS TEXT) ILIKE $${paramIdx}
+      )`);
+      queryParams.push(likePat, normLike || likePat, tail9Like || likePat);
+      paramIdx += 3;
     }
 
-    const { rows } = await pool.query(query, params);
-    const countRes = await pool.query(`SELECT COUNT(*) FROM users`);
+    // Role Filter
+    if (role !== 'all') {
+      whereClauses.push(`u.role = $${paramIdx}`);
+      queryParams.push(role);
+      paramIdx++;
+    }
+
+    // Status Filter
+    if (status !== 'all') {
+      whereClauses.push(`u.banned = $${paramIdx}`);
+      queryParams.push(status === 'banned');
+      paramIdx++;
+    }
+
+    const whereStr = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const query = `
+      SELECT u.id, u.number, u.username, u.display_name, u.avatar,
+             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins, u.created_at,
+             COALESCE(w.available_balance, 0)    AS available_balance,
+             COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
+             COALESCE(w.bonus_balance, 0)        AS bonus_balance
+      FROM users u
+      LEFT JOIN wallets w ON w.user_id = u.id
+      ${whereStr}
+      ORDER BY u.created_at DESC
+      LIMIT $${paramIdx} OFFSET $${paramIdx+1}
+    `;
+    const finalParams = [...queryParams, Number(limit), Number(offset)];
+
+    const { rows } = await pool.query(query, finalParams);
+    
+    // Count query with same filters
+    const countQuery = `
+      SELECT COUNT(*) FROM users u 
+      LEFT JOIN wallets w ON w.user_id = u.id
+      ${whereStr}
+    `;
+    const countRes = await pool.query(countQuery, queryParams);
 
     const formattedUsers = rows.map(u => ({
       ...u,
@@ -378,7 +410,12 @@ router.get('/users', async (req, res) => {
       bonus_balance: Number(u.bonus_balance || 0)
     }));
 
-    return res.json({ users: formattedUsers, total: Number(countRes.rows[0].count), limit, offset });
+    return res.json({ 
+      users: formattedUsers, 
+      total: Number(countRes.rows[0].count), 
+      limit: Number(limit), 
+      offset: Number(offset) 
+    });
   } catch (err) {
     console.error('[ADMIN] /users error', err);
     return res.status(500).json({ error: 'Failed to fetch users' });
