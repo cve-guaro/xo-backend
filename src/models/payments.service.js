@@ -317,7 +317,7 @@ async function redeemPromoCode({ userId, code }) {
       
       await client.query(SQL.applyTx, [
         userId,
-        "GIFT",
+        "PRIZE",
         amount,
         "COMPLETED",
         idem,
