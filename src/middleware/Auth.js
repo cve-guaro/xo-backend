@@ -68,8 +68,18 @@ function adminAuth(req, res, next) {
       return res.status(403).json({ error: 'Forbidden: Admin dashboard only available on Web' });
     }
 
+/**
+ * Restricts to ONLY Simon (Super Admin)
+ */
+function superAdminAuth(req, res, next) {
+  adminAuth(req, res, () => {
+    // Check role or phone number
+    const isSimon = req.user.role === 'superadmin' || req.user.phone_number === '+251961111106';
+    if (!isSimon) {
+      return res.status(403).json({ error: 'Critical access denied: Only Super Admin can perform this action.' });
+    }
     next();
   });
 }
 
-module.exports = { auth, adminAuth };
+module.exports = { auth, adminAuth, superAdminAuth };

@@ -877,50 +877,61 @@ function setupGameSocket(io) {
             // pop two from head (FIFO)
             let popped = await lpopN(queueKey, 2);
             dbg(ctx, "matcher: popped raw", popped);
+            
             if (!Array.isArray(popped)) popped = [popped].filter(Boolean);
+            
+            // If we somehow didn't get 2, but the queue length was >=2, it means 
+            // another process might have popped them, or Redis was busy.
             if (popped.length < 2) {
-              if (popped[0]) await redis.lpush(queueKey, popped[0]);
-              break;
+              if (popped.length === 1) await redis.lpush(queueKey, popped[0]);
+              break; 
             }
 
-            let [raw1, raw2] = popped;
             let p1, p2;
-            try { p1 = JSON.parse(raw1); p2 = JSON.parse(raw2); }
-            catch { dbg(ctx, "matcher: JSON parse error; skip"); continue; }
+            try { 
+              p1 = JSON.parse(popped[0]); 
+              p2 = JSON.parse(popped[1]); 
+            } catch { 
+              dbg(ctx, "matcher: JSON parse error; skip segment"); 
+              continue; 
+            }
 
             if (!p1?.userId || !p2?.userId) { dbg(ctx, "matcher: malformed pair; skip"); continue; }
-            if (p1.userId === p2.userId) { dbg(ctx, "same user twice; push p2 back"); await redis.lpush(queueKey, JSON.stringify(p2)); continue; }
+            
+            // Critical: Don't match user with themselves. If this happens, push the second one back and try next.
+            if (p1.userId === p2.userId) { 
+              dbg(ctx, "same user twice; push p2 back to front"); 
+              await redis.lpush(queueKey, JSON.stringify(p2)); 
+              // We need another player from the queue to match with p1
+              const nextRaw = await redis.lpop(queueKey);
+              if (!nextRaw) {
+                // No one else left, put p1 back for later
+                await redis.lpush(queueKey, JSON.stringify(p1));
+                break;
+              }
+              p2 = JSON.parse(nextRaw);
+            }
 
-            // someone disconnected?
             const s1 = io.sockets.sockets.get(p1.socketId);
             const s2 = io.sockets.sockets.get(p2.socketId);
-            dbg(ctx, "sockets present", { s1: !!s1, s2: !!s2 });
+            
             if (!s1 || !s2) {
-              if (s1) await redis.rpush(queueKey, JSON.stringify(p1));
-              if (s2) await redis.rpush(queueKey, JSON.stringify(p2));
+              dbg(ctx, "One or both sockets missing, re-queuing survivors", { s1: !!s1, s2: !!s2 });
+              if (s1) await redis.lpush(queueKey, JSON.stringify(p1)); // Push to FRONT so they aren't penalized
+              if (s2) await redis.lpush(queueKey, JSON.stringify(p2));
               continue;
             }
 
             const matchId = uuidv4();
-            dbg(ctx, "lockAndStartMatch: try", { matchId, p1: p1.userId, p2: p2.userId });
-
             try {
               await lockAndStartMatch(matchId, p1.userId, p2.userId, betAmountCents);
-              dbg(ctx, "lockAndStartMatch: OK", { matchId });
             } catch (e) {
               dbg(ctx, "lockAndStartMatch: FAIL", String(e));
-              // best-effort balances
-              const bRes = await pool.query(
-                `SELECT user_id, available_balance FROM wallets WHERE user_id = ANY($1::uuid[])`,
-                [[p1.userId, p2.userId]]
-              );
-              const m = new Map(bRes.rows.map(r => [String(r.user_id), Number(r.available_balance)]));
-              const p1Ok = (m.get(String(p1.userId)) ?? 0) >= betAmount;
-              const p2Ok = (m.get(String(p2.userId)) ?? 0) >= betAmount;
-
-              if (!p1Ok && p2Ok) { s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" }); await redis.rpush(queueKey, JSON.stringify(p2)); continue; }
-              if (p1Ok && !p2Ok) { s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" }); await redis.rpush(queueKey, JSON.stringify(p1)); continue; }
-              if (p1Ok && p2Ok) { await redis.rpush(queueKey, JSON.stringify(p1)); await redis.rpush(queueKey, JSON.stringify(p2)); }
+              // Balances might have changed between enqueue and match
+              if (String(e).includes("INSUFFICIENT_BALANCE")) {
+                s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
+                s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
+              }
               continue;
             }
 

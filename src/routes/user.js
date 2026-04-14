@@ -2,8 +2,34 @@
 const express = require('express');
 const { pool } = require('../db/index');
 const { auth } = require('./../middleware/Auth');
+const { redeemPromoCode } = require('../models/payments.service');
 
 const router = express.Router();
+
+/**
+ * POST /user/promocodes/redeem
+ */
+router.post('/promocodes/redeem', auth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Code is required' });
+
+    const result = await redeemPromoCode({ userId: req.user.id, code });
+    return res.json({ ok: true, message: `Successfully redeemed code!`, amount: result.amount });
+  } catch (err) {
+    const msg = String(err.message || '');
+    if (msg === 'INVALID_CODE') return res.status(404).json({ error: 'Promo code not found' });
+    if (msg === 'CODE_INACTIVE') return res.status(400).json({ error: 'This promo code is currently disabled' });
+    if (msg === 'CODE_EXPIRED') return res.status(400).json({ error: 'This promo code has expired' });
+    if (msg === 'USAGE_LIMIT_REACHED') return res.status(400).json({ error: 'This promo code has reached its maximum usage' });
+    if (msg === 'ALREADY_REDEEMED') return res.status(400).json({ error: 'You have already used this promo code' });
+    if (msg === 'ONLY_FOR_NEW_USERS') return res.status(400).json({ error: 'This gift is only for new users' });
+
+    console.error('[USER] /promocodes/redeem error', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 /**
  * GET /user/me

@@ -4,7 +4,7 @@
 
 const express = require('express');
 const { pool, withTx } = require('../db/index');
-const { adminAuth } = require('../middleware/Auth');
+const { adminAuth, superAdminAuth } = require('../middleware/Auth');
 const { getChapaBalance } = require('../models/Chapa');
 const { CHAPA } = require('../env');
 
@@ -42,7 +42,18 @@ router.get('/settings', async (req, res) => {
 });
 
 router.patch('/settings', async (req, res) => {
-  // Allow any admin to configure the system (since route is already wrapped in adminAuth)
+  // Check if sensitive keys are being edited
+  const sensitiveKeys = ['maintenance_mode', 'min_withdrawal', 'max_withdrawal', 'withdraw_limit_24h', 'security_autoban'];
+  const isEditingSensitive = Object.keys(req.body).some(k => sensitiveKeys.includes(k));
+
+  if (isEditingSensitive) {
+    // Return early if not Simon
+    const isSimon = req.user.phone_number === '+251961111106' || req.user.role === 'superadmin';
+    if (!isSimon) {
+      return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify financial or security protocols.' });
+    }
+  }
+
   try {
     const updates = req.body; 
     for (const [key, value] of Object.entries(updates)) {
@@ -59,7 +70,7 @@ router.patch('/settings', async (req, res) => {
     await logAdminAction(req.user.id, 'updated_global_settings', null, updates);
     return res.json({ ok: true });
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to update settings' });
+    return res.status(500).json({ error: 'Failed to fetch settings' });
   }
 });
 
@@ -88,7 +99,7 @@ router.post('/giveaway/reset', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
-    const [usersRes, gamesRes, pendingRes, revenueRes, payoutsRes, giveawayRes] = await Promise.all([
+    const [usersRes, gamesRes, pendingRes, revenueRes, payoutsRes, giveawayRes, walletSumRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       pool.query(`SELECT COUNT(*) AS active_games FROM games WHERE status = 'ongoing'`),
       pool.query(`SELECT COUNT(*) AS pending_withdrawals, COALESCE(SUM(amount), 0) AS pending_amount
@@ -103,11 +114,24 @@ router.get('/stats', async (req, res) => {
         WHERE claimed_giveaway_version = COALESCE(
           (SELECT value::text::int FROM global_settings WHERE key = 'current_giveaway_version' LIMIT 1), 1
         )
-      `)
+      `),
+      pool.query(`SELECT COALESCE(SUM(available_balance), 0) AS platform_balance FROM wallets`)
     ]);
+
+    // Fetch real Chapa balance if possible
+    let chapaBalance = 0;
+    try {
+      const chapaData = await getChapaBalance();
+      // Chapa returns { data: [ { currency: 'ETB', balance: ... } ] }
+      const etbBal = chapaData?.data?.find(b => b.currency === 'ETB');
+      chapaBalance = Number(etbBal?.balance || 0);
+    } catch (e) {
+      console.warn('[ADMIN] Chapa balance fetch failed:', e.message);
+    }
 
     const deposits = Number(revenueRes.rows[0].total_deposits);
     const withdrawals = Number(payoutsRes.rows[0].total_withdrawals);
+    const platformBalance = Number(walletSumRes.rows[0].platform_balance);
 
     return res.json({
       totalUsers: Number(usersRes.rows[0].total_users),
@@ -116,6 +140,8 @@ router.get('/stats', async (req, res) => {
       totalDeposits: deposits,
       totalWithdrawals: withdrawals,
       totalProfit: (deposits - withdrawals),
+      platformBalance,
+      chapaBalance,
       giveawayClaims: Number(giveawayRes.rows[0].claims || 0),
       // New real-time metrics for dashboard boxes
       volume24h: deposits, 
@@ -493,6 +519,9 @@ router.patch('/users/:id', async (req, res) => {
       [availableCents, bonusCents, req.params.id]
     );
 
+    // Logging
+    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, role, available_balance, bonus_balance });
+
     return res.json({ ok: true });
   } catch (err) {
     console.error('[ADMIN] /users/:id patch error', err);
@@ -505,7 +534,7 @@ router.patch('/users/:id', async (req, res) => {
 // Body: { field: 'available_balance'|'bonus_balance', amount: number }
 // Sets the balance (in ETB, converted to cents internally)
 // ──────────────────────────────────────────────
-router.patch('/users/:id/balance', async (req, res) => {
+router.patch('/users/:id/balance', superAdminAuth, async (req, res) => {
   try {
     const { field, amount } = req.body;
     if (!['available_balance', 'bonus_balance', 'withdrawable_balance'].includes(field)) {
@@ -569,7 +598,7 @@ router.patch('/users/:id/ban', async (req, res) => {
 // PATCH /admin/users/:id/role
 // Body: { role: 'user' | 'admin' }
 // ──────────────────────────────────────────────
-router.patch('/users/:id/role', async (req, res) => {
+router.patch('/users/:id/role', superAdminAuth, async (req, res) => {
   try {
     if (!['admin', 'superadmin'].includes(req.user.role)) {
       return res.status(403).json({ error: 'Insufficient permissions to modify roles' });
@@ -1042,6 +1071,52 @@ router.get('/security/alerts', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] /security/alerts error', err);
     return res.status(500).json({ error: 'Failed to fetch security alerts' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// PROMO CODES (GIVEAWAYS)
+// ──────────────────────────────────────────────
+router.get('/promocodes', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM promocodes ORDER BY created_at DESC`);
+    return res.json({ ok: true, promocodes: rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch promo codes' });
+  }
+});
+
+router.post('/promocodes', superAdminAuth, async (req, res) => {
+  try {
+    const { code, amount, description, target_type, usage_limit, expires_at } = req.body;
+    if (!code || !amount) return res.status(400).json({ error: 'Code and Amount are required' });
+
+    const { rows } = await pool.query(
+      `INSERT INTO promocodes (code, amount, description, target_type, usage_limit, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [code.toUpperCase(), amount, description, target_type || 'ALL', usage_limit || null, expires_at || null]
+    );
+
+    await logAdminAction(req.user.id, 'created_promocode', rows[0].id, { code: rows[0].code, amount: rows[0].amount });
+
+    return res.json({ ok: true, promocode: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Promo code already exists' });
+    console.error('[ADMIN] /promocodes post error', err);
+    return res.status(500).json({ error: 'Failed to create promo code' });
+  }
+});
+
+router.delete('/promocodes/:id', superAdminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`DELETE FROM promocodes WHERE id = $1 RETURNING code`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Promo code not found' });
+
+    await logAdminAction(req.user.id, 'deleted_promocode', req.params.id, { code: rows[0].code });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete promo code' });
   }
 });
 

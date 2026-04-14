@@ -109,7 +109,21 @@ app.use(systemLockdownCheck);
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
 // ─── ONLINE PLAYERS ────────────────────────────────────────────────────────────
-app.get('/players/online', (_, res) => res.json({ count: io.engine.clientsCount || 0 }));
+app.get('/players/online', async (_, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT value FROM global_settings WHERE key = 'show_online_count'`);
+    const show = rows.length ? (rows[0].value === true || rows[0].value === 'true') : true; // default true
+    
+    if (!show) {
+      // Return a "random fake" high-activity count (e.g., between 420 and 780)
+      const fakeCount = Math.floor(Math.random() * (780 - 420 + 1)) + 420;
+      return res.json({ count: fakeCount, is_fake: true });
+    }
+    return res.json({ count: io.engine.clientsCount || 0 });
+  } catch (err) {
+    return res.json({ count: io.engine.clientsCount || 0 }); // fallback
+  }
+});
 
 // ─── ROUTES ────────────────────────────────────────────────────────────────────
 app.use('/payments', payments);

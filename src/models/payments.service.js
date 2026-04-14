@@ -280,11 +280,59 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   return { withdrawRequest, wallet, chapaStatus, checkout_url };
 }
 
+// ----------- Promo Code Redemption -----------
+async function redeemPromoCode({ userId, code }) {
+  const cleanCode = String(code).toUpperCase().trim();
+  
+  return withTx(async (client) => {
+    // 1) Get code info
+    const promoRes = await client.query(`SELECT * FROM promocodes WHERE code = $1 FOR UPDATE`, [cleanCode]);
+    const promo = promoRes.rows[0];
+
+    if (!promo) throw new Error("INVALID_CODE");
+    if (!promo.is_active) throw new Error("CODE_INACTIVE");
+    if (promo.expires_at && new Date(promo.expires_at) < new Date()) throw new Error("CODE_EXPIRED");
+    if (promo.usage_limit !== null && promo.used_count >= promo.usage_limit) throw new Error("USAGE_LIMIT_REACHED");
+
+    // 2) Check if user already used it
+    const usageRes = await client.query(`SELECT 1 FROM promocode_usages WHERE promocode_id = $1 AND user_id = $2`, [promo.id, userId]);
+    if (usageRes.rowCount > 0) throw new Error("ALREADY_REDEEMED");
+
+    // 3) Targeted checks
+    if (promo.target_type === 'NEW') {
+      const { rows } = await client.query(`SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, [userId]);
+      if (Number(rows[0].total) > 0) throw new Error("ONLY_FOR_NEW_USERS");
+    }
+
+    // 4) Apply balance! (GIFT type = Available only, not withdrawable)
+    const amount = Number(promo.amount);
+    const idem = makeIdempotencyKey("PROMO", userId, promo.id);
+    
+    await client.query(SQL.applyTx, [
+      userId,
+      "GIFT",
+      amount,
+      "COMPLETED",
+      idem,
+      "PROMO",
+      cleanCode,
+      { promoId: promo.id }
+    ]);
+
+    // 5) Update usage
+    await client.query(`INSERT INTO promocode_usages (promocode_id, user_id) VALUES ($1, $2)`, [promo.id, userId]);
+    await client.query(`UPDATE promocodes SET used_count = used_count + 1 WHERE id = $1`, [promo.id]);
+
+    return { amount, code: cleanCode };
+  });
+}
+
 module.exports = {
   initDeposit,
   completeDeposit,
   creditPrize,
   requestWithdraw,
+  redeemPromoCode,
   // exporting helpers is optional; remove if you don't want them public
   makeIdempotencyKey,
   hash20,
