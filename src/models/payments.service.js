@@ -1,5 +1,5 @@
 const crypto = require("crypto");
-const { withTx } = require("../db/index.js");
+const { pool, withTx } = require("../db/index.js");
 const { SQL } = require("./payments.sql.js");
 const { initChapaDeposit, initChapaPayout } = require("./Chapa.js");
 const { CHAPA } = require("../env.js");
@@ -284,60 +284,71 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
 async function redeemPromoCode({ userId, code }) {
   const cleanCode = String(code).toUpperCase().trim();
   
-  return withTx(async (client) => {
-    // 1) Find active giveaway by promo code
-    const giveawayRes = await client.query(`
-      SELECT * FROM giveaways 
-      WHERE promo_code = $1 
-        AND status = 'ACTIVE' 
-        AND type = 'PROMOCODE'
-        AND (starts_at IS NULL OR starts_at <= now())
-        AND (ends_at IS NULL OR ends_at >= now())
-      FOR UPDATE
-    `, [cleanCode]);
-    
-    const giveaway = giveawayRes.rows[0];
-    if (!giveaway) throw new Error("INVALID_CODE");
+  try {
+    return await withTx(async (client) => {
+      // 1) Find active giveaway by promo code
+      const giveawayRes = await client.query(`
+        SELECT * FROM giveaways 
+        WHERE promo_code = $1 
+          AND status = 'ACTIVE' 
+          AND type = 'PROMOCODE'
+          AND (starts_at IS NULL OR starts_at <= now())
+          AND (ends_at IS NULL OR ends_at >= now())
+        FOR UPDATE
+      `, [cleanCode]);
+      
+      const giveaway = giveawayRes.rows[0];
+      if (!giveaway) throw new Error("INVALID_CODE");
 
-    // 2) Check if user already used it
-    const usageRes = await client.query(`SELECT 1 FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2`, [giveaway.id, userId]);
-    if (usageRes.rowCount > 0) throw new Error("ALREADY_REDEEMED");
+      // 2) Check if user already used it
+      const usageRes = await client.query(`SELECT 1 FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2`, [giveaway.id, userId]);
+      if (usageRes.rowCount > 0) throw new Error("ALREADY_REDEEMED");
 
-    // 3) Targeted checks from metadata
-    const meta = giveaway.metadata || {};
-    if (meta.target === 'NEW_USER') {
-      const { rows } = await client.query(`SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, [userId]);
-      if (Number(rows[0].total) > 0) throw new Error("ONLY_FOR_NEW_USERS");
-    }
+      // 3) Targeted checks from metadata
+      const meta = giveaway.metadata || {};
+      if (meta.target === 'NEW_USER') {
+        const { rows } = await client.query(`SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, [userId]);
+        if (Number(rows[0].total) > 0) throw new Error("ONLY_FOR_NEW_USERS");
+      }
 
-    // 4) Apply balance to BONUS_BALANCE (requested for giveaways)
-    const amount = Number(giveaway.amount);
-    const idem = makeIdempotencyKey("GIVEAWAY", userId, giveaway.id);
-    
-    await client.query(SQL.applyTx, [
-      userId,
-      "GIFT",
-      amount,
-      "COMPLETED",
-      idem,
-      "GIVEAWAY",
-      giveaway.title,
-      { giveawayId: giveaway.id, code: cleanCode }
-    ]);
+      // 4) Apply balance to BONUS_BALANCE (requested for giveaways)
+      const amount = Number(giveaway.amount);
+      const idem = makeIdempotencyKey("GIVEAWAY", userId, giveaway.id);
+      
+      await client.query(SQL.applyTx, [
+        userId,
+        "GIFT",
+        amount,
+        "COMPLETED",
+        idem,
+        "GIVEAWAY",
+        giveaway.title || `Promocode: ${cleanCode}`,
+        { giveawayId: giveaway.id, code: cleanCode }
+      ]);
 
-    // Use bonus_balance update logic (ensure it hits the bonus field)
-    await client.query(`
-      UPDATE wallets 
-      SET bonus_balance = bonus_balance + $1,
-          updated_at = now()
-      WHERE user_id = $2
-    `, [amount, userId]);
+      // Use bonus_balance update logic (ensure it hits the bonus field)
+      await client.query(`
+        UPDATE wallets 
+        SET bonus_balance = bonus_balance + $1,
+            updated_at = now()
+        WHERE user_id = $2
+      `, [amount, userId]);
 
-    // 5) Update claim log
-    await client.query(`INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`, [giveaway.id, userId, amount]);
+      // 5) Update claim log
+      await client.query(`INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`, [giveaway.id, userId, amount]);
 
-    return { amount, code: cleanCode, title: giveaway.title };
-  });
+      // 6) Add to bonus_logs for the frontend tracking list
+      await client.query(`
+        INSERT INTO bonus_logs (user_id, amount, reason)
+        VALUES ($1, $2, $3)
+      `, [userId, amount, giveaway.title || `Promocode: ${cleanCode}`]);
+
+      return { amount, code: cleanCode, title: giveaway.title };
+    });
+  } catch (err) {
+    console.error(`[PAYMENTS_SERVICE] redeemPromoCode error for user ${userId}:`, err.message);
+    throw err;
+  }
 }
 
 /**
@@ -384,6 +395,13 @@ async function applyNewUserGiveaways(userId) {
         `, [amount, userId]);
 
         await client.query(`INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`, [g.id, userId, amount]);
+
+        // Add to bonus_logs for tracking
+        await client.query(`
+          INSERT INTO bonus_logs (user_id, amount, reason)
+          VALUES ($1, $2, $3)
+        `, [userId, amount, g.title || 'New User Bonus']);
+
         console.log(`[GIVEAWAY] Auto-applied "${g.title}" (${amount} ETB) to user ${userId}`);
       } catch (err) {
         console.error(`[GIVEAWAY_AUTO_ERR] Failed to apply ${g.id} to ${userId}:`, err.message);

@@ -10,23 +10,25 @@ const router = express.Router();
  * POST /user/promocodes/redeem
  */
 router.post('/promocodes/redeem', auth, async (req, res) => {
-  try {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ error: 'Code is required' });
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'Code is required' });
 
+  try {
     const result = await redeemPromoCode({ userId: req.user.id, code });
-    return res.json({ ok: true, message: `Successfully redeemed code!`, amount: result.amount });
+    return res.json({ ok: true, ...result });
   } catch (err) {
     const msg = String(err.message || '');
-    if (msg === 'INVALID_CODE') return res.status(404).json({ error: 'Promo code not found' });
-    if (msg === 'CODE_INACTIVE') return res.status(400).json({ error: 'This promo code is currently disabled' });
-    if (msg === 'CODE_EXPIRED') return res.status(400).json({ error: 'This promo code has expired' });
-    if (msg === 'USAGE_LIMIT_REACHED') return res.status(400).json({ error: 'This promo code has reached its maximum usage' });
-    if (msg === 'ALREADY_REDEEMED') return res.status(400).json({ error: 'You have already used this promo code' });
-    if (msg === 'ONLY_FOR_NEW_USERS') return res.status(400).json({ error: 'This gift is only for new users' });
+    console.error(`[PROMOCODE_ERROR] User ${req.user.id} code "${code}":`, msg, err.stack);
 
-    console.error('[USER] /promocodes/redeem error', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    // Map specific errors to status codes
+    if (msg === 'INVALID_CODE') return res.status(404).json({ error: 'Promo code not found', code: msg });
+    if (msg === 'ALREADY_REDEEMED') return res.status(400).json({ error: 'You have already used this promo code', code: msg });
+    if (msg === 'ONLY_FOR_NEW_USERS') return res.status(400).json({ error: 'This gift is only for new users', code: msg });
+    
+    return res.status(500).json({ 
+      error: 'Internal server error',
+      details: msg 
+    });
   }
 });
 
