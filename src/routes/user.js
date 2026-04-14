@@ -18,13 +18,23 @@ router.post('/promocodes/redeem', auth, async (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (err) {
     const msg = String(err.message || '');
-    console.error(`[PROMOCODE_ERROR] User ${req.user.id} code "${code}":`, msg, err.stack);
+    const validationErrors = ['INVALID_CODE', 'ALREADY_REDEEMED', 'ONLY_FOR_NEW_USERS'];
 
-    // Map specific errors to status codes
-    if (msg === 'INVALID_CODE') return res.status(404).json({ error: 'Promo code not found', code: msg });
-    if (msg === 'ALREADY_REDEEMED') return res.status(400).json({ error: 'You have already used this promo code', code: msg });
-    if (msg === 'ONLY_FOR_NEW_USERS') return res.status(400).json({ error: 'This gift is only for new users', code: msg });
-    
+    if (validationErrors.includes(msg)) {
+      console.log(`[PROMOCODE_REDEEM_FAIL] User ${req.user.id} code "${code}": ${msg}`);
+      
+      const status = msg === 'INVALID_CODE' ? 404 : 400;
+      const errorMap = {
+        'INVALID_CODE': 'Promo code not found',
+        'ALREADY_REDEEMED': 'You have already used this promo code',
+        'ONLY_FOR_NEW_USERS': 'This gift is only for new users'
+      };
+      
+      return res.status(status).json({ error: errorMap[msg] || msg, code: msg });
+    }
+
+    // Unexpected errors get full logging
+    console.error(`[PROMOCODE_SYSTEM_ERROR] User ${req.user.id} code "${code}":`, err);
     return res.status(500).json({ 
       error: 'Internal server error',
       details: msg 

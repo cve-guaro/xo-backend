@@ -289,7 +289,7 @@ async function redeemPromoCode({ userId, code }) {
       // 1) Find active giveaway by promo code
       const giveawayRes = await client.query(`
         SELECT * FROM giveaways 
-        WHERE promo_code = $1 
+        WHERE UPPER(promo_code) = $1 
           AND status = 'ACTIVE' 
           AND type = 'PROMOCODE'
           AND (starts_at IS NULL OR starts_at <= now())
@@ -346,7 +346,7 @@ async function redeemPromoCode({ userId, code }) {
       return { amount, code: cleanCode, title: giveaway.title };
     });
   } catch (err) {
-    console.error(`[PAYMENTS_SERVICE] redeemPromoCode error for user ${userId}:`, err.message);
+    // Let the route handler log specific errors as needed
     throw err;
   }
 }
