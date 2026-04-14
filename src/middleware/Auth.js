@@ -68,6 +68,10 @@ function adminAuth(req, res, next) {
       return res.status(403).json({ error: 'Forbidden: Admin dashboard only available on Web' });
     }
 
+    next();
+  });
+}
+
 /**
  * Restricts to ONLY Simon (Super Admin)
  */
