@@ -92,7 +92,7 @@ async function completeDeposit(txIdOrRef, provider, realReference = null) {
     // 2. Mark the transaction as COMPLETED & Store the REAL provider reference
     // We use realReference if provided, otherwise fallback to provider (e.g. 'CHAPA') which is old behaviour
     const referenceToStore = realReference || provider; 
-    await client.query(SQL.markTxCompletedById, [txId, referenceToStore]);
+    await client.query(SQL.markTxCompletedById, [txId, referenceToStore, null]);
     console.log(`[WEBHOOK] Transaction ${txId} marked as COMPLETED with ref: ${referenceToStore}`);
 
     // 3. Apply the balance using the tx_id (UUID we sent Chapa, used as idempotency key in fn)
