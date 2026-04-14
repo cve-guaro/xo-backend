@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const axios = require("axios");
 const crypto = require("crypto");
 const { pool, withTx } = require('../db/index');
+const { applyNewUserGiveaways } = require('../models/payments.service');
 
 const router = express.Router();
 
@@ -257,48 +258,24 @@ router.post('/verify-otp', async (req, res) => {
         [user.id]
       );
 
-      // 6) Credit welcome bonus ONLY if new_user is still true
+      // 6) Robust Giveaway Engine: Apply any active NEW_USER giveaways
       if (user.new_user) {
-        console.log(`[BONUS] New User detected: ${user.number}. Checking settings & platform...`);
+        console.log(`[BONUS] Processing giveaways for ${user.number}...`);
         
-        // --- PLATFORM CHECK: Only Web users get the bonus ---
+        // --- PLATFORM CHECK: Only Web users get the bonus (as per existing logic) ---
         if (!req.isWeb) {
-           console.log(`[BONUS] Mobile user ${user.id} skipped bonus.`);
-           // Even if they don't get the bonus, we mark them as no longer "new" so they don't get it later if they log in via Web
+           console.log(`[BONUS] Mobile user ${user.id} skipped auto-giveaways.`);
+           // We still mark them as no longer "new" so they don't get it later if they log in via Web
            await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
            user.new_user = false;
         } else {
-          const { rows: settingsRows } = await client.query(
-            `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
-          );
-          const settingsMap = {};
-          for (const row of settingsRows) settingsMap[row.key] = row.value;
-
-          const bonusActive = settingsMap['welcome_bonus_active'] === true || settingsMap['welcome_bonus_active'] === 'true';
-          if (bonusActive) {
-            const rawAmount = settingsMap['welcome_bonus_amount'];
-            const bonusAmountEtb = rawAmount ? Math.round(Number(rawAmount)) : 10;
-            
-            console.log(`[BONUS] Crediting ${bonusAmountEtb} ETB to Web user ${user.id}`);
-            
-            await client.query(
-              `UPDATE wallets SET bonus_balance = bonus_balance + $1 WHERE user_id = $2`,
-              [bonusAmountEtb, user.id]
-            );
-
-            // Log the bonus
-            await client.query(
-              `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
-              [user.id, bonusAmountEtb, 'Welcome Bonus']
-            ).catch(err => console.error('[BONUS_LOG] Error logging welcome bonus:', err));
-
-            // Reset new_user flag so they don't get it again
-            await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
-            user.new_user = false;
-
-          } else {
-            console.log('[BONUS] Welcome bonus is currently DISABLED in settings.');
-          }
+          // Use our new robust service
+          await applyNewUserGiveaways(user.id).catch(err => console.error('[GIVEAWAY_ERR] Failed apply:', err));
+          
+          // Mark user as no longer "new" (handled inside applyNewUserGiveaways for each gift, 
+          // but we do it globally here to stop the "new_user" status)
+          await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
+          user.new_user = false;
         }
       }
 

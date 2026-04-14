@@ -42,20 +42,19 @@ router.get('/settings', async (req, res) => {
 });
 
 router.patch('/settings', async (req, res) => {
-  // Check if sensitive keys are being edited
-  const sensitiveKeys = ['maintenance_mode', 'min_withdrawal', 'max_withdrawal', 'withdraw_limit_24h', 'security_autoban'];
-  const isEditingSensitive = Object.keys(req.body).some(k => sensitiveKeys.includes(k));
+  // Security Protocols: only Simon can touch these
+  const restrictedKeys = ['system_emergency_lockout', 'mobile_app_lockout', 'maintenance_mode', 'security_autoban'];
+  const isEditingRestricted = Object.keys(req.body).some(k => restrictedKeys.includes(k));
 
-  if (isEditingSensitive) {
-    // Return early if not Simon
+  if (isEditingRestricted) {
     const isSimon = req.user.phone_number === '+251961111106' || req.user.role === 'superadmin';
     if (!isSimon) {
-      return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify financial or security protocols.' });
+      return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify security protocols.' });
     }
   }
 
   try {
-    const updates = req.body; 
+    const updates = req.body;
     for (const [key, value] of Object.entries(updates)) {
       if (key === 'welcome_bonus_active') {
         const valStr = value === true || value === 'true';
@@ -598,11 +597,11 @@ router.patch('/users/:id/ban', async (req, res) => {
 // PATCH /admin/users/:id/role
 // Body: { role: 'user' | 'admin' }
 // ──────────────────────────────────────────────
+// PATCH /admin/users/:id/role
+// Body: { role: 'user' | 'admin' }
+// ──────────────────────────────────────────────
 router.patch('/users/:id/role', superAdminAuth, async (req, res) => {
   try {
-    if (!['admin', 'superadmin'].includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions to modify roles' });
-    }
     const targetRole = req.body.role;
     if (!['user', 'admin'].includes(targetRole)) {
       return res.status(400).json({ error: 'Invalid role assignment' });
@@ -630,9 +629,10 @@ router.patch('/users/:id', async (req, res) => {
   try {
     const { username, number, role, available_balance, bonus_balance, banned } = req.body;
     
-    // Authorization check for structural edits
-    if (role && !['admin', 'superadmin'].includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions to modify roles.' });
+    // Authorization check for sensitive fields
+    const isSimon = req.user.phone_number === '+251961111106' || req.user.role === 'superadmin';
+    if ((role !== undefined || available_balance !== undefined || bonus_balance !== undefined) && !isSimon) {
+      return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify roles or wallet balances.' });
     }
 
     await withTx(async (client) => {
@@ -1117,6 +1117,75 @@ router.delete('/promocodes/:id', superAdminAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to delete promo code' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// NEW GIVEAWAY SYSTEM
+// ──────────────────────────────────────────────
+
+// GET all giveaways
+router.get('/giveaways', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT g.*, 
+        (SELECT COUNT(*) FROM giveaway_claims WHERE giveaway_id = g.id) as claim_count
+      FROM giveaways g 
+      ORDER BY g.created_at DESC
+    `);
+    return res.json({ ok: true, giveaways: rows });
+  } catch (err) {
+    console.error('[ADMIN] /giveaways get error', err);
+    return res.status(500).json({ error: 'Failed to fetch giveaways' });
+  }
+});
+
+// POST new giveaway
+router.post('/giveaways', async (req, res) => {
+  try {
+    const { title, description, amount, type, starts_at, ends_at, promo_code, metadata } = req.body;
+    if (!title || !amount || !type) return res.status(400).json({ error: 'Title, Amount, and Type are required' });
+
+    const { rows } = await pool.query(
+      `INSERT INTO giveaways (title, description, amount, type, starts_at, ends_at, promo_code, created_by, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [title, description, amount, type, starts_at || new Date(), ends_at || null, promo_code || null, req.user.id, JSON.stringify(metadata || {})]
+    );
+
+    await logAdminAction(req.user.id, 'created_giveaway', rows[0].id, { title, amount, type });
+    return res.json({ ok: true, giveaway: rows[0] });
+  } catch (err) {
+    console.error('[ADMIN] /giveaways post error', err);
+    return res.status(500).json({ error: 'Failed to create giveaway' });
+  }
+});
+
+// GET giveaway claims / stats
+router.get('/giveaways/:id/claims', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT c.*, u.username, u.number
+      FROM giveaway_claims c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.giveaway_id = $1
+      ORDER BY c.claimed_at DESC
+    `, [req.params.id]);
+    return res.json({ ok: true, claims: rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch giveaway claims' });
+  }
+});
+
+// DELETE giveaway
+router.delete('/giveaways/:id', superAdminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`DELETE FROM giveaways WHERE id = $1 RETURNING title`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Giveaway not found' });
+    await logAdminAction(req.user.id, 'deleted_giveaway', req.params.id, { title: rows[0].title });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete giveaway' });
   }
 });
 
