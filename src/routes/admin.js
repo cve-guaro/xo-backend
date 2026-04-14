@@ -120,10 +120,12 @@ router.get('/stats', async (req, res) => {
     // Fetch real Chapa balance if possible
     let chapaBalance = 0;
     try {
-      const chapaData = await getChapaBalance();
-      // Chapa returns { data: [ { currency: 'ETB', balance: ... } ] }
-      const etbBal = chapaData?.data?.find(b => b.currency === 'ETB');
-      chapaBalance = Number(etbBal?.balance || 0);
+      const chapaData = await getChapaBalance(CHAPA.secret);
+      // Chapa returns { data: [ { currency: 'ETB', available_balance: ... } ] }
+      if (chapaData?.data && Array.isArray(chapaData.data)) {
+        const etbBal = chapaData.data.find(b => b.currency === 'ETB') || chapaData.data[0];
+        chapaBalance = Number(etbBal?.available_balance || etbBal?.balance || 0);
+      }
     } catch (e) {
       console.warn('[ADMIN] Chapa balance fetch failed:', e.message);
     }
