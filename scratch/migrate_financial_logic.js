@@ -54,7 +54,7 @@ BEGIN
   --   Withdrawable = Real deposits + Real wins - Losses - Withdrawals
   --   Available    = Withdrawable + Admin Gifts + Welcome Bonus
   
-  IF p_tx_type = 'DEPOSIT' OR p_tx_type = 'WON' THEN
+  IF p_tx_type = 'DEPOSIT' OR p_tx_type = 'PRIZE' THEN
     -- Real income: adds to both
     UPDATE wallets
     SET available_balance = available_balance + v_amount,

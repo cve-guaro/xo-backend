@@ -5,9 +5,9 @@ const SQL = {
     SELECT fn_wallet_apply_existing_tx($1::uuid) AS tx_id;
   `,
 
-  // Find deposit tx by tx_id (which is what we send to Chapa as tx_ref)
+  // Find deposit tx by provider ref (tx_ref in Chapa)
   findDepositTxByProviderRef: `
-    SELECT id, user_id, status, tx_id
+    SELECT id, user_id, status, id AS tx_id
     FROM wallet_transactions
     WHERE tx_type = 'DEPOSIT'
       AND provider = $1
