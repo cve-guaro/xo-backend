@@ -30,6 +30,10 @@ const SQL = {
     UPDATE wallet_transactions
     SET status = 'COMPLETED',
         provider_ref = COALESCE($2::text, provider_ref::text)::text,
+        meta = CASE 
+          WHEN $3::jsonb IS NOT NULL THEN (COALESCE(meta, '{}'::jsonb) || $3::jsonb)
+          ELSE meta
+        END,
         updated_at = now()
     WHERE id = $1::uuid
       AND status = 'PENDING'

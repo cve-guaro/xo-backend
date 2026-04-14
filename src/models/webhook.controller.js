@@ -160,8 +160,8 @@ async function handleWebhook(req, res) {
 
     if (event === "charge.success") {
       console.log("[WEBHOOK] Processing charge.success deposit for ref:", providerRef);
-      // Pass the real provider reference (e.g. 'CHAPA-xxxx') so receipt links work
-      const out = await completeDeposit(providerRef, "CHAPA", realReference);
+      // Pass the real provider reference (e.g. 'CHAPA-xxxx') and the full body as meta
+      const out = await completeDeposit(providerRef, "CHAPA", realReference, req.body);
       console.log("[WEBHOOK] Deposit completed:", out);
       return res.json({ ok: true, ...out });
     }

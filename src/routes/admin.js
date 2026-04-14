@@ -809,7 +809,7 @@ router.get('/transactions', async (req, res) => {
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const query = `
-      SELECT pt.id, pt.tx_type as type, pt.amount, pt.status, pt.provider as bank, pt.provider_ref as tx_ref, pt.created_at, u.number, u.username, u.display_name
+      SELECT pt.id, pt.tx_type as type, pt.amount, pt.status, pt.provider as bank, pt.provider_ref as tx_ref, pt.meta as provider_payload, pt.created_at, u.number, u.username, u.display_name
       FROM wallet_transactions pt
       LEFT JOIN users u ON u.id = pt.user_id
       ${where}
