@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const Redis = require('ioredis');
 const bodyParser = require("body-parser"); 
 const cors = require('cors');
 require('dotenv').config();
@@ -42,10 +44,21 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests globally
 
-// ─── SOCKET.IO ─────────────────────────────────────────────────────────────────
+// ─── SOCKET.IO & REDIS ADAPTER ─────────────────────────────────────────────────
 const io = new Server(server, {
   cors: { origin: corsOptions.origin, methods: ["GET", "POST"], credentials: true }
 });
+
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const pubClient = new Redis(REDIS_URL);
+const subClient = pubClient.duplicate();
+
+pubClient.on('error', (err) => console.error('[REDIS PUB] Adapter connection error:', err));
+subClient.on('error', (err) => console.error('[REDIS SUB] Adapter connection error:', err));
+
+io.adapter(createAdapter(pubClient, subClient));
+console.log('[SOCKET.IO] Redis adapter connected and attached for scalable matchmaking.');
+
 
 // ─── RATE LIMITING (FIREWALL) ──────────────────────────────────────────────────
 const generalLimiter = rateLimit({

@@ -6,9 +6,13 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : (process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false),
-  max: 20,
+  max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => {
+  console.error('[DB POOL] Unexpected error on idle client:', err.message);
 });
 
 async function withTx(fn) {
