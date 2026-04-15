@@ -1088,7 +1088,7 @@ router.get('/promocodes', async (req, res) => {
   }
 });
 
-router.post('/promocodes', superAdminAuth, async (req, res) => {
+router.post('/promocodes', async (req, res) => {
   try {
     const { code, amount, description, target_type, usage_limit, expires_at } = req.body;
     if (!code || !amount) return res.status(400).json({ error: 'Code and Amount are required' });
@@ -1110,7 +1110,7 @@ router.post('/promocodes', superAdminAuth, async (req, res) => {
   }
 });
 
-router.delete('/promocodes/:id', superAdminAuth, async (req, res) => {
+router.delete('/promocodes/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(`DELETE FROM promocodes WHERE id = $1 RETURNING code`, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Promo code not found' });
@@ -1180,7 +1180,7 @@ router.get('/giveaways/:id/claims', async (req, res) => {
 });
 
 // DELETE giveaway
-router.delete('/giveaways/:id', superAdminAuth, async (req, res) => {
+router.delete('/giveaways/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(`DELETE FROM giveaways WHERE id = $1 RETURNING title`, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Giveaway not found' });
