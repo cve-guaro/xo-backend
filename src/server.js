@@ -44,7 +44,7 @@ app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests gl
 
 // ─── SOCKET.IO ─────────────────────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: { origin: corsOptions.origin, methods: ["GET", "POST"], credentials: true }
 });
 
 // ─── RATE LIMITING (FIREWALL) ──────────────────────────────────────────────────
@@ -117,7 +117,7 @@ app.get('/players/online', async (_, res) => {
     if (!show) {
       // Return a "random fake" high-activity count (e.g., between 420 and 780)
       const fakeCount = Math.floor(Math.random() * (780 - 420 + 1)) + 420;
-      return res.json({ count: fakeCount, is_fake: true });
+      return res.json({ count: fakeCount });
     }
     return res.json({ count: io.engine.clientsCount || 0 });
   } catch (err) {

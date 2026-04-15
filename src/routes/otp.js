@@ -11,7 +11,7 @@ const router = express.Router();
 const OTP_TTL = Number(process.env.OTP_TTL_SECONDS || 300); // 5 min
 const MAX_TRIES = Number(process.env.MAX_OTP_TRIES || 5);
 const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
-const GEEZ_SMS_TOKEN = '4fnQT0PgJm0PKFEXVh96Twt9kq5EdC1p'; // put your token in .env
+const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
 
 
 async function sendGeezSMS({ userId, phone, message }) {
@@ -86,7 +86,7 @@ router.post('/request-otp', async (req, res) => {
     const code = genOtp(number);
     const ttl = OTP_TTL;
 
-    console.log(`[DEBUG] OTP for ${number}: ${code} (valid for ${ttl}s)`);
+    console.log(`[DEBUG] OTP requested for ${number} (valid for ${ttl}s)`);
 
     await withTx(async (client) => {
       // 1️⃣ Ensure user exists
@@ -170,7 +170,7 @@ router.post('/verify-otp', async (req, res) => {
   }
 
   const number = normalizeNumber(raw);
-  const secret = process.env.JWT_SECRET || 'test';
+  const secret = process.env.JWT_SECRET;
 
   if (!secret) {
     console.error('[VERIFY_OTP] JWT secret missing');

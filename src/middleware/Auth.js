@@ -3,10 +3,11 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../db/index');
 const JWT_SECRET = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
 
-const pubKey = JWT_SECRET || 'test'; // or HS256 secret
-if (!pubKey) {
-  console.warn('JWT_PUBLIC_KEY not set — auth middleware will accept x-user-id for local testing.');
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set. Server cannot start securely.');
+  process.exit(1);
 }
+const pubKey = JWT_SECRET;
 
 async function auth(req, res, next) {
   try {
@@ -29,13 +30,6 @@ async function auth(req, res, next) {
         phone_number: payload.number,
         role: liveRole,
       };
-      return next();
-    }
-
-    // Dev fallback: x-user-id header
-    const fake = req.headers['x-user-id'];
-    if (fake) {
-      req.user = { id: fake, role: 'user' };
       return next();
     }
 

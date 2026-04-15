@@ -67,7 +67,12 @@ const METHODS = [
 router.get('/chapa-bounce', async (req, res) => {
   try {
     const url = req.query.url;
-    if (!url || !url.startsWith('https://checkout.chapa.co/')) {
+    let isValidChapaUrl = false;
+    try {
+      const parsed = new URL(url);
+      isValidChapaUrl = parsed.hostname === 'checkout.chapa.co' && parsed.protocol === 'https:';
+    } catch (_) {}
+    if (!url || !isValidChapaUrl) {
       return res.status(400).send('Invalid Chapa checkout URL');
     }
 

@@ -145,9 +145,8 @@ async function handleWebhook(req, res) {
         ['WEBHOOK_SIGNATURE_INVALID', details, 'CRITICAL', req.ip || req.headers['x-forwarded-for']]
       ).catch(e => console.error('[ALERTS] Failed to log alert:', e));
 
-      console.warn("[WEBHOOK SECURITY] Signature mismatch BYPASSED to unblock production testing.");
-      // TODO: Once the correct strategy is identified in logs, uncomment:
-      // return res.status(403).json({ error: "Invalid signature" });
+      console.error("[WEBHOOK SECURITY] Signature mismatch — REJECTING.");
+      return res.status(403).json({ error: "Invalid signature" });
     }
 
     const { event, providerRef, realReference } = parseProviderEvent(req.body);
