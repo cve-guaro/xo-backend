@@ -701,11 +701,22 @@ function setupGameSocket(io) {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.sub;
         console.log(`[MM] Token verified for user: ${userId}`);
+        
+        // --- STRICT PAYLOAD SANITIZATION (Security Pen Test Patch) ---
+        const safeBetAmount = Number(betAmount);
+        if (!Number.isFinite(safeBetAmount) || safeBetAmount <= 0) {
+           console.warn(`[SECURITY WARN] Malicious betAmount payload detected from user ${userId}:`, betAmount);
+           if (typeof ack === "function") ack({ ok: true, data: { state: "INVALID_BET_AMOUNT" } });
+           socket.emit("error", { code: "INVALID_BET_AMOUNT", message: "Invalid payload format." });
+           return;
+        }
+
         rememberUser(userId);
         rememberUserSocket(socket, userId); // track user online
         const username = decoded.username || "";
+        
         // After validation → Normalize and store as cents internally
-        const roomNumber = determineRoomByBetAmount(betAmount);
+        const roomNumber = determineRoomByBetAmount(safeBetAmount);
         if (!roomNumber) {
           const validBets = [
             ...ROOMS_CONFIG[1].betRange,
@@ -746,7 +757,7 @@ function setupGameSocket(io) {
         }
 
         // --- TRANSLATOR: Convert Birr to Cents for DB/Logic ---
-        const betAmountCents = Math.round(Number(betAmount));
+        const betAmountCents = Math.round(safeBetAmount);
         
         const ctx = `rid=${rid} sid=${socket.id} uid=${userId} bet=${betAmountCents} isWeb=${isWeb}`;
         dbg(ctx, "verified token and room");
