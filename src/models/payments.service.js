@@ -190,20 +190,79 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       throw err;
     }
 
+    // AML & Security Rules (Master Switch)
+    const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'max_daily_withdraw_amount', 'max_daily_withdraw_count')`);
+    let manualApproval = false;
+    let maxAmount = 25000;
+    let maxCount = 3;
+    
+    settingsRes.rows.forEach(r => {
+      if (r.key === 'is_manual_approval_enabled') manualApproval = (r.value === true || r.value === 'true');
+      if (r.key === 'max_daily_withdraw_amount') maxAmount = Number(r.value);
+      if (r.key === 'max_daily_withdraw_count') maxCount = Number(r.value);
+    });
+
+    let requiresManualReview = false;
+    let reviewReason = [];
+
+    if (manualApproval) {
+      if (amountEtb > maxAmount) {
+        requiresManualReview = true;
+        reviewReason.push(`Exceeds 24h limit (${amountEtb} > ${maxAmount})`);
+      }
+      
+      const { rows: todayWdRows } = await client.query(`SELECT COUNT(*) as count FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'WITHDRAW_REQUEST' AND created_at >= NOW() - INTERVAL '24 HOURS'`, [userId]);
+      if (Number(todayWdRows[0].count) >= maxCount) {
+        requiresManualReview = true;
+        reviewReason.push(`Too many requests 24h (${todayWdRows[0].count} >= ${maxCount})`);
+      }
+
+      // Quick cooldown check (1 hour)
+      const { rows: cooldownRows } = await client.query(`SELECT count(*) as count FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'WITHDRAW_REQUEST' AND created_at >= NOW() - INTERVAL '1 HOUR'`, [userId]);
+      if (Number(cooldownRows[0].count) > 0) {
+        requiresManualReview = true;
+        reviewReason.push(`Cooldown active (requested < 1h ago)`);
+      }
+
+      // Wagering 100% check
+      const { rows: wagRows } = await client.query(`
+        SELECT 
+          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status IN ('completed', 'COMPLETED')) as total_deps,
+          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'STAKE' AND status IN ('completed', 'COMPLETED')) +
+          (SELECT COALESCE(SUM(bet_amount), 0) FROM games WHERE player_x = $1 OR player_o = $1) as total_wagered
+      `, [userId]);
+      const totDeps = Number(wagRows[0].total_deps);
+      const totWag = Number(wagRows[0].total_wagered);
+      
+      if (totWag < totDeps) {
+        requiresManualReview = true;
+        reviewReason.push(`Wagering req failed (Wagered: ${totWag}, Deposited: ${totDeps})`);
+      }
+
+      // Phone match check
+      const { rows: phoneRows } = await client.query(`SELECT number FROM users WHERE id = $1`, [userId]);
+      if (String(payoutDestination).trim() !== String(phoneRows[0].number).trim()) {
+        requiresManualReview = true;
+        reviewReason.push(`Phone mismatch (Req: ${payoutDestination}, Reg: ${phoneRows[0].number})`);
+      }
+    }
+
+    const initialStatus = requiresManualReview ? "PENDING_MANUAL" : "PENDING";
+
     const txRes = await client.query(SQL.applyTx, [
       userId,
       "WITHDRAW_REQUEST",
       amountEtb,
-      "PENDING", // Start as PENDING for admin review
+      initialStatus,
       idem,
       null,
       null,
-      { payoutMethod, payoutDestination },
+      { payoutMethod, payoutDestination, reviewReason: reviewReason.join(' | ') },
     ]);
 
     const reserveTxId = txRes.rows[0].tx_id;
 
-    // IMMEDIATELY reserve/lock funds! Since fn_wallet_apply_tx ignores PENDING, we deduct manually.
+    // IMMEDIATELY reserve/lock funds!
     let deductW = Math.min(withdrawable, amountEtb);
     let deductB = amountEtb - deductW;
 
@@ -215,7 +274,6 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       WHERE user_id = $4
     `, [amountEtb, deductW, deductB, userId]);
 
-    // Set applied_at = now() so future approval (webhooks calling fn_wallet_apply_existing_tx) doesn't duplicate the deduction.
     await client.query(`UPDATE wallet_transactions SET applied_at = now() WHERE id = $1`, [reserveTxId]);
 
     const reqRes = await client.query(SQL.createWithdrawRequest, [
@@ -227,11 +285,15 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     ]);
 
     const walletRes = await client.query(SQL.getWallet, [userId]);
-    return { reserveTxId, withdrawRequest: reqRes.rows[0], wallet: walletRes.rows[0] };
+    return { reserveTxId, withdrawRequest: reqRes.rows[0], wallet: walletRes.rows[0], requiresManualReview, reviewReason };
   });
 
   // STEP 2: Attempt Chapa payout OUTSIDE the DB transaction
-  // If Chapa fails, the withdrawal is still recorded as pending for admin manual processing
+  if (requiresManualReview) {
+    console.log(`[WITHDRAW] Marked PENDING_MANUAL for ${userId}. Reasons: ${reviewReason.join(', ')}`);
+    return { withdrawRequest, wallet, chapaStatus: 'pending_manual', checkout_url: null, reviewReason };
+  }
+
   let chapaStatus = 'pending_manual';
   let checkout_url = null;
   const cleanDestination = String(payoutDestination).replace(/\D/g, "");

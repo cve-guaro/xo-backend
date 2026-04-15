@@ -24,7 +24,7 @@ const { pool } = require('./db/index');
 
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', true);
 const server = http.createServer(app);
 
 // ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ const paymentLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 30, // 30 OTP attempts per 15 min is plenty
+  max: 500, // Increased to 500 to prevent proxy-related IP exhaustion
   message: {
     error: "TOO_MANY_REQUESTS",
     message: "Too many login attempts. For security, please wait 15 minutes before trying again."
