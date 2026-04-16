@@ -51,6 +51,60 @@ async function logAdminAction(adminId, action, targetId = null, details = {}) {
 }
 
 // ──────────────────────────────────────────────
+// GET /admin/reconcile
+// ──────────────────────────────────────────────
+// Military-Grade Double-Entry Verification: Matches historical ledger vs LIVE wallet balances
+router.get('/reconcile', async (req, res) => {
+  try {
+    // We sum up the transactions that logically modify balances:
+    // + DEPOSIT, PRIZE, GIFT (Giveaway), REFUND
+    // - WITHDRAW_REQUEST, STAKE
+
+    const result = await pool.query(`
+      WITH ledger AS (
+        SELECT 
+          user_id,
+          SUM(
+            CASE 
+              WHEN tx_type IN ('DEPOSIT', 'PRIZE', 'GIFT', 'REFUND') AND status IN ('COMPLETED', 'success') THEN amount
+              WHEN tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED', 'STAKE') AND status IN ('COMPLETED', 'success', 'PENDING', 'PENDING_MANUAL') THEN -amount
+              ELSE 0
+            END
+          ) AS calculated_net_balance
+        FROM wallet_transactions
+        GROUP BY user_id
+      ),
+      wallets_live AS (
+        SELECT 
+          user_id,
+          (COALESCE(available_balance, 0) + COALESCE(withdrawable_balance, 0) + COALESCE(bonus_balance, 0)) AS current_total_balance
+        FROM wallets
+      )
+      SELECT 
+        w.user_id,
+        u.phone_number,
+        COALESCE(l.calculated_net_balance, 0) AS derived_history_balance,
+        w.current_total_balance AS live_wallet_balance,
+        (w.current_total_balance - COALESCE(l.calculated_net_balance, 0)) AS discrepancy
+      FROM wallets_live w
+      LEFT JOIN ledger l ON w.user_id = l.user_id
+      LEFT JOIN users u ON w.user_id = u.id
+      WHERE (w.current_total_balance - COALESCE(l.calculated_net_balance, 0)) != 0
+         OR w.current_total_balance < 0;
+    `);
+
+    return res.json({ 
+      ok: true, 
+      anomaliesFound: result.rows.length,
+      anomalies: result.rows // Anything strictly non-zero means math violated
+    });
+  } catch (err) {
+    console.error("[RECONCILE ENGINE] Failed:", err);
+    return res.status(500).json({ error: 'Reconciliation failed' });
+  }
+});
+
+// ──────────────────────────────────────────────
 // GET & PATCH /admin/settings
 // ──────────────────────────────────────────────
 router.get('/settings', async (req, res) => {
