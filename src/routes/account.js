@@ -16,9 +16,6 @@ router.patch(
 
       // Zod has already validated and sanitized req.body
       const { username, display_name, avatar } = req.body;
-
-
-      const { username, display_name, avatar } = req.body;
       if (!username && !display_name && !avatar) {
         return res.status(400).json({ message: "No data provided" });
       }
