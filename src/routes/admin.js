@@ -362,7 +362,7 @@ router.get('/metrics/daily-trends', async (req, res) => {
 // ──────────────────────────────────────────────
 router.get('/users', async (req, res) => {
   try {
-    const { limit = 100, offset = 0, search = '', role = 'all', status = 'all' } = req.query;
+    const { limit = 100, offset = 0, search = '', role = 'all', status = 'all', amountRange = 'all' } = req.query;
     const rawSearch = search.trim();
     
     let whereClauses = [];
@@ -403,6 +403,17 @@ router.get('/users', async (req, res) => {
       whereClauses.push(`u.banned = $${paramIdx}`);
       queryParams.push(status === 'banned');
       paramIdx++;
+    }
+
+    // Amount Range Filter (available_balance)
+    if (amountRange !== 'all') {
+      if (amountRange === '0-100') {
+        whereClauses.push(`w.available_balance <= 100`);
+      } else if (amountRange === '100-10000') {
+        whereClauses.push(`w.available_balance > 100 AND w.available_balance <= 10000`);
+      } else if (amountRange === '10000-100000') {
+        whereClauses.push(`w.available_balance > 10000 AND w.available_balance <= 100000`);
+      }
     }
 
     // Dynamic Sorting
@@ -809,6 +820,7 @@ router.get('/transactions', async (req, res) => {
     const offset = Number(req.query.offset || 0);
     const type   = req.query.type;
     const status = req.query.status;
+    const amountRange = req.query.amountRange || 'all';
 
     const conditions = [`(pt.provider IS NULL OR pt.provider != 'PRIZE')`];
     const params = [];
@@ -835,6 +847,16 @@ router.get('/transactions', async (req, res) => {
       } else {
         conditions.push(`pt.status = $${idx++}`);
         params.push(statusList[0]);
+      }
+    }
+
+    if (amountRange !== 'all') {
+      if (amountRange === '0-100') {
+        conditions.push(`pt.amount <= 100`);
+      } else if (amountRange === '100-10000') {
+        conditions.push(`pt.amount > 100 AND pt.amount <= 10000`);
+      } else if (amountRange === '10000-100000') {
+        conditions.push(`pt.amount > 10000 AND pt.amount <= 100000`);
       }
     }
 
@@ -1031,6 +1053,18 @@ router.get('/game-logs', async (req, res) => {
   try {
     const limit  = Math.min(Number(req.query.limit  || 20), 2000); // Increased max limit to 2000
     const offset = Number(req.query.offset || 0);
+    const amountRange = req.query.amountRange || 'all';
+
+    let whereStr = '';
+    if (amountRange !== 'all') {
+      if (amountRange === '0-100') {
+        whereStr = `WHERE g.bet_amount <= 100`;
+      } else if (amountRange === '100-10000') {
+        whereStr = `WHERE g.bet_amount > 100 AND g.bet_amount <= 10000`;
+      } else if (amountRange === '10000-100000') {
+        whereStr = `WHERE g.bet_amount > 10000 AND g.bet_amount <= 100000`;
+      }
+    }
 
     const { rows } = await pool.query(`
       SELECT
@@ -1043,6 +1077,7 @@ router.get('/game-logs', async (req, res) => {
       FROM games g
       LEFT JOIN users px ON px.id = g.player_x
       LEFT JOIN users po ON po.id = g.player_o
+      ${whereStr}
       ORDER BY g.created_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
@@ -1052,7 +1087,7 @@ router.get('/game-logs', async (req, res) => {
       bet_amount: Number(r.bet_amount || 0)
     }));
 
-    const countRes = await pool.query(`SELECT COUNT(*) FROM games`);
+    const countRes = await pool.query(`SELECT COUNT(*) FROM games g ${whereStr}`);
     return res.json({ games: formatted, total: Number(countRes.rows[0].count), limit, offset });
   } catch (err) {
     console.error('[ADMIN] /game-logs error', err);
@@ -1168,15 +1203,34 @@ router.post('/giveaways', async (req, res) => {
 // GET giveaway claims / stats
 router.get('/giveaways/:id/claims', async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT c.*, u.username, u.number
-      FROM giveaway_claims c
-      JOIN users u ON c.user_id = u.id
-      WHERE c.giveaway_id = $1
-      ORDER BY c.claimed_at DESC
-    `, [req.params.id]);
-    return res.json({ ok: true, claims: rows });
+    const limit = Math.min(Number(req.query.limit || 100), 500);
+    const offset = Number(req.query.offset || 0);
+
+    const [giveawayRes, claimsRes, countRes] = await Promise.all([
+      pool.query(`SELECT id, title, amount, type, promo_code, starts_at, ends_at FROM giveaways WHERE id = $1`, [req.params.id]),
+      pool.query(`
+        SELECT c.*, u.username, u.number
+        FROM giveaway_claims c
+        JOIN users u ON c.user_id = u.id
+        WHERE c.giveaway_id = $1
+        ORDER BY c.claimed_at DESC
+        LIMIT $2 OFFSET $3
+      `, [req.params.id, limit, offset]),
+      pool.query(`SELECT COUNT(*) FROM giveaway_claims WHERE giveaway_id = $1`, [req.params.id])
+    ]);
+
+    if (!giveawayRes.rows.length) return res.status(404).json({ error: 'Giveaway not found' });
+
+    return res.json({ 
+      ok: true, 
+      giveaway: giveawayRes.rows[0],
+      claims: claimsRes.rows, 
+      total: Number(countRes.rows[0].count),
+      limit,
+      offset
+    });
   } catch (err) {
+    console.error('[ADMIN] /giveaways/claims error', err);
     return res.status(500).json({ error: 'Failed to fetch giveaway claims' });
   }
 });
