@@ -29,7 +29,16 @@ const server = http.createServer(app);
 
 // ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
 app.use(helmet({
-  contentSecurityPolicy: false, // Disable to prevent breaking existing inline scripts
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "https://xo-et-frontend.vercel.app"],
+      frameAncestors: ["'none'"]
+    }
+  },
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
   hsts: {
@@ -39,8 +48,15 @@ app.use(helmet({
   },
   xssFilter: true,
   noSniff: true,
-  frameguard: { action: 'deny' } // Block iframe embedding (clickjacking)
+  frameguard: { action: 'deny' }, // Block iframe embedding (clickjacking)
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" }
 }));
+
+// Manually applying Permissions-Policy since helmet doesn't support it natively yet
+app.use((req, res, next) => {
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 
 // ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
 // Must be FIRST, before any routes or other middleware.
