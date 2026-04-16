@@ -76,6 +76,10 @@ function genOtp(phoneNumber) {
   return String(n).padStart(4, "0");
 }
 
+// ✅ Redis connection for Refresh Tokens & Blacklisting
+const Redis = require('ioredis');
+const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+
 
 function normalizeNumber(n) {
   return String(n)
@@ -345,13 +349,18 @@ router.post('/verify-otp', async (req, res) => {
         role: result.user.role || 'user',
       },
       secret,
-      { expiresIn: '30d' }
+      { expiresIn: '15m' } // ✅ Military-Grade: Short-lived access token
     );
 
-    console.log('[VERIFY_OTP] Token generated successfully');
+    // ✅ Generate Cryptographically Secure Refresh Token (7 days)
+    const refreshToken = crypto.randomBytes(40).toString('hex');
+    await redis.set(`refresh_token:${refreshToken}`, result.user.id, 'EX', 7 * 24 * 60 * 60);
+
+    console.log('[VERIFY_OTP] Tokens generated successfully');
 
     return res.json({
       token,
+      refreshToken, // Frontend must now store and use this when 401s occur
       user: {
         id: result.user.id,
         number: result.user.number,
@@ -372,5 +381,87 @@ router.post('/verify-otp', async (req, res) => {
   }
 });
 
+/**
+ * POST /auth/refresh
+ * Exchanges a valid refresh token for a new 15m access token and rotates the refresh token.
+ */
+router.post('/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
+
+  try {
+    const userId = await redis.get(`refresh_token:${refreshToken}`);
+    if (!userId) {
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    // Fetch latest user data to ensure claims (like role) are fresh
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+    if (!rows.length) return res.status(401).json({ error: 'User no longer exists' });
+    const user = rows[0];
+    if (user.banned) return res.status(403).json({ error: 'Account suspended' });
+
+    // Invalidate the old refresh token (Token Rotation for theft detection)
+    await redis.del(`refresh_token:${refreshToken}`);
+
+    // Generate new Access Token
+    const secret = process.env.JWT_SECRET;
+    const newToken = jwt.sign(
+      {
+        sub: user.id,
+        number: user.number,
+        username: user.username,
+        role: user.role || 'user',
+      },
+      secret,
+      { expiresIn: '15m' }
+    );
+
+    // Generate new Refresh Token
+    const newRefreshToken = crypto.randomBytes(40).toString('hex');
+    await redis.set(`refresh_token:${newRefreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60);
+
+    return res.json({ token: newToken, refreshToken: newRefreshToken });
+  } catch (err) {
+    console.error('[REFRESH] Error:', err);
+    return res.status(500).json({ error: 'Server error during refresh' });
+  }
+});
+
+/**
+ * POST /auth/logout
+ * Strictly revokes the access token (via Redis blacklist) and deletes the refresh token.
+ */
+router.post('/logout', async (req, res) => {
+  const hdr = req.headers.authorization || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : hdr;
+  const { refreshToken } = req.body;
+
+  try {
+    if (token) {
+      // Decode without verifying just to get expiry time and minimize Redis bloat
+      const decoded = jwt.decode(token);
+      if (decoded && decoded.exp) {
+        const ttl = Math.max(0, decoded.exp - Math.floor(Date.now() / 1000));
+        if (ttl > 0) {
+           await redis.set(`jwt_bl:${token}`, 'revoked', 'EX', ttl);
+        }
+      } else {
+        // Fallback if unable to decode cleanly
+        await redis.set(`jwt_bl:${token}`, 'revoked', 'EX', 15 * 60); 
+      }
+    }
+
+    if (refreshToken) {
+      await redis.del(`refresh_token:${refreshToken}`);
+    }
+
+    return res.json({ ok: true, message: 'Logged out securely' });
+  } catch (err) {
+    console.error('[LOGOUT] Error:', err);
+    return res.status(500).json({ error: 'Failed to logout securely' });
+  }
+});
 
 module.exports = router;
+

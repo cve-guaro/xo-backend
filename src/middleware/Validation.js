@@ -1,0 +1,53 @@
+const { z } = require('zod');
+
+/**
+ * Higher-order middleware to strictly validate request bindings against a Zod schema.
+ * Rejects invalid payloads immediately with a 400 Bad Request error.
+ */
+const validate = (schema, source = 'body') => {
+  return (req, res, next) => {
+    try {
+      const parsed = schema.parse(req[source]);
+      // Completely replace the request payload with the sanitized, validated version
+      req[source] = parsed;
+      next();
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({
+          error: 'Validation failed. Invalid input format.',
+          details: err.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
+        });
+      }
+      return res.status(400).json({ error: 'Malformed request payload' });
+    }
+  };
+};
+
+/**
+ * Military-Grade Schemas
+ */
+
+const schemas = {
+  // Financial Operations
+  deposit: z.object({
+    amount: z.number().int('Amount must be an integer').min(10, 'Minimum deposit is 10 ETB').max(100000, 'Maximum single deposit limit is 100000 ETB')
+  }),
+
+  withdraw: z.object({
+    amount: z.number().int('Amount must be an integer').min(10, 'Minimum withdrawal is 10 ETB').max(100000, 'Maximum withdrawal is 100,000 ETB'),
+    provider: z.enum(['telebirr', 'm-pesa', 'cbebirr'], { errorMap: () => ({ message: 'Invalid payout provider' }) }),
+    accountNo: z.string().min(7, 'Account number too short').max(15, 'Account number too long').regex(/^[0-9+]+$/, 'Account number must contain only numbers and +')
+  }),
+
+  // Account Operations
+  updateProfile: z.object({
+    username: z.string().min(3).max(24).regex(/^[a-zA-Z0-9_\-]+$/, 'Username can only contain letters, numbers, underscores, and hyphens').optional(),
+    display_name: z.string().min(2).max(40).optional(),
+    avatar: z.string().url('Avatar must be a valid URL').max(1024).optional()
+  })
+};
+
+module.exports = {
+  validate,
+  schemas
+};

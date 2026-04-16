@@ -1,6 +1,8 @@
-// auth.js
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db/index');
+const Redis = require('ioredis');
+const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+
 const JWT_SECRET = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
 
 if (!JWT_SECRET) {
@@ -15,6 +17,12 @@ async function auth(req, res, next) {
     const hdr = req.headers.authorization || '';
     const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : hdr;
     if (token && pubKey) {
+      // ✅ Military-Grade: Check if token was explicitly revoked
+      const isBlacklisted = await redis.get(`jwt_bl:${token}`);
+      if (isBlacklisted) {
+        return res.status(401).json({ error: 'Token revoked' });
+      }
+
       const payload = jwt.verify(token, pubKey);
       const userId = payload.sub || payload.userId || payload.id;
 

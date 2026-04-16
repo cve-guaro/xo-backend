@@ -1,27 +1,21 @@
 const express = require('express');
-const { pool } = require('../db/index'); // your Postgres client (pg.Pool
-const { body, validationResult } = require('express-validator');
+const { pool } = require('../db/index'); // your Postgres client (pg.Pool)
 const { auth } = require('../middleware/Auth.js');
+const { validate, schemas } = require('../middleware/Validation.js');
 
 const router = express.Router();
 
 // PATCH /account/profile
 router.patch(
   "/profile",
-  [
-    body("username").optional().isLength({ min: 3, max: 30 }).trim().escape(),
-    body("display_name").optional().isLength({ min: 1, max: 50 }).trim().escape(),
-  ], auth,
+  auth,
+  validate(schemas.updateProfile),
   async (req, res) => {
     try {
-      const userId = req.user?.id || req.user?.sub || req.user?.userId
+      const userId = req.user?.id || req.user?.sub || req.user?.userId;
 
-      // --- Validate body ---
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        console.log("Validation errors:", errors.array());
-        return res.status(400).json({ message: "Validation error", errors: errors.array() });
-      }
+      // Zod has already validated and sanitized req.body
+      const { username, display_name, avatar } = req.body;
 
 
       const { username, display_name, avatar } = req.body;

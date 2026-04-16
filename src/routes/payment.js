@@ -6,6 +6,7 @@ const { METHODS, LIMITS, CHAPA, toCents } = require('../env');
 const { auth } = require('../middleware/Auth');
 const { initDeposit, requestWithdraw } = require("../models/payments.service");
 const { handleWebhook } = require("../models/webhook.controller");
+const { validate, schemas } = require('../middleware/Validation');
 
 const router = express.Router();
 
@@ -124,7 +125,7 @@ router.get('/chapa-banks', async (req, res) => {
 });
 
 // 1) DEPOSIT
-router.post('/deposit', auth, async (req, res) => {
+router.post('/deposit', auth, validate(schemas.deposit), async (req, res) => {
   try {
     const userId = req.user.id;
     const { amount, provider, clientRef } = req.body || {};
@@ -168,7 +169,7 @@ router.post('/deposit', auth, async (req, res) => {
 
 
 // 2) WITHDRAW
-router.post('/withdraw', auth, async (req, res) => {
+router.post('/withdraw', auth, validate(schemas.withdraw), async (req, res) => {
   try {
     const userId = req.user.id;
     const { amount, payoutMethod, payoutDestination } = req.body || {};
