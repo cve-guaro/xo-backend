@@ -14,6 +14,29 @@ const router = express.Router();
 router.use(adminAuth);
 
 // ──────────────────────────────────────────────
+// GET /admin/audit-logs
+// ──────────────────────────────────────────────
+router.get('/audit-logs', async (req, res) => {
+  try {
+    const { limit = 500, offset = 0 } = req.query;
+    const { rows } = await pool.query(`
+      SELECT a.*, 
+             u.username as admin_name, u.number as admin_number,
+             t.username as target_name
+      FROM admin_audit_logs a
+      LEFT JOIN users u ON u.id = a.admin_id
+      LEFT JOIN users t ON t.id = a.target_id
+      ORDER BY a.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [Number(limit), Number(offset)]);
+    return res.json({ logs: rows });
+  } catch (err) {
+    console.error('[ADMIN] /audit-logs error', err);
+    return res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
+// ──────────────────────────────────────────────
 // Helper: Log Admin Action
 // ──────────────────────────────────────────────
 async function logAdminAction(adminId, action, targetId = null, details = {}) {
@@ -745,13 +768,21 @@ router.delete('/users/:id', async (req, res) => {
     }
 
     await withTx(async (client) => {
+      // Fetch target user info for audit logging
+      const { rows } = await client.query(`SELECT username, number FROM users WHERE id = $1`, [req.params.id]);
+      const targetUser = rows[0] || {};
+      
       // Order is important for foreign keys
       await client.query(`DELETE FROM games WHERE player_x = $1 OR player_o = $1 OR winner = $1`, [req.params.id]);
       await client.query(`DELETE FROM wallet_transactions WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM bonus_logs WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM wallets WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM users WHERE id = $1`, [req.params.id]);
-      await logAdminAction(req.user.id, 'deleted_user_permanent', req.params.id, {});
+      
+      await logAdminAction(req.user.id, 'deleted_user_permanent', req.params.id, { 
+        username: targetUser.username || 'Unknown',
+        number: targetUser.number || 'Unknown' 
+      });
     });
 
     res.json({ ok: true });

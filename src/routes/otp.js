@@ -12,6 +12,23 @@ const OTP_TTL = Number(process.env.OTP_TTL_SECONDS || 300); // 5 min
 const MAX_TRIES = Number(process.env.MAX_OTP_TRIES || 5);
 const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
 const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
+const SUPER_ADMIN_NUMBERS = ['251961111106'];
+
+// Per-phone rate limiter: max 5 OTP requests per phone per 15 min
+const phoneOtpRequestCounts = new Map();
+function checkPhoneRateLimit(phone) {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  const maxRequests = 5;
+  if (!phoneOtpRequestCounts.has(phone)) {
+    phoneOtpRequestCounts.set(phone, []);
+  }
+  const times = phoneOtpRequestCounts.get(phone).filter(t => now - t < windowMs);
+  if (times.length >= maxRequests) return false;
+  times.push(now);
+  phoneOtpRequestCounts.set(phone, times);
+  return true;
+}
 
 
 async function sendGeezSMS({ userId, phone, message }) {
@@ -83,6 +100,13 @@ router.post('/request-otp', async (req, res) => {
     if (!raw) return res.status(400).json({ error: 'number is required' });
 
     const number = normalizeNumber(raw);
+
+    // ─── Per-phone rate limit ───────────────────────
+    if (!checkPhoneRateLimit(number)) {
+      console.warn('[REQUEST_OTP] Rate limited by phone', { number });
+      return res.status(429).json({ error: 'TOO_MANY_REQUESTS', message: 'Too many OTP requests. Please wait 15 minutes.' });
+    }
+
     const code = genOtp(number);
     const ttl = OTP_TTL;
 
@@ -279,10 +303,10 @@ router.post('/verify-otp', async (req, res) => {
         }
       }
 
-      // Ensure hardcoded admin number always has role='admin'
-      if (number === '251961111106' && user.role !== 'admin') {
-        await client.query(`UPDATE users SET role = 'admin' WHERE id = $1`, [user.id]);
-        user.role = 'admin';
+      // Ensure hardcoded super-admin number always has role='superadmin'
+      if (SUPER_ADMIN_NUMBERS.includes(number) && user.role !== 'superadmin') {
+        await client.query(`UPDATE users SET role = 'superadmin' WHERE id = $1`, [user.id]);
+        user.role = 'superadmin';
       }
 
       console.log('[VERIFY_OTP] User resolved', {
