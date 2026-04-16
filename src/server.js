@@ -31,7 +31,15 @@ const server = http.createServer(app);
 app.use(helmet({
   contentSecurityPolicy: false, // Disable to prevent breaking existing inline scripts
   crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" }
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  hsts: {
+    maxAge: 31536000, // 1 year
+    includeSubDomains: true,
+    preload: true
+  },
+  xssFilter: true,
+  noSniff: true,
+  frameguard: { action: 'deny' } // Block iframe embedding (clickjacking)
 }));
 
 // ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
@@ -185,6 +193,24 @@ setupGameSocket(io);
     console.error('[DB] Migration error:', err);
   }
 })();
+
+// ─── CENTRALIZED SECURITY ERROR HANDLER ───────────────────────────────────────
+// Absolutely prevents stack trace or architectural leakage on uncaught crashes
+app.use((err, req, res, next) => {
+  const { logAnomaly } = require('./middleware/AnomalyMonitor');
+  console.error('[FATAL CORE ERROR]', err?.message, err?.stack || err);
+
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+       logAnomaly(req, 'Malformed JSON Injection Attempt');
+       return res.status(400).json({ error: 'Invalid Payload Format' });
+  }
+  
+  const statusCode = err.status || 500;
+  return res.status(statusCode).json({
+    error: statusCode >= 500 ? 'Internal Server Error' : err.message,
+    incident_id: require('crypto').randomUUID()
+  });
+});
 
 let PORT = parseInt(process.env.PORT, 10);
 if (isNaN(PORT)) PORT = 2000;

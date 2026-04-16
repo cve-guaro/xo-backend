@@ -1,4 +1,5 @@
 const { z } = require('zod');
+const { logAnomaly } = require('./AnomalyMonitor');
 
 /**
  * Higher-order middleware to strictly validate request bindings against a Zod schema.
@@ -13,11 +14,13 @@ const validate = (schema, source = 'body') => {
       next();
     } catch (err) {
       if (err instanceof z.ZodError) {
+        logAnomaly(req, `Schema Validation Failed on [${req.originalUrl}]`);
         return res.status(400).json({
           error: 'Validation failed. Invalid input format.',
           details: err.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
         });
       }
+      logAnomaly(req, `Malformed Payload on [${req.originalUrl}]`);
       return res.status(400).json({ error: 'Malformed request payload' });
     }
   };
