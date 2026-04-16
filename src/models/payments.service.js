@@ -161,7 +161,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   const idem = makeIdempotencyKey("WREQ", userId, anchor);
 
     // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
-  const { reserveTxId, withdrawRequest, wallet } = await withTx(async (client) => {
+  const { reserveTxId, withdrawRequest, wallet, requiresManualReview, reviewReason } = await withTx(async (client) => {
     await client.query(SQL.ensureWallet, [userId]);
     
     // 1) Verify user has played at least one match
