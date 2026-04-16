@@ -380,6 +380,7 @@ router.get('/users', async (req, res) => {
       whereClauses.push(`(
         u.username ILIKE $${paramIdx} 
         OR u.display_name ILIKE $${paramIdx} 
+        OR u.role ILIKE $${paramIdx}
         OR u.number ILIKE $${paramIdx}
         OR REGEXP_REPLACE(u.number, '[^0-9]', '', 'g') ILIKE $${paramIdx+1}
         OR RIGHT(REGEXP_REPLACE(u.number, '[^0-9]', '', 'g'), 9) ILIKE $${paramIdx+2}
@@ -1158,6 +1159,7 @@ router.post('/giveaways', async (req, res) => {
     await logAdminAction(req.user.id, 'created_giveaway', rows[0].id, { title, amount, type });
     return res.json({ ok: true, giveaway: rows[0] });
   } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Promo code already exists' });
     console.error('[ADMIN] /giveaways post error', err);
     return res.status(500).json({ error: 'Failed to create giveaway' });
   }

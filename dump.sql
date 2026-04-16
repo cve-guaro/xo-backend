@@ -73,12 +73,12 @@ BEGIN
   END IF;
 
   -- Apply balance logic
-  IF p_tx_type IN ('DEPOSIT','REFUND','ADJUSTMENT') THEN
+  IF p_tx_type IN ('REFUND','ADJUSTMENT') THEN
     UPDATE wallets
     SET available_balance = available_balance + v_amount
     WHERE user_id = p_user_id;
 
-  ELSIF p_tx_type = 'PRIZE' THEN
+  ELSIF p_tx_type IN ('DEPOSIT', 'PRIZE') THEN
     UPDATE wallets
     SET available_balance = available_balance + v_amount,
         withdrawable_balance = withdrawable_balance + v_amount

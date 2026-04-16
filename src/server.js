@@ -30,7 +30,8 @@ const server = http.createServer(app);
 // ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
 app.use(helmet({
   contentSecurityPolicy: false, // Disable to prevent breaking existing inline scripts
-  crossOriginEmbedderPolicy: false
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
 // ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
