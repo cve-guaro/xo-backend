@@ -286,54 +286,9 @@ router.post('/verify-otp', async (req, res) => {
         [user.id]
       );
 
-      // 6) Robust Giveaway Engine: Apply any active NEW_USER giveaways
+      // 6) Mark new_user flag and capture it for post-tx bonus processing
+      const isNewUser = !!user.new_user;
       if (user.new_user) {
-        console.log(`[BONUS] Processing bonuses for new user ${user.number} (${user.id})...`);
-        
-        // A) Apply giveaway-table promotions (works for all platforms)
-        await applyNewUserGiveaways(user.id).catch(err => console.error('[GIVEAWAY_ERR] Failed apply:', err));
-        
-        // B) Apply Legacy Welcome Bonus from global_settings (admin toggle)
-        try {
-          const { rows: settingsRows } = await client.query(
-            `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
-          );
-          let legacyActive = false;
-          let legacyAmount = 10; // default 10 ETB
-          settingsRows.forEach(r => {
-            if (r.key === 'welcome_bonus_active') legacyActive = (r.value === true || r.value === 'true');
-            if (r.key === 'welcome_bonus_amount') legacyAmount = Number(r.value) || 10;
-          });
-
-          if (legacyActive && legacyAmount > 0) {
-            // Check if already credited (idempotency)
-            const idemKey = `LEGACY_BONUS:${user.id}`;
-            const { rowCount: alreadyCredited } = await client.query(
-              `SELECT 1 FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'GIFT' AND provider_ref = $2`,
-              [user.id, idemKey]
-            );
-            if (!alreadyCredited) {
-              await client.query(
-                `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, description, meta)
-                 VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', 'Legacy Welcome Bonus', $4)`,
-                [user.id, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' })]
-              );
-              await client.query(
-                `UPDATE wallets SET bonus_balance = bonus_balance + $1, updated_at = now() WHERE user_id = $2`,
-                [legacyAmount, user.id]
-              );
-              await client.query(
-                `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, 'Legacy Welcome Bonus')`,
-                [user.id, legacyAmount]
-              );
-              console.log(`[BONUS] Legacy Welcome Bonus of ${legacyAmount} ETB credited to user ${user.id}`);
-            }
-          }
-        } catch (legacyErr) {
-          console.error('[BONUS] Legacy welcome bonus error:', legacyErr.message);
-        }
-
-        // Mark user as no longer "new"
         await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
         user.new_user = false;
       }
@@ -350,7 +305,7 @@ router.post('/verify-otp', async (req, res) => {
         role: user.role,
       });
 
-      return { ok: true, user };
+      return { ok: true, user, isNewUser };
     });
 
     // ---- After COMMIT ----
@@ -380,18 +335,67 @@ router.post('/verify-otp', async (req, res) => {
         role: result.user.role || 'user',
       },
       secret,
-      { expiresIn: '15m' } // ✅ Military-Grade: Short-lived access token
+      { expiresIn: '15m' }
     );
 
-    // ✅ Generate Cryptographically Secure Refresh Token (7 days)
     const refreshToken = crypto.randomBytes(40).toString('hex');
     await redis.set(`refresh_token:${refreshToken}`, result.user.id, 'EX', 7 * 24 * 60 * 60);
 
     console.log('[VERIFY_OTP] Tokens generated successfully');
 
+    // ---- FIRE-AND-FORGET: Apply bonuses AFTER login succeeds ----
+    if (result.isNewUser) {
+      const bonusUserId = result.user.id;
+      setImmediate(async () => {
+        try {
+          console.log(`[BONUS] Processing bonuses for new user ${bonusUserId}...`);
+          
+          // A) Apply giveaway-table promotions
+          await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
+          
+          // B) Apply Legacy Welcome Bonus from global_settings
+          try {
+            const { rows: settingsRows } = await pool.query(
+              `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
+            );
+            let legacyActive = false;
+            let legacyAmount = 10;
+            settingsRows.forEach(r => {
+              if (r.key === 'welcome_bonus_active') legacyActive = (r.value === true || r.value === 'true');
+              if (r.key === 'welcome_bonus_amount') legacyAmount = Number(r.value) || 10;
+            });
+
+            if (legacyActive && legacyAmount > 0) {
+              const idemKey = `LEGACY_BONUS:${bonusUserId}`;
+              const { rowCount: alreadyCredited } = await pool.query(
+                `SELECT 1 FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'GIFT' AND provider_ref = $2`,
+                [bonusUserId, idemKey]
+              );
+              if (!alreadyCredited) {
+                await pool.query(
+                  `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, meta)
+                   VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', $4)`,
+                  [bonusUserId, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' })]
+                );
+                await pool.query(
+                  `UPDATE wallets SET bonus_balance = bonus_balance + $1, updated_at = now() WHERE user_id = $2`,
+                  [legacyAmount, bonusUserId]
+                );
+                console.log(`[BONUS] Legacy Welcome Bonus of ${legacyAmount} ETB credited to user ${bonusUserId}`);
+              }
+            }
+          } catch (legacyErr) {
+            console.error('[BONUS] Legacy welcome bonus error:', legacyErr.message);
+          }
+        } catch (bonusErr) {
+          console.error('[BONUS] Post-login bonus processing failed:', bonusErr.message);
+        }
+      });
+    }
+
     return res.json({
       token,
-      refreshToken, // Frontend must now store and use this when 401s occur
+      refreshToken,
       user: {
         id: result.user.id,
         number: result.user.number,
