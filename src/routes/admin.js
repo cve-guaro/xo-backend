@@ -24,11 +24,9 @@ router.get('/audit-logs', async (req, res) => {
              u.username as admin_name, u.number as admin_number,
              t.username as target_name
       FROM admin_audit_logs a
-      LEFT JOIN users u ON a.admin_id IS NOT NULL 
-        AND a.admin_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-        AND u.id = a.admin_id::uuid
+      LEFT JOIN users u ON u.id = a.admin_id
       LEFT JOIN users t ON a.target_id IS NOT NULL 
-        AND a.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        AND a.target_id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         AND t.id = a.target_id::uuid
       ORDER BY a.created_at DESC
       LIMIT $1 OFFSET $2
