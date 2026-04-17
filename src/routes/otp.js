@@ -288,23 +288,54 @@ router.post('/verify-otp', async (req, res) => {
 
       // 6) Robust Giveaway Engine: Apply any active NEW_USER giveaways
       if (user.new_user) {
-        console.log(`[BONUS] Processing giveaways for ${user.number}...`);
+        console.log(`[BONUS] Processing bonuses for new user ${user.number} (${user.id})...`);
         
-        // --- PLATFORM CHECK: Only Web users get the bonus (as per existing logic) ---
-        if (!req.isWeb) {
-           console.log(`[BONUS] Mobile user ${user.id} skipped auto-giveaways.`);
-           // We still mark them as no longer "new" so they don't get it later if they log in via Web
-           await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
-           user.new_user = false;
-        } else {
-          // Use our new robust service
-          await applyNewUserGiveaways(user.id).catch(err => console.error('[GIVEAWAY_ERR] Failed apply:', err));
-          
-          // Mark user as no longer "new" (handled inside applyNewUserGiveaways for each gift, 
-          // but we do it globally here to stop the "new_user" status)
-          await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
-          user.new_user = false;
+        // A) Apply giveaway-table promotions (works for all platforms)
+        await applyNewUserGiveaways(user.id).catch(err => console.error('[GIVEAWAY_ERR] Failed apply:', err));
+        
+        // B) Apply Legacy Welcome Bonus from global_settings (admin toggle)
+        try {
+          const { rows: settingsRows } = await client.query(
+            `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
+          );
+          let legacyActive = false;
+          let legacyAmount = 10; // default 10 ETB
+          settingsRows.forEach(r => {
+            if (r.key === 'welcome_bonus_active') legacyActive = (r.value === true || r.value === 'true');
+            if (r.key === 'welcome_bonus_amount') legacyAmount = Number(r.value) || 10;
+          });
+
+          if (legacyActive && legacyAmount > 0) {
+            // Check if already credited (idempotency)
+            const idemKey = `LEGACY_BONUS:${user.id}`;
+            const { rowCount: alreadyCredited } = await client.query(
+              `SELECT 1 FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'GIFT' AND provider_ref = $2`,
+              [user.id, idemKey]
+            );
+            if (!alreadyCredited) {
+              await client.query(
+                `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, description, meta)
+                 VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', 'Legacy Welcome Bonus', $4)`,
+                [user.id, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' })]
+              );
+              await client.query(
+                `UPDATE wallets SET bonus_balance = bonus_balance + $1, updated_at = now() WHERE user_id = $2`,
+                [legacyAmount, user.id]
+              );
+              await client.query(
+                `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, 'Legacy Welcome Bonus')`,
+                [user.id, legacyAmount]
+              );
+              console.log(`[BONUS] Legacy Welcome Bonus of ${legacyAmount} ETB credited to user ${user.id}`);
+            }
+          }
+        } catch (legacyErr) {
+          console.error('[BONUS] Legacy welcome bonus error:', legacyErr.message);
         }
+
+        // Mark user as no longer "new"
+        await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
+        user.new_user = false;
       }
 
       // Ensure hardcoded super-admin number always has role='superadmin'
