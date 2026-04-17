@@ -1057,8 +1057,8 @@ router.get('/transactions/:id/details', async (req, res) => {
 
     const statsQuery = await pool.query(`
       SELECT 
-        SUM(CASE WHEN tx_type IN ('DEPOSIT', 'ADMIN_DEPOSIT') AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_deposit,
-        SUM(CASE WHEN tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_withdraw
+        SUM(CASE WHEN tx_type::text IN ('DEPOSIT', 'ADMIN_DEPOSIT', 'ADMIN_EDIT') AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_deposit,
+        SUM(CASE WHEN tx_type::text = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_withdraw
       FROM wallet_transactions 
       WHERE user_id = $1
     `, [details.user_id]);
