@@ -191,24 +191,26 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     }
 
     // AML & Security Rules (Master Switch)
-    const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'max_daily_withdraw_amount', 'max_daily_withdraw_count')`);
+    const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'max_daily_withdraw_amount', 'max_daily_withdraw_count', 'auto_payout_threshold')`);
     let manualApproval = false;
     let maxAmount = 25000;
     let maxCount = 3;
+    let autoPayoutLimit = 2000;
     
     settingsRes.rows.forEach(r => {
       if (r.key === 'is_manual_approval_enabled') manualApproval = (r.value === true || r.value === 'true');
       if (r.key === 'max_daily_withdraw_amount') maxAmount = Number(r.value);
       if (r.key === 'max_daily_withdraw_count') maxCount = Number(r.value);
+      if (r.key === 'auto_payout_threshold') autoPayoutLimit = Number(r.value);
     });
 
     let requiresManualReview = false;
     let reviewReason = [];
 
     if (manualApproval) {
-      if (amountEtb > maxAmount) {
+      if (amountEtb > autoPayoutLimit) {
         requiresManualReview = true;
-        reviewReason.push(`Exceeds 24h limit (${amountEtb} > ${maxAmount})`);
+        reviewReason.push(`Exceeds auto-payout limit (${amountEtb} > ${autoPayoutLimit})`);
       }
       
       const { rows: todayWdRows } = await client.query(`SELECT COUNT(*) as count FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'WITHDRAW_REQUEST' AND created_at >= NOW() - INTERVAL '24 HOURS'`, [userId]);
