@@ -368,13 +368,13 @@ router.post('/verify-otp', async (req, res) => {
             if (legacyActive && legacyAmount > 0) {
               const idemKey = `LEGACY_BONUS:${bonusUserId}`;
               const { rowCount: alreadyCredited } = await pool.query(
-                `SELECT 1 FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'PRIZE' AND provider_ref = $2`,
+                `SELECT 1 FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'GIFT' AND provider_ref = $2`,
                 [bonusUserId, idemKey]
               );
               if (!alreadyCredited) {
                 await pool.query(
                   `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, meta)
-                   VALUES ($1, 'PRIZE', $2, 'COMPLETED', $3, 'SYSTEM', $4)`,
+                   VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', $4)`,
                   [bonusUserId, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' })]
                 );
                 await pool.query(
