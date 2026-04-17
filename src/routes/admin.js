@@ -1037,7 +1037,9 @@ router.get('/transactions/:id/details', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT pt.id, pt.tx_type as type, pt.amount, pt.status, pt.provider_ref, pt.meta as provider_payload, pt.created_at, 
-              u.id as user_id, u.username, u.number, u.banned, u.role, u.total_wins, u.total_games,
+              u.id as user_id, u.username, u.number, u.banned, u.role, 
+              (SELECT COUNT(*) FROM games WHERE winner = u.id) as total_wins, 
+              (SELECT COUNT(*) FROM games WHERE player_x = u.id OR player_o = u.id) as total_games,
               w.available_balance, w.withdrawable_balance, w.bonus_balance
        FROM wallet_transactions pt
        JOIN users u ON u.id = pt.user_id
