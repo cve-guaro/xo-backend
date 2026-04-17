@@ -35,7 +35,7 @@ app.use(helmet({
       scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "https://xo-et-frontend.vercel.app"],
+      connectSrc: ["'self'", "https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app", "https://xoethiopia.com", "https://www.xoethiopia.com"],
       frameAncestors: ["'none'"]
     }
   },
@@ -61,7 +61,7 @@ app.use((req, res, next) => {
 // ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
 // Must be FIRST, before any routes or other middleware.
 const corsOptions = {
-  origin: ["https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app", "http://localhost:3000", "http://localhost:8081"],
+  origin: ["https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app", "https://xoethiopia.com", "https://www.xoethiopia.com", "http://localhost:3000", "http://localhost:8081"],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-access-token", "x-platform", "Idempotency-Key"],
   credentials: true,
