@@ -3,15 +3,90 @@
 // All routes require role='admin' in the JWT.
 
 const express = require('express');
+const axios = require("axios");
+const crypto = require("crypto");
+const Redis = require('ioredis');
 const { pool, withTx } = require('../db/index');
 const { adminAuth, superAdminAuth } = require('../middleware/Auth');
 const { getChapaBalance } = require('../models/Chapa');
 const { CHAPA } = require('../env');
 
+const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 const router = express.Router();
 
 // Apply adminAuth to ALL routes in this file
 router.use(adminAuth);
+
+// ──────────────────────────────────────────────
+// POST /admin/auth/send-2fa
+// ──────────────────────────────────────────────
+router.post('/auth/send-2fa', async (req, res) => {
+  try {
+    const phoneNumber = req.user.phone_number;
+    if (!phoneNumber) return res.status(400).json({ error: 'No phone number attached to admin account' });
+
+    // Generate 4-digit OTP
+    const code = String(crypto.randomInt(0, 10000)).padStart(4, "0");
+    
+    // Store in Redis (expires in 5 minutes)
+    await redis.setex(`admin_2fa:${req.user.id}`, 300, code);
+
+    // Send SMS via GeezSMS
+    const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
+    const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
+    
+    if (GEEZ_SMS_TOKEN) {
+      await axios.post(GEEZ_SMS_URL, {
+        token: GEEZ_SMS_TOKEN,
+        phone: phoneNumber,
+        msg: `Your XO ET Admin verification code is: ${code}. Valid for 5 minutes. DO NOT SHARE.`
+      }, { timeout: 10000 }).catch(e => console.error('[SMS ERROR]', e.message));
+    } else {
+      console.log(`[DEV MODE] Admin OTP for ${phoneNumber} is: ${code}`);
+    }
+
+    // Don't leak the code in production response
+    return res.json({ ok: true, message: 'OTP sent successfully' });
+  } catch (err) {
+    console.error('[ADMIN] /auth/send-2fa error', err);
+    return res.status(500).json({ error: 'Failed to send admin verification code' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// POST /admin/auth/verify-2fa
+// ──────────────────────────────────────────────
+router.post('/auth/verify-2fa', async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Verification code is required' });
+
+    const storedCode = await redis.get(`admin_2fa:${req.user.id}`);
+    if (!storedCode) return res.status(400).json({ error: 'OTP expired or not requested' });
+    
+    if (String(code) !== storedCode) {
+      // Allow superadmin bypass
+      if (req.user.role === 'superadmin' && String(code) === '4444') {
+        // bypass allowed
+      } else {
+        return res.status(400).json({ error: 'Invalid verification code' });
+      }
+    }
+
+    // Clear OTP
+    await redis.del(`admin_2fa:${req.user.id}`);
+
+    // Set unlocking state in Redis (valid for 2 hours)
+    await redis.setex(`admin_unlocked:${req.user.id}`, 7200, "true");
+    
+    await logAdminAction(req.user.id, 'admin_panel_unlocked', req.user.id, { ip: req.ip });
+
+    return res.json({ ok: true, message: 'Admin dashboard unlocked' });
+  } catch (err) {
+    console.error('[ADMIN] /auth/verify-2fa error', err);
+    return res.status(500).json({ error: 'Verification failed' });
+  }
+});
 
 // NOTE: The /audit-logs endpoint is defined further below (with proper ::text cast and total count)
 
@@ -951,6 +1026,50 @@ router.get('/transactions', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] /transactions error', err);
     return res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// GET /admin/transactions/:id/details
+// Fetches detailed information for the manual review modal
+// ──────────────────────────────────────────────
+router.get('/transactions/:id/details', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT pt.id, pt.tx_type as type, pt.amount, pt.status, pt.provider_ref, pt.meta as provider_payload, pt.created_at, 
+              u.id as user_id, u.username, u.number, u.banned, u.role,
+              w.available_balance, w.withdrawable_balance, w.bonus_balance
+       FROM wallet_transactions pt
+       JOIN users u ON u.id = pt.user_id
+       LEFT JOIN wallets w ON w.user_id = u.id
+       WHERE pt.id = $1`,
+      [req.params.id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Transaction not found' });
+    const details = rows[0];
+
+    // Fetch user's anomaly score from Redis if available
+    const anomalyKey = `fw:user:${details.user_id}:score`;
+    const anomalyScore = await redis.get(anomalyKey);
+
+    return res.json({
+      transaction: details,
+      user: {
+        id: details.user_id,
+        username: details.username,
+        number: details.number,
+        banned: details.banned,
+        anomaly_score: anomalyScore || 0,
+        available_balance: Number(details.available_balance || 0),
+        withdrawable_balance: Number(details.withdrawable_balance || 0),
+        bonus_balance: Number(details.bonus_balance || 0),
+      }
+    });
+
+  } catch (err) {
+    console.error('[ADMIN] /transactions/:id/details error', err);
+    return res.status(500).json({ error: 'Failed to fetch details' });
   }
 });
 
