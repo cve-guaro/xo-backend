@@ -1037,7 +1037,7 @@ router.get('/transactions/:id/details', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT pt.id, pt.tx_type as type, pt.amount, pt.status, pt.provider_ref, pt.meta as provider_payload, pt.created_at, 
-              u.id as user_id, u.username, u.number, u.banned, u.role,
+              u.id as user_id, u.username, u.number, u.banned, u.role, u.total_wins, u.total_games,
               w.available_balance, w.withdrawable_balance, w.bonus_balance
        FROM wallet_transactions pt
        JOIN users u ON u.id = pt.user_id
@@ -1053,6 +1053,16 @@ router.get('/transactions/:id/details', async (req, res) => {
     const anomalyKey = `fw:user:${details.user_id}:score`;
     const anomalyScore = await redis.get(anomalyKey);
 
+    const statsQuery = await pool.query(`
+      SELECT 
+        SUM(CASE WHEN tx_type IN ('DEPOSIT', 'ADMIN_DEPOSIT') AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_deposit,
+        SUM(CASE WHEN tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_withdraw
+      FROM wallet_transactions 
+      WHERE user_id = $1
+    `, [details.user_id]);
+    
+    const aggregates = statsQuery.rows[0];
+
     return res.json({
       transaction: details,
       user: {
@@ -1060,10 +1070,15 @@ router.get('/transactions/:id/details', async (req, res) => {
         username: details.username,
         number: details.number,
         banned: details.banned,
+        role: details.role,
         anomaly_score: anomalyScore || 0,
         available_balance: Number(details.available_balance || 0),
         withdrawable_balance: Number(details.withdrawable_balance || 0),
         bonus_balance: Number(details.bonus_balance || 0),
+        total_wins: Number(details.total_wins || 0),
+        total_games: Number(details.total_games || 0),
+        total_deposit: Number(aggregates.total_deposit || 0),
+        total_withdraw: Number(aggregates.total_withdraw || 0)
       }
     });
 
