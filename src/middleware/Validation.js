@@ -44,9 +44,9 @@ const schemas = {
 
   // Account Operations
   updateProfile: z.object({
-    username: z.string().min(3).max(24).regex(/^[a-zA-Z0-9_\-]+$/, 'Username can only contain letters, numbers, underscores, and hyphens').optional(),
+    username: z.string().min(2).max(24).regex(/^[\p{L}\p{N}_\- ]+$/u, 'Username can only contain letters, numbers, spaces, underscores, and hyphens').optional(),
     display_name: z.string().min(2).max(40).optional(),
-    avatar: z.string().url('Avatar must be a valid URL').max(1024).optional()
+    avatar: z.string().url('Avatar must be a valid URL').max(1024).optional().nullable()
   })
 };
 
