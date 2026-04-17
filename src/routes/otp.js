@@ -19,7 +19,7 @@ const phoneOtpRequestCounts = new Map();
 function checkPhoneRateLimit(phone) {
   const now = Date.now();
   const windowMs = 15 * 60 * 1000;
-  const maxRequests = 5;
+  const maxRequests = 3;
   if (!phoneOtpRequestCounts.has(phone)) {
     phoneOtpRequestCounts.set(phone, []);
   }

@@ -42,7 +42,7 @@ async function ensureWallet(client, userId) {
   );
 }
 
-router.get('/methods', async (req, res) => {
+router.get('/methods', auth, async (req, res) => {
   try {
 const METHODS = [
   {
