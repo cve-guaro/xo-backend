@@ -13,30 +13,7 @@ const router = express.Router();
 // Apply adminAuth to ALL routes in this file
 router.use(adminAuth);
 
-// ──────────────────────────────────────────────
-// GET /admin/audit-logs
-// ──────────────────────────────────────────────
-router.get('/audit-logs', async (req, res) => {
-  try {
-    const { limit = 500, offset = 0 } = req.query;
-    const { rows } = await pool.query(`
-      SELECT a.*, 
-             u.username as admin_name, u.number as admin_number,
-             t.username as target_name
-      FROM admin_audit_logs a
-      LEFT JOIN users u ON u.id = a.admin_id
-      LEFT JOIN users t ON a.target_id IS NOT NULL 
-        AND a.target_id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-        AND t.id = a.target_id::uuid
-      ORDER BY a.created_at DESC
-      LIMIT $1 OFFSET $2
-    `, [Number(limit), Number(offset)]);
-    return res.json({ logs: rows });
-  } catch (err) {
-    console.error('[ADMIN] /audit-logs error', err);
-    return res.status(500).json({ error: 'Failed to fetch audit logs' });
-  }
-});
+// NOTE: The /audit-logs endpoint is defined further below (with proper ::text cast and total count)
 
 // ──────────────────────────────────────────────
 // Helper: Log Admin Action
