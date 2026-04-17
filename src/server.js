@@ -147,16 +147,42 @@ app.use(systemLockdownCheck);
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
 // ─── ONLINE PLAYERS ────────────────────────────────────────────────────────────
-app.get('/players/online', async (_, res) => {
+app.get('/players/online', async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT value FROM global_settings WHERE key = 'show_online_count'`);
     const show = rows.length ? (rows[0].value === true || rows[0].value === 'true') : true; // default true
     
-    if (!show) {
-      // Return a "random fake" high-activity count (e.g., between 420 and 780)
-      const fakeCount = Math.floor(Math.random() * (780 - 420 + 1)) + 420;
-      return res.json({ count: fakeCount });
+    let isAdmin = false;
+    try {
+      const hdr = req.headers.authorization || '';
+      const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : hdr;
+      if (token) {
+        const jwt = require('jsonwebtoken');
+        const pubKey = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
+        const payload = jwt.verify(token, pubKey);
+        
+        if (payload.role === 'admin' || payload.role === 'superadmin') {
+          isAdmin = true;
+        } else {
+          // Verify with DB just in case role was upgraded
+          const userId = payload.sub || payload.userId || payload.id;
+          if (userId) {
+             const userCheck = await pool.query('SELECT role FROM users WHERE id = $1', [userId]);
+             if (userCheck.rows.length && (userCheck.rows[0].role === 'admin' || userCheck.rows[0].role === 'superadmin')) {
+               isAdmin = true;
+             }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore token errors for public access fallback
     }
+
+    // Hide count for normal users if off. Frontend will render "—"
+    if (!show && !isAdmin) {
+      return res.json({ count: 0 });
+    }
+    
     return res.json({ count: io.engine.clientsCount || 0 });
   } catch (err) {
     return res.json({ count: io.engine.clientsCount || 0 }); // fallback
