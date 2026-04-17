@@ -442,7 +442,7 @@ async function applyNewUserGiveaways(userId) {
         // Apply to balance
         await client.query(SQL.applyTx, [
           userId,
-          "GIFT",
+          "PRIZE",
           amount,
           "COMPLETED",
           idem,

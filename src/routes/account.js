@@ -53,6 +53,9 @@ router.patch(
 
       res.json({ ok: true, user: result.rows[0] });
     } catch (err) {
+      if (err.code === '23505' && err.constraint === 'users_username_key') {
+        return res.status(400).json({ message: "Username is already taken" });
+      }
       console.error("Profile update error:", err);
       res.status(500).json({ message: "Server error" });
     }
