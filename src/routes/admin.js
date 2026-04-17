@@ -24,8 +24,8 @@ router.get('/audit-logs', async (req, res) => {
              u.username as admin_name, u.number as admin_number,
              t.username as target_name
       FROM admin_audit_logs a
-      LEFT JOIN users u ON u.id = a.admin_id
-      LEFT JOIN users t ON t.id = a.target_id
+      LEFT JOIN users u ON u.id = a.admin_id::uuid
+      LEFT JOIN users t ON t.id = a.target_id::uuid
       ORDER BY a.created_at DESC
       LIMIT $1 OFFSET $2
     `, [Number(limit), Number(offset)]);
