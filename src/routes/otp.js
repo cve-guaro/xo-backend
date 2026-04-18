@@ -353,40 +353,8 @@ router.post('/verify-otp', async (req, res) => {
           // A) Apply giveaway-table promotions
           await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
           
-          // B) Apply Legacy Welcome Bonus from global_settings
-          try {
-            const { rows: settingsRows } = await pool.query(
-              `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
-            );
-            let legacyActive = true; // Default to true — bonus is always on unless explicitly disabled
-            let legacyAmount = 10;
-            settingsRows.forEach(r => {
-              if (r.key === 'welcome_bonus_active') legacyActive = (r.value === true || r.value === 'true');
-              if (r.key === 'welcome_bonus_amount') legacyAmount = Number(r.value) || 10;
-            });
-
-            if (legacyActive && legacyAmount > 0) {
-              const idemKey = `LEGACY_BONUS:${bonusUserId}`;
-              const { rowCount: alreadyCredited } = await pool.query(
-                `SELECT 1 FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'GIFT' AND provider_ref = $2`,
-                [bonusUserId, idemKey]
-              );
-              if (!alreadyCredited) {
-                await pool.query(
-                  `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, meta, idempotency_key)
-                   VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', $4, $5)`,
-                  [bonusUserId, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' }), idemKey]
-                );
-                await pool.query(
-                  `UPDATE wallets SET bonus_balance = bonus_balance + $1, updated_at = now() WHERE user_id = $2`,
-                  [legacyAmount, bonusUserId]
-                );
-                console.log(`[BONUS] Legacy Welcome Bonus of ${legacyAmount} ETB credited to user ${bonusUserId}`);
-              }
-            }
-          } catch (legacyErr) {
-            console.error('[BONUS] Legacy welcome bonus error:', legacyErr.message);
-          }
+          // B) Legacy Welcome Bonus has been moved to the /welcome-seen flow
+          // to ensure users only get credited once they acknowledge the welcome modal.
         } catch (bonusErr) {
           console.error('[BONUS] Post-login bonus processing failed:', bonusErr.message);
         }
