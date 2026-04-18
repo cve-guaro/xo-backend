@@ -201,6 +201,10 @@ app.use('/admin', adminRoutes);
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
 
+// ─── BACKGROUND CRON SCHEDULER ──────────────────────────────────────────────────
+const { initCron } = require('./cron');
+initCron();
+
 // ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
 (async () => {
   try {
