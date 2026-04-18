@@ -12,7 +12,7 @@ const OTP_TTL = Number(process.env.OTP_TTL_SECONDS || 300); // 5 min
 const MAX_TRIES = Number(process.env.MAX_OTP_TRIES || 5);
 const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
 const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
-const SUPER_ADMIN_NUMBERS = ['251961111106'];
+const SUPER_ADMIN_NUMBERS = (process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
 
 // Per-phone rate limiter: max 5 OTP requests per phone per 15 min
 const phoneOtpRequestCounts = new Map();

@@ -178,7 +178,7 @@ router.patch('/settings', async (req, res) => {
   const isEditingRestricted = Object.keys(req.body).some(k => restrictedKeys.includes(k));
 
   if (isEditingRestricted) {
-    const isSimon = req.user.phone_number === '+251961111106' || req.user.role === 'superadmin';
+    const isSimon = req.user.role === 'superadmin';
     if (!isSimon) {
       return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify security protocols.' });
     }
@@ -775,7 +775,7 @@ router.patch('/users/:id', async (req, res) => {
     const { username, number, role, available_balance, bonus_balance, banned } = req.body;
     
     // Authorization check for sensitive fields
-    const isSimon = req.user.phone_number === '+251961111106' || req.user.role === 'superadmin';
+    const isSimon = req.user.role === 'superadmin';
     if ((role !== undefined || available_balance !== undefined || bonus_balance !== undefined) && !isSimon) {
       return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify roles or wallet balances.' });
     }

@@ -75,13 +75,11 @@ function adminAuth(req, res, next) {
 }
 
 /**
- * Restricts to ONLY Simon (Super Admin)
+ * Restricts to ONLY Super Admins (role-based, no hardcoded phones)
  */
 function superAdminAuth(req, res, next) {
   adminAuth(req, res, () => {
-    // Check role or phone number
-    const isSimon = req.user.role === 'superadmin' || req.user.phone_number === '+251961111106';
-    if (!isSimon) {
+    if (req.user.role !== 'superadmin') {
       return res.status(403).json({ error: 'Critical access denied: Only Super Admin can perform this action.' });
     }
     next();

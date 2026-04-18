@@ -32,15 +32,20 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https:"],
+      imgSrc: ["'self'", "data:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app"],
       connectSrc: ["'self'", "https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app", "https://xoethiopia.com", "https://www.xoethiopia.com"],
-      frameAncestors: ["'none'"]
+      frameAncestors: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: []
     }
   },
   crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginResourcePolicy: { policy: "same-origin" },
+  crossOriginOpenerPolicy: { policy: "same-origin" },
   hsts: {
     maxAge: 31536000, // 1 year
     includeSubDomains: true,
@@ -55,13 +60,32 @@ app.use(helmet({
 // Manually applying Permissions-Policy since helmet doesn't support it natively yet
 app.use((req, res, next) => {
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
   next();
 });
 
-// ─── NUCLEAR CORS ──────────────────────────────────────────────────────────────
-// Must be FIRST, before any routes or other middleware.
+// ─── STRICT CORS ───────────────────────────────────────────────────────────────
+// Hardcoded whitelist — no dynamic origin reflection
+const ALLOWED_ORIGINS = [
+  "https://xoethiopia.com",
+  "https://www.xoethiopia.com",
+  "https://xo-et-frontend.vercel.app",
+  "https://xoet-pro-frontend.vercel.app",
+];
+// Only allow localhost in development
+if (process.env.NODE_ENV !== 'production') {
+  ALLOWED_ORIGINS.push("http://localhost:3000", "http://localhost:8081");
+}
+
 const corsOptions = {
-  origin: ["https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app", "https://xoethiopia.com", "https://www.xoethiopia.com", "http://localhost:3000", "http://localhost:8081"],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS: Origin not allowed'));
+  },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-access-token", "x-platform", "Idempotency-Key"],
   credentials: true,
@@ -71,7 +95,7 @@ app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests gl
 
 // ─── SOCKET.IO & REDIS ADAPTER ─────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: corsOptions.origin, methods: ["GET", "POST"], credentials: true }
+  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"], credentials: true }
 });
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
