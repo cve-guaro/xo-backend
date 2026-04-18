@@ -373,9 +373,9 @@ router.post('/verify-otp', async (req, res) => {
               );
               if (!alreadyCredited) {
                 await pool.query(
-                  `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, meta)
-                   VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', $4)`,
-                  [bonusUserId, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' })]
+                  `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider_ref, provider, meta, idempotency_key)
+                   VALUES ($1, 'GIFT', $2, 'COMPLETED', $3, 'SYSTEM', $4, $5)`,
+                  [bonusUserId, legacyAmount, idemKey, JSON.stringify({ type: 'LEGACY_WELCOME_BONUS' }), idemKey]
                 );
                 await pool.query(
                   `UPDATE wallets SET bonus_balance = bonus_balance + $1, updated_at = now() WHERE user_id = $2`,

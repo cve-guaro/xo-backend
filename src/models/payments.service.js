@@ -229,8 +229,8 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       // Wagering 100% check
       const { rows: wagRows } = await client.query(`
         SELECT 
-          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status IN ('completed', 'COMPLETED')) as total_deps,
-          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'STAKE' AND status IN ('completed', 'COMPLETED')) +
+          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'COMPLETED') as total_deps,
+          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'STAKE' AND status = 'COMPLETED') +
           (SELECT COALESCE(SUM(bet_amount), 0) FROM games WHERE player_x = $1 OR player_o = $1) as total_wagered
       `, [userId]);
       const totDeps = Number(wagRows[0].total_deps);
