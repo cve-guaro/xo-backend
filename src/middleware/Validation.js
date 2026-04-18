@@ -14,6 +14,7 @@ const validate = (schema, source = 'body') => {
       next();
     } catch (err) {
       if (err instanceof z.ZodError) {
+        console.error(`[VALIDATION] Failed on ${req.originalUrl}:`, JSON.stringify(err.errors), 'Body:', JSON.stringify(req[source]));
         logAnomaly(req, `Schema Validation Failed on [${req.originalUrl}]`);
         return res.status(400).json({
           error: 'Validation failed. Invalid input format.',
@@ -33,14 +34,14 @@ const validate = (schema, source = 'body') => {
 const schemas = {
   // Financial Operations
   deposit: z.object({
-    amount: z.number().int('Amount must be an integer').min(10, 'Minimum deposit is 10 ETB').max(100000, 'Maximum single deposit limit is 100000 ETB')
-  }),
+    amount: z.coerce.number().int('Amount must be an integer').min(10, 'Minimum deposit is 10 ETB').max(100000, 'Maximum single deposit limit is 100000 ETB')
+  }).passthrough(),
 
   withdraw: z.object({
-    amount: z.number().int('Amount must be an integer').min(10, 'Minimum withdrawal is 10 ETB').max(100000, 'Maximum withdrawal is 100,000 ETB'),
-    provider: z.enum(['telebirr', 'm-pesa', 'cbebirr'], { errorMap: () => ({ message: 'Invalid payout provider' }) }),
-    accountNo: z.string().min(7, 'Account number too short').max(15, 'Account number too long').regex(/^[0-9+]+$/, 'Account number must contain only numbers and +')
-  }),
+    amount: z.coerce.number().min(10, 'Minimum withdrawal is 10 ETB').max(100000, 'Maximum withdrawal is 100,000 ETB'),
+    payoutMethod: z.string().optional(),
+    payoutDestination: z.string().optional(),
+  }).passthrough(),
 
   // Account Operations
   updateProfile: z.object({

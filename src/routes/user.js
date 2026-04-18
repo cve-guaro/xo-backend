@@ -67,6 +67,8 @@ router.get('/me', auth, async (req, res) => {
         u.r1_50_wins,
         u.r1_99_wins,
         u.banned,
+        u.created_at,
+        u.claimed_giveaway_version,
         COALESCE(w.available_balance, 0)    AS available_balance,
         COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
         COALESCE(w.bonus_balance, 0)        AS bonus_balance
@@ -103,6 +105,8 @@ router.get('/me', auth, async (req, res) => {
       r1_50_wins: user.r1_50_wins || 0,
       r1_99_wins: user.r1_99_wins || 0,
       banned: user.banned || false,
+      created_at: user.created_at,
+      claimed_giveaway_version: user.claimed_giveaway_version || 0,
       available_balance: Number(user.available_balance),
       withdrawable_balance: Number(user.withdrawable_balance),
       bonus_balance: Number(user.bonus_balance),

@@ -290,7 +290,7 @@ router.post('/verify-otp', async (req, res) => {
       const isNewUser = !!user.new_user;
       if (user.new_user) {
         await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
-        user.new_user = false;
+        // Keep user.new_user = true for the response so frontend can show welcome popup
       }
 
       // Ensure hardcoded super-admin number always has role='superadmin'
@@ -358,7 +358,7 @@ router.post('/verify-otp', async (req, res) => {
             const { rows: settingsRows } = await pool.query(
               `SELECT key, value FROM global_settings WHERE key IN ('welcome_bonus_active', 'welcome_bonus_amount')`
             );
-            let legacyActive = false;
+            let legacyActive = true; // Default to true — bonus is always on unless explicitly disabled
             let legacyAmount = 10;
             settingsRows.forEach(r => {
               if (r.key === 'welcome_bonus_active') legacyActive = (r.value === true || r.value === 'true');
