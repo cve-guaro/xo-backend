@@ -219,12 +219,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
         reviewReason.push(`Too many requests 24h (${todayWdRows[0].count} >= ${maxCount})`);
       }
 
-      // Quick cooldown check (1 hour)
-      const { rows: cooldownRows } = await client.query(`SELECT count(*) as count FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'WITHDRAW_REQUEST' AND created_at >= NOW() - INTERVAL '1 HOUR'`, [userId]);
-      if (Number(cooldownRows[0].count) > 0) {
-        requiresManualReview = true;
-        reviewReason.push(`Cooldown active (requested < 1h ago)`);
-      }
+      // Quick cooldown check (removed per request)
 
       // Wagering 100% check
       const { rows: wagRows } = await client.query(`

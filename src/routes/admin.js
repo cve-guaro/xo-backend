@@ -1104,7 +1104,7 @@ router.patch('/transactions/:id/approve', async (req, res) => {
       if (!rows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
       const txn = rows[0];
 
-      if (txn.status !== 'PENDING') {
+      if (txn.status !== 'PENDING' && txn.status !== 'PENDING_MANUAL') {
         throw Object.assign(new Error(`Cannot approve a ${txn.status} transaction`), { status: 409 });
       }
 
@@ -1155,7 +1155,7 @@ router.patch('/transactions/:id/reject', async (req, res) => {
       if (!rows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
       const txn = rows[0];
 
-      if (txn.status !== 'PENDING') {
+      if (txn.status !== 'PENDING' && txn.status !== 'PENDING_MANUAL') {
         throw Object.assign(new Error(`Cannot reject a ${txn.status} transaction`), { status: 409 });
       }
 
