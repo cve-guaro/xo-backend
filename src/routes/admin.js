@@ -315,9 +315,9 @@ router.get('/dashboard-data', async (req, res) => {
       // [2] Total settled withdrawals
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_payouts
                   FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
-      // [3] Pending withdrawal amount
-      pool.query(`SELECT COALESCE(SUM(amount), 0) AS pending_amount
-                   FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING'`),
+      // [3] Pending MANUAL withdrawal count (only transactions that need admin approval)
+      pool.query(`SELECT COUNT(*) AS pending_manual_count
+                   FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING_MANUAL'`),
       // [4] 24h metrics - real volume and real success rate
       pool.query(`
         SELECT 
@@ -363,7 +363,7 @@ router.get('/dashboard-data', async (req, res) => {
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
     const payouts = Number(payoutsRes.rows[0].total_payouts);
-    const pending = Number(pendingRes.rows[0].pending_amount);
+    const pendingManualCount = Number(pendingRes.rows[0].pending_manual_count);
     const volume24h = Number(metricsRes.rows[0].volume);
     const successRate = Number(metricsRes.rows[0].success_rate) || 0;
     const platformCommission = Number(earningsRes.rows[0].platform_commission);
@@ -390,7 +390,8 @@ router.get('/dashboard-data', async (req, res) => {
       totalProfit: revenue - payouts,
       platformEarnings: platformCommission,
       chapaNetPosition: realChapaBalance,
-      pendingWithdrawalAmount: pending,
+      pendingWithdrawals: pendingManualCount,
+      pendingWithdrawalAmount: pendingManualCount,
       volume24h,
       successRate,
       activeGames: Number(activeGamesRes.rows[0].active_games),

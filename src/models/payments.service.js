@@ -177,70 +177,33 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       throw err;
     }
 
-    // 2) Check balance - include bonus_balance as requested ("can also withdrow the bonnes money")
+    // 2) Check balance — ONLY withdrawable_balance counts (bonus is NOT withdrawable)
     const walletCheck = await client.query(SQL.getWallet, [userId]);
     const walletData = walletCheck.rows[0];
     const withdrawable = Number(walletData?.withdrawable_balance || 0);
-    const bonus = Number(walletData?.bonus_balance || 0);
-    const totalWithdrawable = withdrawable + bonus;
     
-    if (totalWithdrawable < amountEtb) {
-      const err = new Error("Insufficient balance for withdrawal.");
+    if (withdrawable < amountEtb) {
+      const err = new Error("Insufficient withdrawable balance.");
       err.status = 400;
       throw err;
     }
 
-    // AML & Security Rules (Master Switch)
-    const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'max_daily_withdraw_amount', 'max_daily_withdraw_count', 'auto_payout_threshold')`);
+    // AML & Security Rules — only the auto-payout threshold matters
+    const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'auto_payout_threshold')`);
     let manualApproval = false;
-    let maxAmount = 25000;
-    let maxCount = 3;
     let autoPayoutLimit = 2000;
     
     settingsRes.rows.forEach(r => {
       if (r.key === 'is_manual_approval_enabled') manualApproval = (r.value === true || r.value === 'true');
-      if (r.key === 'max_daily_withdraw_amount') maxAmount = Number(r.value);
-      if (r.key === 'max_daily_withdraw_count') maxCount = Number(r.value);
       if (r.key === 'auto_payout_threshold') autoPayoutLimit = Number(r.value);
     });
 
     let requiresManualReview = false;
     let reviewReason = [];
 
-    if (manualApproval) {
-      if (amountEtb > autoPayoutLimit) {
-        requiresManualReview = true;
-        reviewReason.push(`Exceeds auto-payout limit (${amountEtb} > ${autoPayoutLimit})`);
-      }
-      
-      const { rows: todayWdRows } = await client.query(`SELECT COUNT(*) as count FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'WITHDRAW_REQUEST' AND created_at >= NOW() - INTERVAL '24 HOURS'`, [userId]);
-      if (Number(todayWdRows[0].count) >= maxCount) {
-        requiresManualReview = true;
-        reviewReason.push(`Too many requests 24h (${todayWdRows[0].count} >= ${maxCount})`);
-      }
-
-      // Quick cooldown check (removed per request)
-
-      // Wagering 100% check
-      const { rows: wagRows } = await client.query(`
-        SELECT 
-          (SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE user_id = $1 AND tx_type = 'DEPOSIT' AND status = 'COMPLETED') as total_deps,
-          (SELECT COALESCE(SUM(bet_amount), 0) FROM games WHERE player_x = $1 OR player_o = $1) as total_wagered
-      `, [userId]);
-      const totDeps = Number(wagRows[0].total_deps);
-      const totWag = Number(wagRows[0].total_wagered);
-      
-      if (totWag < totDeps) {
-        requiresManualReview = true;
-        reviewReason.push(`Wagering req failed (Wagered: ${totWag}, Deposited: ${totDeps})`);
-      }
-
-      // Phone match check
-      const { rows: phoneRows } = await client.query(`SELECT number FROM users WHERE id = $1`, [userId]);
-      if (String(payoutDestination).trim() !== String(phoneRows[0].number).trim()) {
-        requiresManualReview = true;
-        reviewReason.push(`Phone mismatch (Req: ${payoutDestination}, Reg: ${phoneRows[0].number})`);
-      }
+    if (manualApproval && amountEtb > autoPayoutLimit) {
+      requiresManualReview = true;
+      reviewReason.push(`Exceeds auto-payout limit (${amountEtb} > ${autoPayoutLimit})`);
     }
 
     const initialStatus = requiresManualReview ? "PENDING_MANUAL" : "PENDING";
@@ -258,17 +221,13 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
 
     const reserveTxId = txRes.rows[0].tx_id;
 
-    // IMMEDIATELY reserve/lock funds!
-    let deductW = Math.min(withdrawable, amountEtb);
-    let deductB = amountEtb - deductW;
-
+    // IMMEDIATELY reserve/lock funds — deduct from available AND withdrawable (no bonus touched)
     await client.query(`
       UPDATE wallets 
       SET available_balance = available_balance - $1, 
-          withdrawable_balance = withdrawable_balance - $2,
-          bonus_balance = bonus_balance - $3
-      WHERE user_id = $4
-    `, [amountEtb, deductW, deductB, userId]);
+          withdrawable_balance = withdrawable_balance - $1
+      WHERE user_id = $2
+    `, [amountEtb, userId]);
 
     await client.query(`UPDATE wallet_transactions SET applied_at = now() WHERE id = $1`, [reserveTxId]);
 
@@ -293,7 +252,15 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   let chapaStatus = 'pending_manual';
   let checkout_url = null;
   const cleanDestination = String(payoutDestination).replace(/\D/g, "");
-  const finalDestination = cleanDestination.length >= 7 ? cleanDestination : "251900000000";
+  
+  // Auto-format Ethiopian phone numbers (09xx → 2519xx, 07xx → 2517xx)
+  let formattedDestination = cleanDestination;
+  if (formattedDestination.startsWith("09") && formattedDestination.length === 10) {
+    formattedDestination = "2519" + formattedDestination.slice(2);
+  } else if (formattedDestination.startsWith("07") && formattedDestination.length === 10) {
+    formattedDestination = "2517" + formattedDestination.slice(2);
+  }
+  const finalDestination = formattedDestination.length >= 7 ? formattedDestination : "251900000000";
 
   try {
     const chapaRes = await initChapaPayout(

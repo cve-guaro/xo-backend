@@ -456,36 +456,23 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
       const userId = wallet.user_id;
 
       const bonusToUse = Math.min(bonus, betAmount);
-      const availToUse = betAmount - bonusToUse;
+      const realToUse = betAmount - bonusToUse;
 
-      if (avail < availToUse) throw new Error("INSUFFICIENT_BALANCE");
+      if (avail < betAmount) throw new Error("INSUFFICIENT_BALANCE");
 
-      if (bonusToUse > 0 && availToUse > 0) {
-        // Use partial bonus + some available
-        await client.query(
-          `UPDATE wallets
-             SET bonus_balance      = bonus_balance      - $1,
-                 available_balance  = available_balance  - $2,
-                 withdrawable_balance = GREATEST(withdrawable_balance - $2, 0)
-           WHERE user_id = $3`,
-          [bonusToUse, availToUse, userId]
-        );
-      } else if (bonusToUse >= betAmount) {
-        // Entire bet covered by bonus
-        await client.query(
-          `UPDATE wallets SET bonus_balance = bonus_balance - $1 WHERE user_id = $2`,
-          [betAmount, userId]
-        );
-      } else {
-        // No bonus — deduct entirely from available (original behaviour)
-        await client.query(
-          `UPDATE wallets
-             SET available_balance    = available_balance    - $1,
-                 withdrawable_balance = GREATEST(withdrawable_balance - $1, 0)
-           WHERE user_id = $2`,
-          [betAmount, userId]
-        );
-      }
+      // Unified deduction:
+      // - available_balance always drops by the full betAmount
+      // - bonus_balance drops by bonusToUse
+      // - withdrawable_balance ONLY drops by the real cash portion (realToUse)
+      await client.query(
+        `UPDATE wallets
+         SET available_balance    = available_balance  - $1,
+             bonus_balance        = GREATEST(bonus_balance - $2, 0),
+             withdrawable_balance = GREATEST(withdrawable_balance - $3, 0),
+             updated_at           = now()
+         WHERE user_id = $4`,
+        [betAmount, bonusToUse, realToUse, userId]
+      );
     }
 
     await client.query(
