@@ -374,8 +374,8 @@ router.get('/dashboard-data', async (req, res) => {
       if (chapaBalances && chapaBalances.data && Array.isArray(chapaBalances.data)) {
         const etbBalance = chapaBalances.data.find((b) => b.currency === 'ETB') || chapaBalances.data[0];
         if (etbBalance) {
-          // Send back the actual available balance from Chapa
-          realChapaBalance = Number(etbBalance.available_balance || etbBalance.balance || 0);
+          // Send back the total ledger balance as requested
+          realChapaBalance = Number(etbBalance.balance || etbBalance.available_balance || 0);
         }
       }
     } catch (apiErr) {
