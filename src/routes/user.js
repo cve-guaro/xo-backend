@@ -139,5 +139,71 @@ router.get('/bonus-logs', auth, async (req, res) => {
   }
 });
 
+/**
+ * GET /user/referral-link
+ * Returns the user's unique referral URL
+ */
+router.get('/referral-link', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    // Use first 8 chars of UUID as referral code
+    const refCode = userId.slice(0, 8).toUpperCase();
+    const referralUrl = `https://xoethiopia.com/?ref=${refCode}`;
+    
+    // Check if referral system is enabled
+    const { rows: settingsRows } = await pool.query(
+      `SELECT value FROM global_settings WHERE key = 'referral_enabled'`
+    );
+    const enabled = settingsRows.length ? settingsRows[0].value === true || settingsRows[0].value === 'true' : true;
+
+    return res.json({ 
+      ok: true, 
+      referralCode: refCode,
+      referralUrl,
+      enabled
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to get referral link' });
+  }
+});
+
+/**
+ * GET /user/referral-stats
+ * Returns referral count and total bonus earned
+ */
+router.get('/referral-stats', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const { rows } = await pool.query(`
+      SELECT 
+        COUNT(*) AS total_referred,
+        COALESCE(SUM(bonus_amount), 0) AS total_bonus_earned
+      FROM referrals 
+      WHERE referrer_id = $1
+    `, [userId]);
+
+    const { rows: recentRows } = await pool.query(`
+      SELECT r.bonus_amount, r.created_at, u.username
+      FROM referrals r
+      JOIN users u ON r.referred_id = u.id
+      WHERE r.referrer_id = $1
+      ORDER BY r.created_at DESC
+      LIMIT 20
+    `, [userId]);
+
+    return res.json({
+      ok: true,
+      totalReferred: Number(rows[0]?.total_referred || 0),
+      totalBonusEarned: Number(rows[0]?.total_bonus_earned || 0),
+      recentReferrals: recentRows
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to get referral stats' });
+  }
+});
+
 
 module.exports = router;

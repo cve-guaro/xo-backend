@@ -22,6 +22,17 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
 
       const amountEtb = Math.round(Number(amount));
 
+      if (!amountEtb || amountEtb < 10) {
+        const err = new Error("Minimum deposit is 10 ETB");
+        err.status = 400;
+        throw err;
+      }
+      if (amountEtb > 100000) {
+        const err = new Error("Maximum deposit is 100,000 ETB");
+        err.status = 400;
+        throw err;
+      }
+
       // PENDING deposit, no idempotency needed here
       const { rows } = await client.query(SQL.applyTx, [
         userId,
@@ -148,6 +159,11 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   // Validation
   if (!amountEtb || amountEtb < 10) {
     const err = new Error("Minimum withdrawal is 10 ETB");
+    err.status = 400;
+    throw err;
+  }
+  if (amountEtb > 25000) {
+    const err = new Error("Maximum withdrawal is 25,000 ETB");
     err.status = 400;
     throw err;
   }

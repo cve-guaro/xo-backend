@@ -346,6 +346,7 @@ router.post('/verify-otp', async (req, res) => {
     // ---- FIRE-AND-FORGET: Apply bonuses AFTER login succeeds ----
     if (result.isNewUser) {
       const bonusUserId = result.user.id;
+      const refParam = req.body?.ref || req.query?.ref || null;
       setImmediate(async () => {
         try {
           console.log(`[BONUS] Processing bonuses for new user ${bonusUserId}...`);
@@ -353,8 +354,69 @@ router.post('/verify-otp', async (req, res) => {
           // A) Apply giveaway-table promotions
           await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
           
-          // B) Legacy Welcome Bonus has been moved to the /welcome-seen flow
-          // to ensure users only get credited once they acknowledge the welcome modal.
+          // B) Process referral bonus
+          if (refParam) {
+            try {
+              // Check if referral system is enabled
+              const { rows: settingsRows } = await pool.query(
+                `SELECT value FROM global_settings WHERE key IN ('referral_enabled', 'referral_bonus_amount')`
+              );
+              let enabled = true;
+              let bonusAmount = 2;
+              settingsRows.forEach(r => {
+                if (r.key === 'referral_enabled') enabled = (r.value === true || r.value === 'true');
+                if (r.key === 'referral_bonus_amount') bonusAmount = Number(r.value) || 2;
+              });
+
+              if (enabled) {
+                // Find referrer by first 8 chars of their UUID
+                const refCode = String(refParam).toUpperCase();
+                const { rows: referrerRows } = await pool.query(
+                  `SELECT id FROM users WHERE UPPER(SUBSTRING(id::text, 1, 8)) = $1 LIMIT 1`,
+                  [refCode]
+                );
+
+                if (referrerRows.length > 0) {
+                  const referrerId = referrerRows[0].id;
+                  
+                  // Don't allow self-referral
+                  if (referrerId !== bonusUserId) {
+                    // Check if this referred user was already recorded
+                    const { rowCount } = await pool.query(
+                      `SELECT 1 FROM referrals WHERE referred_id = $1`, [bonusUserId]
+                    );
+                    
+                    if (rowCount === 0) {
+                      // Record the referral
+                      await pool.query(
+                        `INSERT INTO referrals (referrer_id, referred_id, bonus_amount) VALUES ($1, $2, $3)`,
+                        [referrerId, bonusUserId, bonusAmount]
+                      );
+
+                      // Credit referrer — goes to available_balance ONLY (like bonus, not withdrawable)
+                      await pool.query(`
+                        UPDATE wallets 
+                        SET available_balance = available_balance + $1,
+                            bonus_balance = bonus_balance + $1,
+                            updated_at = now()
+                        WHERE user_id = $2
+                      `, [bonusAmount, referrerId]);
+
+                      // Log it
+                      await pool.query(
+                        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+                        [referrerId, bonusAmount, `Referral bonus (invited user ${bonusUserId.slice(0,8)})`]
+                      );
+
+                      console.log(`[REFERRAL] Credited ${bonusAmount} ETB to referrer ${referrerId} for new user ${bonusUserId}`);
+                    }
+                  }
+                }
+              }
+            } catch (refErr) {
+              console.error('[REFERRAL_ERR]', refErr.message);
+            }
+          }
         } catch (bonusErr) {
           console.error('[BONUS] Post-login bonus processing failed:', bonusErr.message);
         }

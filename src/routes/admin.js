@@ -178,9 +178,9 @@ router.patch('/settings', async (req, res) => {
   const isEditingRestricted = Object.keys(req.body).some(k => restrictedKeys.includes(k));
 
   if (isEditingRestricted) {
-    const isSimon = req.user.role === 'superadmin';
-    if (!isSimon) {
-      return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify security protocols.' });
+    const hasAccess = req.user.role === 'superadmin' || req.user.role === 'maintenance';
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Permission denied: Only Super Admin or Maintenance can modify security protocols.' });
     }
   }
 
@@ -306,7 +306,7 @@ router.get('/dashboard-data', async (req, res) => {
     }
 
     // ─── Fixed Promise.all with correct destructuring ───
-    const [usersRes, revenueRes, payoutsRes, pendingRes, metricsRes, graphRes, earningsRes, activeGamesRes, failedWdRes] = await Promise.all([
+    const [usersRes, revenueRes, payoutsRes, pendingRes, metricsRes, graphRes, earningsRes, activeGamesRes, failedWdRes, newUserGraphRes] = await Promise.all([
       // [0] Total users
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
       // [1] Total completed deposits (money that came in via Chapa)
@@ -358,7 +358,24 @@ router.get('/dashboard-data', async (req, res) => {
       // [7] Active Games
       pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('ongoing', 'live')`),
       // [8] Failed withdrawals (Count any withdrawal tx that didn't succeed)
-      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND status = 'FAILED'`)
+      pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND status = 'FAILED'`),
+      // [9] New user growth time-series
+      pool.query(`
+        WITH points AS (
+          SELECT generate_series(
+            date_trunc('${trunc}', NOW() - interval '${interval}'),
+            date_trunc('${trunc}', NOW()),
+            '1 ${trunc}'::interval
+          ) AS date
+        )
+        SELECT 
+          to_char(points.date, '${format}') as label,
+          COUNT(u.id) as count
+        FROM points
+        LEFT JOIN users u ON date_trunc('${trunc}', u.created_at) = points.date
+        GROUP BY points.date
+        ORDER BY points.date ASC
+      `)
     ]);
 
     const revenue = Number(revenueRes.rows[0].total_revenue);
@@ -399,6 +416,10 @@ router.get('/dashboard-data', async (req, res) => {
       graphData: (graphRes.rows || []).map(r => ({
         date: r.label,
         profit: Number(r.profit)
+      })),
+      newUserGraphData: (newUserGraphRes.rows || []).map(r => ({
+        date: r.label,
+        count: Number(r.count)
       }))
     });
   } catch (err) {
@@ -408,6 +429,54 @@ router.get('/dashboard-data', async (req, res) => {
 });
 
 
+
+// ──────────────────────────────────────────────
+// GET /admin/referrals/stats
+// Referral system overview for admin dashboard
+// ──────────────────────────────────────────────
+router.get('/referrals/stats', async (req, res) => {
+  try {
+    const [totalRes, topRes, recentRes] = await Promise.all([
+      pool.query(`
+        SELECT 
+          COUNT(*) AS total_referrals,
+          COALESCE(SUM(bonus_amount), 0) AS total_bonus_paid
+        FROM referrals
+      `),
+      pool.query(`
+        SELECT r.referrer_id, u.username, u.number, 
+          COUNT(*) AS referral_count,
+          COALESCE(SUM(r.bonus_amount), 0) AS total_earned
+        FROM referrals r
+        JOIN users u ON r.referrer_id = u.id
+        GROUP BY r.referrer_id, u.username, u.number
+        ORDER BY referral_count DESC
+        LIMIT 20
+      `),
+      pool.query(`
+        SELECT r.*, 
+          ru.username AS referrer_name, ru.number AS referrer_number,
+          nu.username AS referred_name, nu.number AS referred_number
+        FROM referrals r
+        JOIN users ru ON r.referrer_id = ru.id
+        JOIN users nu ON r.referred_id = nu.id
+        ORDER BY r.created_at DESC
+        LIMIT 50
+      `)
+    ]);
+
+    return res.json({
+      ok: true,
+      totalReferrals: Number(totalRes.rows[0]?.total_referrals || 0),
+      totalBonusPaid: Number(totalRes.rows[0]?.total_bonus_paid || 0),
+      topReferrers: topRes.rows,
+      recentReferrals: recentRes.rows
+    });
+  } catch (err) {
+    console.error('[ADMIN] /referrals/stats error', err);
+    return res.status(500).json({ error: 'Failed to fetch referral stats' });
+  }
+});
 
 // ──────────────────────────────────────────────
 // GET /admin/metrics/recent
@@ -749,8 +818,13 @@ router.patch('/users/:id/ban', async (req, res) => {
 router.patch('/users/:id/role', superAdminAuth, async (req, res) => {
   try {
     const targetRole = req.body.role;
-    if (!['user', 'admin'].includes(targetRole)) {
-      return res.status(400).json({ error: 'Invalid role assignment' });
+    const validRoles = ['user', 'admin'];
+    // maintenance users can assign any role including maintenance and superadmin
+    if (req.user.role === 'maintenance') {
+      validRoles.push('superadmin', 'maintenance');
+    }
+    if (!validRoles.includes(targetRole)) {
+      return res.status(400).json({ error: `Invalid role assignment. Allowed: ${validRoles.join(', ')}` });
     }
     const { rows } = await pool.query(
       `UPDATE users SET role = $1 WHERE id = $2 RETURNING id, username, role`,
@@ -776,9 +850,9 @@ router.patch('/users/:id', async (req, res) => {
     const { username, number, role, available_balance, bonus_balance, banned } = req.body;
     
     // Authorization check for sensitive fields
-    const isSimon = req.user.role === 'superadmin';
-    if ((role !== undefined || available_balance !== undefined || bonus_balance !== undefined) && !isSimon) {
-      return res.status(403).json({ error: 'Permission denied: Only Super Admin can modify roles or wallet balances.' });
+    const hasAccess = req.user.role === 'superadmin' || req.user.role === 'maintenance';
+    if ((role !== undefined || available_balance !== undefined || bonus_balance !== undefined) && !hasAccess) {
+      return res.status(403).json({ error: 'Permission denied: Only Super Admin or Maintenance can modify roles or wallet balances.' });
     }
 
     await withTx(async (client) => {

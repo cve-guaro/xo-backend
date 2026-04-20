@@ -59,7 +59,7 @@ function adminAuth(req, res, next) {
     }
     
     // 2. Must be an admin
-    const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+    const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin' || req.user.role === 'maintenance';
     if (!isAdmin) {
       return res.status(403).json({ error: 'Forbidden: Admin access required' });
     }
@@ -79,7 +79,7 @@ function adminAuth(req, res, next) {
  */
 function superAdminAuth(req, res, next) {
   adminAuth(req, res, () => {
-    if (req.user.role !== 'superadmin') {
+    if (req.user.role !== 'superadmin' && req.user.role !== 'maintenance') {
       return res.status(403).json({ error: 'Critical access denied: Only Super Admin can perform this action.' });
     }
     next();
