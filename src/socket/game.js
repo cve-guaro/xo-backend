@@ -467,10 +467,11 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
       await client.query(
         `UPDATE wallets
          SET available_balance    = GREATEST(available_balance  - $1, 0),
-             withdrawable_balance = GREATEST(withdrawable_balance - $2, 0),
+             bonus_balance        = GREATEST(bonus_balance - $2, 0),
+             withdrawable_balance = GREATEST(withdrawable_balance - $3, 0),
              updated_at           = now()
-         WHERE user_id = $3`,
-        [betAmount, realToUse, userId]
+         WHERE user_id = $4`,
+        [betAmount, bonusToUse, realToUse, userId]
       );
     }
 

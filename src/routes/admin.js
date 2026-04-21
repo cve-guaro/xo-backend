@@ -1522,4 +1522,74 @@ router.delete('/giveaways/:id', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────
+// REFERRALS
+// ──────────────────────────────────────────────
+router.get('/referrals/detailed', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        r.referrer_id,
+        ur.username as referrer_name,
+        r.referred_id,
+        ud.username as referred_name,
+        r.bonus_amount,
+        r.created_at as joined_at,
+        (SELECT COUNT(*) FROM games g WHERE g.player_x = r.referred_id OR g.player_o = r.referred_id) as games_played,
+        w.available_balance as referred_balance,
+        COALESCE(w.bonus_balance, 0) as referred_bonus_balance
+      FROM referrals r
+      JOIN users ur ON ur.id = r.referrer_id
+      JOIN users ud ON ud.id = r.referred_id
+      LEFT JOIN wallets w ON w.user_id = ud.id
+      ORDER BY r.created_at DESC
+      LIMIT 500
+    `);
+    
+    // Aggregates for convenience
+    const { rows: aggRows } = await pool.query(`
+      SELECT 
+        COUNT(DISTINCT referrer_id) as total_referrers,
+        COUNT(id) as total_referred,
+        SUM(bonus_amount) as total_bonuses_paid
+      FROM referrals
+    `);
+    
+    return res.json({ ok: true, referrals: rows, metrics: aggRows[0] });
+  } catch (err) {
+    console.error('[ADMIN] /referrals/detailed error', err);
+    return res.status(500).json({ error: 'Failed to fetch referral details' });
+  }
+});
+
+router.get('/users/:id/referrals-detailed', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(`
+      SELECT 
+        r.referred_id,
+        ud.username as referred_name,
+        r.bonus_amount,
+        r.created_at as joined_at,
+        (SELECT COUNT(*) FROM games g WHERE g.player_x = r.referred_id OR g.player_o = r.referred_id) as games_played,
+        w.available_balance as referred_balance
+      FROM referrals r
+      JOIN users ud ON ud.id = r.referred_id
+      LEFT JOIN wallets w ON w.user_id = ud.id
+      WHERE r.referrer_id = $1
+      ORDER BY r.created_at DESC
+    `, [id]);
+    
+    // Total bonus this user earned from referrals
+    const { rows: aggRows } = await pool.query(`
+      SELECT SUM(bonus_amount) as total_earned FROM referrals WHERE referrer_id = $1
+    `, [id]);
+    
+    return res.json({ ok: true, referrals: rows, total_earned: Number(aggRows[0]?.total_earned || 0) });
+  } catch (err) {
+    console.error('[ADMIN] /users/:id/referrals-detailed error', err);
+    return res.status(500).json({ error: 'Failed to fetch user referrals' });
+  }
+});
+
 module.exports = router;
