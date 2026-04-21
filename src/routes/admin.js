@@ -993,7 +993,9 @@ router.get('/users/:id/360', async (req, res) => {
     `;
     const txQuery = `
       SELECT id, tx_type as type, amount, status, provider as bank, provider_ref as tx_ref, created_at FROM wallet_transactions 
-      WHERE user_id = $1 AND (provider IS NULL OR provider != 'PRIZE')
+      WHERE user_id = $1 
+        AND LOWER(status::text) IN ('completed', 'settled', 'success')
+        AND LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled')
       ORDER BY created_at DESC LIMIT 50
     `;
     const gamesQuery = `

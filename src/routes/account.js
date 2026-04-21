@@ -140,7 +140,7 @@ router.get('/transactions', auth, async (req, res) => {
     const result = await pool.query(`
       SELECT 
         id,
-        tx_type AS type,
+        tx_type,
         amount,
         status,
         provider AS bank,
@@ -148,16 +148,17 @@ router.get('/transactions', auth, async (req, res) => {
         created_at
       FROM wallet_transactions
       WHERE user_id = $1
-        AND (LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled', 'prize'))
+        AND LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled', 'prize')
       ORDER BY created_at DESC
-      LIMIT 100
+      LIMIT 500
     `, [userId]);
 
     return res.json({
       ok: true,
       transactions: result.rows.map(tx => ({
         id: tx.id,
-        type: tx.type,
+        tx_type: tx.tx_type,           // raw type for frontend normalizeType()
+        type: tx.tx_type,              // alias used by some callers
         amount: Number(tx.amount),
         status: tx.status?.toLowerCase() || 'pending',
         method: tx.bank || 'Chapa',
@@ -170,6 +171,7 @@ router.get('/transactions', auth, async (req, res) => {
     return res.status(500).json({ message: 'Server error' });
   }
 });
+
 
 // PATCH /account/welcome-seen -> Refactored to "Claim Giveaway"
 router.patch("/welcome-seen", auth, async (req, res) => {
