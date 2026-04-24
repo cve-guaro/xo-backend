@@ -253,4 +253,111 @@ router.get("/config", auth, async (req, res) => {
   }
 });
 
+
+// GET /account/bonus-logs -> Returns user's bonus history & admin edits
+router.get('/bonus-logs', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await pool.query(`
+      SELECT amount, reason, created_at FROM (
+        SELECT amount, reason, created_at 
+        FROM bonus_logs 
+        WHERE user_id = $1 
+        UNION ALL 
+        SELECT amount, 'Admin Balance Edit' as reason, created_at 
+        FROM wallet_transactions 
+        WHERE user_id = $1 
+          AND tx_type::text IN ('ADMIN_CREDIT', 'GIFT') 
+          AND status = 'COMPLETED'
+      ) combined_logs
+      ORDER BY created_at DESC 
+      LIMIT 100
+    `, [userId]);
+
+    return res.json({
+      ok: true,
+      logs: result.rows.map(log => ({
+        amount: Number(log.amount),
+        reason: log.reason,
+        created_at: log.created_at
+      }))
+    });
+  } catch (err) {
+    console.error('[account] /bonus-logs error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /account/redeem-code -> Redeem promocode
+router.post('/redeem-code', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { code } = req.body;
+    
+    if (!code || typeof code !== 'string' || code.trim().length < 3) {
+      return res.status(400).json({ error: 'Invalid code format' });
+    }
+
+    const cleanCode = code.trim().toUpperCase();
+
+    // Find active promocode
+    const codeRes = await pool.query(`
+      SELECT * FROM promocodes 
+      WHERE UPPER(code) = $1 
+        AND status = 'ACTIVE'
+        AND (starts_at IS NULL OR starts_at <= NOW())
+        AND (ends_at IS NULL OR ends_at >= NOW())
+        AND (usage_limit IS NULL OR usage_count < usage_limit)
+      FOR UPDATE
+    `, [cleanCode]);
+
+    if (codeRes.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid or expired code' });
+    }
+
+    const promocode = codeRes.rows[0];
+
+    // Check if user already used it
+    const usageRes = await pool.query(`
+      SELECT 1 FROM promocode_claims 
+      WHERE promocode_id = $1 AND user_id = $2
+    `, [promocode.id, userId]);
+
+    if (usageRes.rows.length > 0) {
+      return res.status(400).json({ error: 'Code already redeemed' });
+    }
+
+    const amount = Number(promocode.amount);
+
+    // Apply bonus
+    await pool.query(`
+      UPDATE wallets 
+      SET bonus_balance = bonus_balance + $1,
+          available_balance = available_balance + $1
+      WHERE user_id = $2
+    `, [amount, userId]);
+
+    // Log usage
+    await pool.query(`
+      INSERT INTO promocode_claims (promocode_id, user_id) VALUES ($1, $2)
+    `, [promocode.id, userId]);
+
+    // Update usage count
+    await pool.query(`
+      UPDATE promocodes SET usage_count = usage_count + 1 WHERE id = $1
+    `, [promocode.id]);
+
+    // Log bonus
+    await pool.query(`
+      INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)
+    `, [userId, amount, promocode.title || `Promocode: ${cleanCode}`]);
+
+    return res.json({ ok: true, amount });
+  } catch (err) {
+    console.error('[account] /redeem-code error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 module.exports = router;
+

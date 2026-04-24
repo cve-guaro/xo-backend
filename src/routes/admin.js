@@ -695,11 +695,25 @@ router.get('/users/:id', async (req, res) => {
 
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     const user = rows[0];
+
+    // Calculate admin_edit_balance from bonus_logs
+    const { rows: adminEdits } = await pool.query(
+      `SELECT 
+         COALESCE(SUM(CASE WHEN reason ILIKE '%Admin%' THEN amount ELSE 0 END), 0) AS admin_edit_total,
+         COALESCE(SUM(CASE WHEN reason NOT ILIKE '%Admin%' THEN amount ELSE 0 END), 0) AS earned_bonus_total
+       FROM bonus_logs
+       WHERE user_id = $1
+         `,
+      [req.params.id]
+    );
+
     return res.json({
       ...user,
       available_balance: Number(user.available_balance || 0),
       withdrawable_balance: Number(user.withdrawable_balance || 0),
-      bonus_balance: Number(user.bonus_balance || 0)
+      bonus_balance: Number(user.bonus_balance || 0),
+      admin_edit_balance: Number(adminEdits[0]?.admin_edit_total || 0),
+      earned_bonus_balance: Number(adminEdits[0]?.earned_bonus_total || 0)
     });
   } catch (err) {
     console.error('[ADMIN] /users/:id error', err);
@@ -722,19 +736,44 @@ router.patch('/users/:id', async (req, res) => {
     );
 
     // Process balances (store as whole ETB since migration)
-    let availableCents = Math.round(Number(available_balance || 0));
-    let bonusCents = Math.round(Number(bonus_balance || 0));
+    let newAvail = Math.round(Number(available_balance || 0));
+    let newBonus = Math.round(Number(bonus_balance || 0));
 
     // Ensure wallet exists
     await pool.query(`INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [req.params.id]);
 
+    // Get old balances for delta calculation
+    const { rows: oldWallet } = await pool.query(
+      `SELECT available_balance, bonus_balance FROM wallets WHERE user_id = $1`,
+      [req.params.id]
+    );
+    const oldAvail = Number(oldWallet[0]?.available_balance || 0);
+    const oldBonus = Number(oldWallet[0]?.bonus_balance || 0);
+
     await pool.query(
       `UPDATE wallets SET available_balance = $1, bonus_balance = $2 WHERE user_id = $3`,
-      [availableCents, bonusCents, req.params.id]
+      [newAvail, newBonus, req.params.id]
     );
 
+    // Calculate deltas and log to bonus_logs for audit trail
+    const deltaAvail = newAvail - oldAvail;
+    const deltaBonus = newBonus - oldBonus;
+
+    if (deltaAvail !== 0) {
+      await pool.query(
+        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+        [req.params.id, Math.abs(deltaAvail), `Admin Edit balance ${deltaAvail > 0 ? '+' : '-'}${Math.abs(deltaAvail)} ETB by ${req.user?.username || 'admin'}`]
+      ).catch(e => console.error('[AdminEdit] bonus_log avail error:', e));
+    }
+    if (deltaBonus !== 0) {
+      await pool.query(
+        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+        [req.params.id, Math.abs(deltaBonus), `Admin Edit bonus ${deltaBonus > 0 ? '+' : '-'}${Math.abs(deltaBonus)} ETB by ${req.user?.username || 'admin'}`]
+      ).catch(e => console.error('[AdminEdit] bonus_log bonus error:', e));
+    }
+
     // Logging
-    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, role, available_balance, bonus_balance });
+    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, role, available_balance, bonus_balance, deltaAvail, deltaBonus });
 
     return res.json({ ok: true });
   } catch (err) {
@@ -1591,6 +1630,102 @@ router.get('/users/:id/referrals-detailed', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] /users/:id/referrals-detailed error', err);
     return res.status(500).json({ error: 'Failed to fetch user referrals' });
+  }
+});
+
+
+// ──────────────────────────────────────────────
+// PROMOTION LINKS
+// ──────────────────────────────────────────────
+
+router.get('/promotion-links', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM promotion_links ORDER BY created_at DESC');
+    res.json(rows);
+  } catch (err) {
+    console.error('[ADMIN] GET /promotion-links err', err);
+    res.status(500).json({ error: 'Failed to fetch promotion links' });
+  }
+});
+
+router.post('/promotion-links', async (req, res) => {
+  try {
+    const { name, bonus_amount, code, expires_at } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+    
+    const amt = Number(bonus_amount || 0);
+    const promoCode = (code && code.trim()) ? code.trim().toUpperCase() : ('PROMO' + Math.floor(Math.random() * 1000000));
+
+    const { rows } = await pool.query(
+      `INSERT INTO promotion_links (name, bonus_amount, code, is_active, total_claims, total_registrations) 
+       VALUES ($1, $2, $3, true, 0, 0) RETURNING *`,
+      [name, amt, promoCode]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('[ADMIN] POST /promotion-links err', err);
+    // Return the actual error message for debugging
+    res.status(500).json({ error: 'Failed to create promotion link: ' + err.message });
+  }
+});
+
+router.patch('/promotion-links/:id', async (req, res) => {
+  try {
+    const { name, bonus_amount, code, expires_at, is_active } = req.body;
+    const { id } = req.params;
+
+    const updates = [];
+    const params = [];
+    let idx = 1;
+
+    if (name !== undefined) { updates.push(`name = ${idx++}`); params.push(name); }
+    if (bonus_amount !== undefined) { updates.push(`bonus_amount = ${idx++}`); params.push(Number(bonus_amount || 0)); }
+    if (code !== undefined) { updates.push(`code = ${idx++}`); params.push(code); }
+    if (expires_at !== undefined) { updates.push(`expires_at = ${idx++}`); params.push(expires_at); }
+    if (is_active !== undefined) { updates.push(`is_active = ${idx++}`); params.push(is_active); }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    params.push(id);
+    const { rows } = await pool.query(
+      `UPDATE promotion_links SET ${updates.join(', ')} WHERE id = ${idx} RETURNING *`,
+      params
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Promotion link not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('[ADMIN] PATCH /promotion-links/:id err', err);
+    res.status(500).json({ error: 'Failed to update promotion link' });
+  }
+});
+
+router.delete('/promotion-links/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM promotion_links WHERE id = $1', [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ADMIN] DELETE /promotion-links/:id err', err);
+    res.status(500).json({ error: 'Failed to delete promotion link' });
+  }
+});
+
+router.get('/promotion-links/:id/claims', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(`
+      SELECT plc.id, plc.claimed_at as created_at, u.username, u.number 
+      FROM promotion_claims plc
+      JOIN users u ON u.id = plc.user_id
+      WHERE plc.promotion_link_id = $1
+      ORDER BY plc.claimed_at DESC
+      LIMIT 100
+    `, [id]);
+    res.json(rows);
+  } catch (err) {
+    console.error('[ADMIN] GET /promotion-links/:id/claims err', err);
+    res.status(500).json({ error: 'Failed to fetch claims' });
   }
 });
 

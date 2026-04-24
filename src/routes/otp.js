@@ -343,85 +343,176 @@ router.post('/verify-otp', async (req, res) => {
 
     console.log('[VERIFY_OTP] Tokens generated successfully');
 
-    // ---- FIRE-AND-FORGET: Apply bonuses AFTER login succeeds ----
-    if (result.isNewUser) {
-      const bonusUserId = result.user.id;
-      const refParam = req.body?.ref || req.query?.ref || null;
-      setImmediate(async () => {
-        try {
-          console.log(`[BONUS] Processing bonuses for new user ${bonusUserId}...`);
-          
-          // A) Apply giveaway-table promotions
-          await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
-          
-          // B) Process referral bonus
-          if (refParam) {
-            try {
-              // Check if referral system is enabled
-              const { rows: settingsRows } = await pool.query(
-                `SELECT value FROM global_settings WHERE key IN ('referral_enabled', 'referral_bonus_amount')`
-              );
-              let enabled = true;
-              let bonusAmount = 2;
-              settingsRows.forEach(r => {
-                if (r.key === 'referral_enabled') enabled = (r.value === true || r.value === 'true');
-                if (r.key === 'referral_bonus_amount') bonusAmount = Number(r.value) || 2;
-              });
+     // ---- FIRE-AND-FORGET: Apply bonuses AFTER login succeeds ----
+     if (result.isNewUser) {
+       const bonusUserId = result.user.id;
+       const refParam = req.body?.ref || req.query?.ref || null;
+       const promoParam = req.body?.promo || req.query?.promo || null;
+       setImmediate(async () => {
+         try {
+           console.log(`[BONUS] Processing bonuses for new user ${bonusUserId}...`);
+           
+           // A) Apply giveaway-table promotions — skip if user came via referral or promo link
+           if (!refParam && !promoParam) {
+             await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
+           } else {
+             console.log(`[BONUS] Skipping global giveaway for ref/promo user ${bonusUserId}`);
+           }
+           
+           // B) Process referral bonus
+           if (refParam) {
+             try {
+               // Check if referral system is enabled
+               const { rows: settingsRows } = await pool.query(
+                 `SELECT value FROM global_settings WHERE key IN ('referral_enabled', 'referral_bonus_amount')`
+               );
+               let enabled = true;
+               let bonusAmount = 2;
+               settingsRows.forEach(r => {
+                 if (r.key === 'referral_enabled') enabled = (r.value === true || r.value === 'true');
+                 if (r.key === 'referral_bonus_amount') bonusAmount = Number(r.value) || 2;
+               });
 
-              if (enabled) {
-                // Find referrer by first 8 chars of their UUID
-                const refCode = String(refParam).toUpperCase();
-                const { rows: referrerRows } = await pool.query(
-                  `SELECT id FROM users WHERE UPPER(SUBSTRING(id::text, 1, 8)) = $1 LIMIT 1`,
-                  [refCode]
-                );
+               if (enabled) {
+                 // Find referrer by first 8 chars of their UUID
+                 const refCode = String(refParam).toUpperCase();
+                 const { rows: referrerRows } = await pool.query(
+                   `SELECT id FROM users WHERE UPPER(SUBSTRING(id::text, 1, 8)) = $1 LIMIT 1`,
+                   [refCode]
+                 );
 
-                if (referrerRows.length > 0) {
-                  const referrerId = referrerRows[0].id;
-                  
-                  // Don't allow self-referral
-                  if (referrerId !== bonusUserId) {
-                    // Check if this referred user was already recorded
-                    const { rowCount } = await pool.query(
-                      `SELECT 1 FROM referrals WHERE referred_id = $1`, [bonusUserId]
-                    );
-                    
-                    if (rowCount === 0) {
-                      // Record the referral
-                      await pool.query(
-                        `INSERT INTO referrals (referrer_id, referred_id, bonus_amount) VALUES ($1, $2, $3)`,
-                        [referrerId, bonusUserId, bonusAmount]
-                      );
+                 if (referrerRows.length > 0) {
+                   const referrerId = referrerRows[0].id;
+                   
+                   // Don't allow self-referral
+                   if (referrerId !== bonusUserId) {
+                     // Use a transaction with a wallet lock to prevent race conditions
+                     const client = await pool.connect();
+                     try {
+                       await client.query('BEGIN');
 
-                      // Credit referrer — goes to available_balance ONLY (like bonus, not withdrawable)
-                      await pool.query(`
-                        UPDATE wallets 
-                        SET available_balance = available_balance + $1,
-                            bonus_balance = bonus_balance + $1,
-                            updated_at = now()
-                        WHERE user_id = $2
-                      `, [bonusAmount, referrerId]);
+                       // 🔒 Lock referrer's wallet row to prevent duplicate credits
+                       await client.query(`SELECT 1 FROM wallets WHERE user_id = $1 FOR UPDATE`, [referrerId]);
 
-                      // Log it
-                      await pool.query(
-                        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
-                        [referrerId, bonusAmount, `Referral bonus (invited user ${bonusUserId.slice(0,8)})`]
-                      );
+                       // Check if this referred user was already recorded (safe under lock)
+                       const { rowCount } = await client.query(
+                         `SELECT 1 FROM referrals WHERE referred_id = $1`, [bonusUserId]
+                       );
+                       
+                       if (rowCount === 0) {
+                         // Record the referral
+                         await client.query(
+                           `INSERT INTO referrals (referrer_id, referred_id, bonus_amount) VALUES ($1, $2, $3)`,
+                           [referrerId, bonusUserId, bonusAmount]
+                         );
 
-                      console.log(`[REFERRAL] Credited ${bonusAmount} ETB to referrer ${referrerId} for new user ${bonusUserId}`);
-                    }
-                  }
-                }
-              }
-            } catch (refErr) {
-              console.error('[REFERRAL_ERR]', refErr.message);
-            }
-          }
-        } catch (bonusErr) {
-          console.error('[BONUS] Post-login bonus processing failed:', bonusErr.message);
-        }
-      });
-    }
+                         // Credit referrer — bonus goes to available_balance and bonus_balance (NOT withdrawable)
+                         await client.query(`
+                           UPDATE wallets 
+                           SET available_balance = available_balance + $1,
+                               bonus_balance     = bonus_balance + $1,
+                               updated_at        = now()
+                           WHERE user_id = $2
+                         `, [bonusAmount, referrerId]);
+
+                         // Log it
+                         await client.query(
+                           `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+                           [referrerId, bonusAmount, `Referral bonus (invited user ${bonusUserId.slice(0,8)})`]
+                         );
+
+                         console.log(`[REFERRAL] Credited ${bonusAmount} ETB to referrer ${referrerId} for new user ${bonusUserId}`);
+                       }
+
+                       await client.query('COMMIT');
+                     } catch (txErr) {
+                       await client.query('ROLLBACK');
+                       console.error('[REFERRAL_TX_ERR]', txErr.message);
+                     } finally {
+                       client.release();
+                     }
+                   }
+                 }
+               }
+             } catch (refErr) {
+               console.error('[REFERRAL_ERR]', refErr.message);
+             }
+           }
+
+           // C) Process promotion link bonus
+           if (promoParam) {
+             try {
+               const promoCode = String(promoParam).toUpperCase();
+               const { rows: promoRows } = await pool.query(`
+                 SELECT * FROM promotion_links 
+                 WHERE UPPER(code) = $1 
+                   AND is_active = true
+                   AND (expires_at IS NULL OR expires_at > NOW())
+               `, [promoCode]);
+
+               if (promoRows.length > 0) {
+                 const promo = promoRows[0];
+                 const promoAmount = Number(promo.bonus_amount);
+
+                 // Use transaction to prevent double claims
+                 const client = await pool.connect();
+                 try {
+                   await client.query('BEGIN');
+
+                   // Check if already claimed
+                   const { rowCount } = await client.query(`
+                     SELECT 1 FROM promotion_claims 
+                     WHERE promotion_link_id = $1 AND user_id = $2
+                   `, [promo.id, bonusUserId]);
+
+                   if (rowCount === 0) {
+                     // Record claim
+                     await client.query(`
+                       INSERT INTO promotion_claims (promotion_link_id, user_id) VALUES ($1, $2)
+                     `, [promo.id, bonusUserId]);
+
+                     // Update promotion counter
+                     await client.query(`
+                       UPDATE promotion_links 
+                       SET total_claims = total_claims + 1,
+                           total_registrations = total_registrations + 1
+                       WHERE id = $1
+                     `, [promo.id]);
+
+                     // Credit user bonus
+                     await client.query(`
+                       UPDATE wallets 
+                       SET available_balance = available_balance + $1,
+                           bonus_balance     = bonus_balance + $1,
+                           updated_at        = now()
+                       WHERE user_id = $2
+                     `, [promoAmount, bonusUserId]);
+
+                     // Log bonus
+                     await client.query(`
+                       INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)
+                     `, [bonusUserId, promoAmount, `Promotion bonus: ${promo.name} (${promo.code})`]);
+
+                     console.log(`[PROMO] Credited ${promoAmount} ETB to new user ${bonusUserId} via promotion ${promo.code}`);
+                   }
+
+                   await client.query('COMMIT');
+                 } catch (txErr) {
+                   await client.query('ROLLBACK');
+                   console.error('[PROMO_TX_ERR]', txErr.message);
+                 } finally {
+                   client.release();
+                 }
+               }
+             } catch (promoErr) {
+               console.error('[PROMO_ERR]', promoErr.message);
+             }
+           }
+         } catch (bonusErr) {
+           console.error('[BONUS] Post-login bonus processing failed:', bonusErr.message);
+         }
+       });
+     }
 
     return res.json({
       token,

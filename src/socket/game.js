@@ -449,16 +449,21 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
 
     if (walletRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
 
-    // For each player, apply bonus-first deduction
-    for (const wallet of walletRes.rows) {
-      const avail = Number(wallet.available_balance);
-      const bonus = Number(wallet.bonus_balance);
-      const userId = wallet.user_id;
+      // For each player, apply bonus-first deduction
+      const playerBonusUsed = {};
+      for (const wallet of walletRes.rows) {
+        const avail = Number(wallet.available_balance);
+        const bonus = Number(wallet.bonus_balance);
+        const userId = wallet.user_id;
 
-      const bonusToUse = Math.min(bonus, betAmount);
-      const realToUse = betAmount - bonusToUse;
+        const bonusToUse = Math.min(bonus, betAmount);
+        const realToUse = betAmount - bonusToUse;
 
-      if (avail < betAmount) throw new Error("INSUFFICIENT_BALANCE");
+        // Check TOTAL effective balance (available + bonus), not just available
+        if ((avail + bonus) < betAmount) throw new Error("INSUFFICIENT_BALANCE");
+        
+        // Store pre-deduction bonus used amount for this player
+        playerBonusUsed[userId] = bonusToUse;
 
       // Unified deduction:
       // - available_balance always drops by the full betAmount
@@ -476,9 +481,12 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
     }
 
     await client.query(
-      `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at)
-       VALUES ($1, $2, $3, $4, 'ongoing', '[]'::jsonb, NOW())`,
-      [matchId, playerXId, playerOId, betAmount]
+      `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at, bonus_used_x, bonus_used_o)
+       VALUES ($1, $2, $3, $4, 'ongoing', '[]'::jsonb, NOW(), $5, $6)`,
+      [matchId, playerXId, playerOId, betAmount, 
+        playerBonusUsed[playerXId],
+        playerBonusUsed[playerOId]
+      ]
     );
     return { id: matchId, player_x: playerXId, player_o: playerOId, bet_amount: betAmount, status: "ongoing" };
   });
@@ -493,24 +501,31 @@ async function saveMove(gameId, moveObj) {
 
 async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
   return tx(async (client) => {
-    // Get game details to determine room
-    const gameRes = await client.query(`SELECT bet_amount, player_x, player_o FROM games WHERE id = $1`, [gameId]);
+    // Get game details to determine room and bonus used
+    const gameRes = await client.query(`SELECT bet_amount, player_x, player_o, bonus_used_x, bonus_used_o FROM games WHERE id = $1`, [gameId]);
     const game = gameRes.rows[0];
 
     await client.query(
-      `UPDATE games SET status = $1, winner = $2, finished_at = NOW() WHERE id = $3`,
-      [status === 'X' || status === 'O' ? 'completed' : status, winnerUserId || null, gameId]
+      `UPDATE games SET status = $1, winner = $2, finished_at = NOW(), prize_amount = $4 WHERE id = $3`,
+      [status === 'X' || status === 'O' ? 'completed' : status, winnerUserId || null, gameId, winnerUserId ? prizeAmount : 0]
     );
 
     if (winnerUserId) {
+      const isX = (winnerUserId === game.player_x);
+      const bonusUsed = isX ? Number(game.bonus_used_x || 0) : Number(game.bonus_used_o || 0);
+      const withdrawableProfit = prizeAmount - bonusUsed;
+
       // Direct wallet update — MUST succeed before ledger
+      // ✅ Fixed: Only add prizeAmount ONCE. The prize already includes the original wager return!
+      // The old bug: we were adding BOTH prizeAmount AND bonusUsed, creating double credit for bonuses
       await client.query(`
         UPDATE wallets 
         SET available_balance = available_balance + $1,
-            withdrawable_balance = withdrawable_balance + $1,
+            bonus_balance = bonus_balance + $2,
+            withdrawable_balance = withdrawable_balance + $3,
             updated_at = NOW()
-        WHERE user_id = $2
-      `, [prizeAmount, winnerUserId]);
+        WHERE user_id = $4
+      `, [prizeAmount, 0, withdrawableProfit, winnerUserId]);
 
       // Ledger record — non-critical; do NOT let this roll back the wallet credit! Use pool.query so it's a separate transaction.
       await pool.query(`

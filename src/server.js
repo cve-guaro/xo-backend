@@ -258,6 +258,25 @@ initCron();
       );
     `);
     
+    // Add prize_amount column to games table (tracks actual payout for admin dashboard)
+    await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS prize_amount NUMERIC DEFAULT 0;`);
+
+    // Backfill historical games: calculate prize for completed games with a winner
+    // Uses the same fee logic: Room 1 (bet < 100) = 20% fee → prize = bet * 2 * 0.8
+    // Room 2 (100-999) = 15% fee → prize = bet * 2 * 0.85
+    // Room 3 (1000+) = 10% fee → prize = bet * 2 * 0.9
+    await pool.query(`
+      UPDATE games
+      SET prize_amount = CASE
+        WHEN bet_amount >= 1000 THEN FLOOR(bet_amount * 2 * 0.9)
+        WHEN bet_amount >= 100  THEN FLOOR(bet_amount * 2 * 0.85)
+        ELSE                         FLOOR(bet_amount * 2 * 0.8)
+      END
+      WHERE status = 'completed' 
+        AND winner IS NOT NULL 
+        AND (prize_amount IS NULL OR prize_amount = 0);
+    `);
+
     console.log('[DB] Migrations applied.');
   } catch (err) {
     console.error('[DB] Migration error:', err);

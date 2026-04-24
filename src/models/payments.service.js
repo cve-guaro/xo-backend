@@ -193,16 +193,16 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       throw err;
     }
 
-    // 2) Check balance — ONLY withdrawable_balance counts (bonus is NOT withdrawable)
-    const walletCheck = await client.query(SQL.getWallet, [userId]);
-    const walletData = walletCheck.rows[0];
-    const withdrawable = Number(walletData?.withdrawable_balance || 0);
-    
-    if (withdrawable < amountEtb) {
-      const err = new Error("Insufficient withdrawable balance.");
-      err.status = 400;
-      throw err;
-    }
+     // 2) Check balance — ONLY withdrawable_balance counts (bonus is free leverage, not withdrawable)
+     const walletCheck = await client.query(SQL.getWallet, [userId]);
+     const walletData = walletCheck.rows[0];
+     const withdrawable = Number(walletData?.withdrawable_balance || 0);
+     
+     if (withdrawable < amountEtb) {
+       const err = new Error("Insufficient withdrawable balance.");
+       err.status = 400;
+       throw err;
+     }
 
     // AML & Security Rules — only the auto-payout threshold matters
     const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'auto_payout_threshold')`);
@@ -367,11 +367,12 @@ async function redeemPromoCode({ userId, code }) {
         { giveawayId: giveaway.id, code: cleanCode }
       ]);
 
-      // Use bonus_balance update logic (ensure it hits the bonus field)
+      // ✅ Update BOTH available_balance and bonus_balance to keep wallet in sync
       await client.query(`
         UPDATE wallets 
-        SET bonus_balance = bonus_balance + $1,
-            updated_at = now()
+        SET available_balance = available_balance + $1,
+            bonus_balance     = bonus_balance + $1,
+            updated_at        = now()
         WHERE user_id = $2
       `, [amount, userId]);
 
@@ -398,6 +399,9 @@ async function redeemPromoCode({ userId, code }) {
  */
 async function applyNewUserGiveaways(userId) {
   return withTx(async (client) => {
+    // 🔒 Lock the user's wallet row FIRST to prevent race conditions (e.g. duplicate logins)
+    await client.query(`SELECT 1 FROM wallets WHERE user_id = $1 FOR UPDATE`, [userId]);
+
     // Find all active NEW_USER giveaways
     const giveaways = await client.query(`
       SELECT * FROM giveaways 
@@ -409,14 +413,17 @@ async function applyNewUserGiveaways(userId) {
 
     for (const g of giveaways.rows) {
       try {
-        // Check if already claimed
-        const { rowCount } = await client.query(`SELECT 1 FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2`, [g.id, userId]);
+        // Check if already claimed — safe because we hold the wallet FOR UPDATE lock
+        const { rowCount } = await client.query(
+          `SELECT 1 FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2`,
+          [g.id, userId]
+        );
         if (rowCount > 0) continue;
 
         const amount = Number(g.amount);
         const idem = makeIdempotencyKey("GIVEAWAY_AUTO", userId, g.id);
 
-        // Apply to balance
+        // Apply to wallet transaction ledger
         await client.query(SQL.applyTx, [
           userId,
           "GIFT",
@@ -428,16 +435,22 @@ async function applyNewUserGiveaways(userId) {
           { giveawayId: g.id, type: 'AUTO_NEW_USER' }
         ]);
 
+        // ✅ Update BOTH available_balance and bonus_balance to keep wallet in sync
         await client.query(`
           UPDATE wallets 
-          SET bonus_balance = bonus_balance + $1,
-              updated_at = now()
+          SET available_balance = available_balance + $1,
+              bonus_balance     = bonus_balance + $1,
+              updated_at        = now()
           WHERE user_id = $2
         `, [amount, userId]);
 
-        await client.query(`INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`, [g.id, userId, amount]);
+        // Record the claim to prevent double-claiming
+        await client.query(
+          `INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`,
+          [g.id, userId, amount]
+        );
 
-        // Add to bonus_logs for tracking
+        // Add to bonus_logs for the frontend tracking list
         await client.query(`
           INSERT INTO bonus_logs (user_id, amount, reason)
           VALUES ($1, $2, $3)

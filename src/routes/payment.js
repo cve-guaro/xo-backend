@@ -27,7 +27,7 @@ function assertAmountForDeposit(amountCents) {
   }
 }
 function assertAmountForPayout(amountCents) {
-    console.log(LIMITS)
+
   if (amountCents < LIMITS.minPayout || amountCents > LIMITS.maxPayout) {
     const e = new Error('Amount out of payout limits'); e.status = 400; throw e;
   }
@@ -77,24 +77,25 @@ router.get('/chapa-bounce', async (req, res) => {
       return res.status(400).send('Invalid Chapa checkout URL');
     }
 
-    // This meta-refresh + JS structure forces WebViews (like Telegram) to treat 
-    // the navigation as a first-party document transition, fixing the SameSite/CSRF block on Chapa's Laravel backend.
+    // Sanitize URL to prevent XSS — only allow validated Chapa URLs
+    const safeUrl = encodeURI(url).replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta http-equiv="refresh" content="0; url=${url}">
+        <meta http-equiv="refresh" content="0; url=${safeUrl}">
         <title>Redirecting to Secure Payment...</title>
       </head>
       <body style="background: #060814; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
         <div style="text-align: center;">
            <p style="font-weight: bold; font-size: 16px;">Connecting to secure payment...</p>
-           <p style="font-size: 13px; color: #888;">If you are not redirected automatically, <a href="${url}" style="color: #a78bfa;">click here</a>.</p>
+           <p style="font-size: 13px; color: #888;">If you are not redirected automatically, <a href="${safeUrl}" style="color: #a78bfa;">click here</a>.</p>
         </div>
         <script>
            setTimeout(function() {
-              window.location.href = "${url}";
+              window.location.href = "${safeUrl}";
            }, 200);
         </script>
       </body>
@@ -226,9 +227,8 @@ router.post('/withdraw', auth, validate(schemas.withdraw), async (req, res) => {
 router.post("/webhook", handleWebhook);
 
 
-router.post('/withdrawal/approve', async (req, res) => {
-  // Placeholder for admin approval logic
-  console.log('Approve withdrawal endpoint hit');
+router.post('/withdrawal/approve', auth, async (req, res) => {
+  // Placeholder for admin approval logic — protected with auth
   return res.status(200).json({ status: 'Not implemented' });
 });
 
