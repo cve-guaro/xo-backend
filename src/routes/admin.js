@@ -995,6 +995,7 @@ router.delete('/users/:id', async (req, res) => {
       const targetUser = rows[0] || {};
       
       // Order is important for foreign keys
+      await client.query(`DELETE FROM promotion_claims WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM games WHERE player_x = $1 OR player_o = $1 OR winner = $1`, [req.params.id]);
       await client.query(`DELETE FROM wallet_transactions WHERE user_id = $1`, [req.params.id]);
       await client.query(`DELETE FROM bonus_logs WHERE user_id = $1`, [req.params.id]);
