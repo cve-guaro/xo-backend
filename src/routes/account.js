@@ -204,7 +204,7 @@ router.patch("/welcome-seen", auth, async (req, res) => {
         RETURNING id
       )
       UPDATE wallets
-      SET bonus_balance = bonus_balance + $3
+      SET bonus_balance = bonus_balance + $3, available_balance = available_balance + $3
       WHERE user_id IN (SELECT id FROM updated_user)
       RETURNING user_id;
     `, [currentVersion, userId, bonusAmount]);

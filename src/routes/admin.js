@@ -948,7 +948,7 @@ router.post('/users', async (req, res) => {
     const { username, number, role, balance } = req.body;
     if (!username || !number) return res.status(400).json({ error: "Username and Number are required." });
 
-    if (role && role !== 'user' && !['admin', 'superadmin'].includes(req.user.role)) {
+    if (role && role !== 'user' && !['admin', 'superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
       return res.status(403).json({ error: "Insufficient permissions to create administrative accounts." });
     }
 
@@ -985,7 +985,7 @@ router.post('/users', async (req, res) => {
 // ──────────────────────────────────────────────
 router.delete('/users/:id', async (req, res) => {
   try {
-    if (!['admin', 'superadmin'].includes(req.user.role)) {
+    if (!['admin', 'superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
       return res.status(403).json({ error: "Insufficient permissions to delete accounts." });
     }
 
@@ -1678,17 +1678,17 @@ router.patch('/promotion-links/:id', async (req, res) => {
     const params = [];
     let idx = 1;
 
-    if (name !== undefined) { updates.push(`name = ${idx++}`); params.push(name); }
-    if (bonus_amount !== undefined) { updates.push(`bonus_amount = ${idx++}`); params.push(Number(bonus_amount || 0)); }
-    if (code !== undefined) { updates.push(`code = ${idx++}`); params.push(code); }
-    if (expires_at !== undefined) { updates.push(`expires_at = ${idx++}`); params.push(expires_at); }
-    if (is_active !== undefined) { updates.push(`is_active = ${idx++}`); params.push(is_active); }
+    if (name !== undefined) { updates.push(`name = $${idx++}`); params.push(name); }
+    if (bonus_amount !== undefined) { updates.push(`bonus_amount = $${idx++}`); params.push(Number(bonus_amount || 0)); }
+    if (code !== undefined) { updates.push(`code = $${idx++}`); params.push(code); }
+    if (expires_at !== undefined) { updates.push(`expires_at = $${idx++}`); params.push(expires_at); }
+    if (is_active !== undefined) { updates.push(`is_active = $${idx++}`); params.push(is_active); }
 
     if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
     params.push(id);
     const { rows } = await pool.query(
-      `UPDATE promotion_links SET ${updates.join(', ')} WHERE id = ${idx} RETURNING *`,
+      `UPDATE promotion_links SET ${updates.join(', ')} WHERE id = $${idx} RETURNING *`,
       params
     );
 
@@ -1703,6 +1703,7 @@ router.patch('/promotion-links/:id', async (req, res) => {
 router.delete('/promotion-links/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    await pool.query('DELETE FROM promotion_claims WHERE promotion_link_id = $1', [id]);
     await pool.query('DELETE FROM promotion_links WHERE id = $1', [id]);
     res.json({ ok: true });
   } catch (err) {
