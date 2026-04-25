@@ -81,7 +81,7 @@ const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (mobile apps, server-to-server)
     if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) {
+    if (ALLOWED_ORIGINS.includes(origin) || origin.endsWith('.vercel.app')) {
       return callback(null, true);
     }
     return callback(new Error('CORS: Origin not allowed'));
@@ -95,7 +95,7 @@ app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests gl
 
 // ─── SOCKET.IO & REDIS ADAPTER ─────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"], credentials: true }
+  cors: { origin: corsOptions.origin, methods: ["GET", "POST", "OPTIONS"], credentials: true }
 });
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
