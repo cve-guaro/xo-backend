@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const { pool } = require('./db'); // Assuming pool is exported from db/index.js
+const { verifyPendingPayouts } = require('./cron/verifyPendingPayouts');
 
 function initCron() {
   console.log('[CRON] Initializing background scheduler...');
@@ -9,12 +10,10 @@ function initCron() {
     try {
       console.log('[CRON] Running Ghost Game Cleanup...');
       
-      // Cleanup games stuck in 'ongoing', 'seeking', or 'countdown' for over 30 mins
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
         
-        // Find stuck games
         const { rows: stuckGames } = await client.query(`
           UPDATE games 
           SET status = 'abandoned', finished_at = NOW() 
@@ -26,7 +25,6 @@ function initCron() {
         for (const game of stuckGames) {
           const betAmount = Number(game.bet_amount || 0);
           if (betAmount > 0) {
-            // Refund BOTH players safely
             if (game.player_x) {
               await client.query(`
                 UPDATE wallets 
@@ -95,6 +93,16 @@ function initCron() {
      } catch (err) {
        console.error('[CRON] Task 3 Error:', err.message);
      }
+  });
+
+  // 4) 💳 Verify Pending Payouts (Runs every 15 minutes)
+  // Checks Chapa transfer status and auto-refunds if Chapa failed/cancelled
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      await verifyPendingPayouts();
+    } catch (err) {
+      console.error('[CRON] Task 4 (verifyPendingPayouts) Error:', err.message);
+    }
   });
 
   console.log('[CRON] Scheduler active.');

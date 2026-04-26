@@ -723,62 +723,38 @@ router.get('/users/:id', async (req, res) => {
 
 // ──────────────────────────────────────────────
 // PATCH /admin/users/:id
-// Full user profile edit
+// Profile-only edit (username, number, role). Balance changes go through /users/:id/balance.
 // ──────────────────────────────────────────────
 router.patch('/users/:id', async (req, res) => {
   try {
-    const { username, number, role, available_balance, bonus_balance } = req.body;
+    const { username, number, role } = req.body;
     
-    // Process User details
-    await pool.query(
-      `UPDATE users SET username = $1, number = $2, role = $3 WHERE id = $4`,
-      [username, number, role, req.params.id]
-    );
-
-    // Process balances (store as whole ETB since migration)
-    let newAvail = Math.round(Number(available_balance || 0));
-    let newBonus = Math.round(Number(bonus_balance || 0));
-
-    // Ensure wallet exists
-    await pool.query(`INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [req.params.id]);
-
-    // Get old balances for delta calculation
-    const { rows: oldWallet } = await pool.query(
-      `SELECT available_balance, bonus_balance FROM wallets WHERE user_id = $1`,
-      [req.params.id]
-    );
-    const oldAvail = Number(oldWallet[0]?.available_balance || 0);
-    const oldBonus = Number(oldWallet[0]?.bonus_balance || 0);
-
-    await pool.query(
-      `UPDATE wallets SET available_balance = $1, bonus_balance = $2 WHERE user_id = $3`,
-      [newAvail, newBonus, req.params.id]
-    );
-
-    // Calculate deltas and log to bonus_logs for audit trail
-    const deltaAvail = newAvail - oldAvail;
-    const deltaBonus = newBonus - oldBonus;
-
-    if (deltaAvail !== 0) {
-      await pool.query(
-        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
-        [req.params.id, Math.abs(deltaAvail), `Admin Edit balance ${deltaAvail > 0 ? '+' : '-'}${Math.abs(deltaAvail)} ETB by ${req.user?.username || 'admin'}`]
-      ).catch(e => console.error('[AdminEdit] bonus_log avail error:', e));
-    }
-    if (deltaBonus !== 0) {
-      await pool.query(
-        `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
-        [req.params.id, Math.abs(deltaBonus), `Admin Edit bonus ${deltaBonus > 0 ? '+' : '-'}${Math.abs(deltaBonus)} ETB by ${req.user?.username || 'admin'}`]
-      ).catch(e => console.error('[AdminEdit] bonus_log bonus error:', e));
+    // Build dynamic update — only update provided fields
+    const updates = [];
+    const params = [];
+    let idx = 1;
+    if (username !== undefined) { updates.push(`username = $${idx++}`); params.push(username); }
+    if (number !== undefined) { updates.push(`number = $${idx++}`); params.push(number); }
+    if (role !== undefined) {
+      const hasAccess = req.user.role === 'superadmin' || req.user.role === 'maintenance' || req.user.role === 'maintenance_admin';
+      if (!hasAccess) return res.status(403).json({ error: 'Permission denied: Cannot modify roles.' });
+      updates.push(`role = $${idx++}`); params.push(role);
     }
 
-    // Logging
-    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, role, available_balance, bonus_balance, deltaAvail, deltaBonus });
+    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    params.push(req.params.id);
+    await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = $${idx}`, params);
+
+    // NOTE: Wallet balances are NOT modified here.
+    // Use PATCH /admin/users/:id/balance for balance changes.
+
+    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, role });
 
     return res.json({ ok: true });
   } catch (err) {
     console.error('[ADMIN] /users/:id patch error', err);
-    return res.status(500).json({ error: 'Failed to fully update user' });
+    return res.status(500).json({ error: 'Failed to update user profile' });
   }
 });
 
@@ -880,64 +856,8 @@ router.patch('/users/:id/role', superAdminAuth, async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────
-// PATCH /admin/users/:id
-// Full CRUD functionality for Admin user updates
-// ──────────────────────────────────────────────
-router.patch('/users/:id', async (req, res) => {
-  try {
-    const { username, number, role, available_balance, bonus_balance, banned } = req.body;
-    
-    // Authorization check for sensitive fields
-    const hasAccess = req.user.role === 'superadmin' || req.user.role === 'maintenance';
-    if ((role !== undefined || available_balance !== undefined || bonus_balance !== undefined) && !hasAccess) {
-      return res.status(403).json({ error: 'Permission denied: Only Super Admin or Maintenance can modify roles or wallet balances.' });
-    }
-
-    await withTx(async (client) => {
-      // 1. Update user profile
-      const userUpdates = [];
-      const userParams = [];
-      let uIdx = 1;
-      
-      if (username !== undefined) { userUpdates.push(`username = $${uIdx++}`); userParams.push(username); }
-      if (number !== undefined) { userUpdates.push(`number = $${uIdx++}`); userParams.push(number); }
-      if (role !== undefined) { userUpdates.push(`role = $${uIdx++}`); userParams.push(role); }
-      if (banned !== undefined) { userUpdates.push(`banned = $${uIdx++}`); userParams.push(banned); }
-      
-      let userRes;
-      if (userUpdates.length > 0) {
-        userParams.push(req.params.id);
-        const q = `UPDATE users SET ${userUpdates.join(', ')} WHERE id = $${uIdx} RETURNING *`;
-        userRes = await client.query(q, userParams);
-        if (!userRes.rows.length) throw new Error("User not found");
-      }
-
-      // 2. Update wallet balances
-      const walletUpdates = [];
-      const walletParams = [];
-      let wIdx = 1;
-
-      if (available_balance !== undefined) { walletUpdates.push(`available_balance = $${wIdx++}`); walletParams.push(Math.round(Number(available_balance))); }
-      if (bonus_balance !== undefined) { walletUpdates.push(`bonus_balance = $${wIdx++}`); walletParams.push(Math.round(Number(bonus_balance))); }
-      
-      let walletRes;
-      if (walletUpdates.length > 0) {
-        walletParams.push(req.params.id);
-        const q2 = `UPDATE wallets SET ${walletUpdates.join(', ')} WHERE user_id = $${wIdx} RETURNING *`;
-        walletRes = await client.query(q2, walletParams);
-      }
-
-      await logAdminAction(req.user.id, 'updated_user_profile', req.params.id, { username, role, balance: available_balance, bonus: bonus_balance });
-
-      res.json({ ok: true, user: userRes?.rows?.[0], wallet: walletRes?.rows?.[0] });
-    });
-  } catch (err) {
-    if (err.message === "User not found") return res.status(404).json({ error: err.message });
-    console.error('[ADMIN] /users/:id err', err);
-    res.status(500).json({ error: "Failed to update user profile." });
-  }
-});
+// NOTE: Second PATCH /users/:id route removed — it was a duplicate that also modified wallet
+// balances, causing conflicts. All balance changes go through PATCH /admin/users/:id/balance.
 
 // ──────────────────────────────────────────────
 // POST /admin/users

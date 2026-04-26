@@ -335,7 +335,7 @@ router.post('/verify-otp', async (req, res) => {
         role: result.user.role || 'user',
       },
       secret,
-      { expiresIn: '15m' }
+      { expiresIn: '7d' }
     );
 
     const refreshToken = crypto.randomBytes(40).toString('hex');
@@ -570,7 +570,7 @@ router.post('/refresh', async (req, res) => {
         role: user.role || 'user',
       },
       secret,
-      { expiresIn: '15m' }
+      { expiresIn: '7d' }
     );
 
     // Generate new Refresh Token

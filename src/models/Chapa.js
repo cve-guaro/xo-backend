@@ -102,10 +102,24 @@ async function verifyTx(tx_ref, secretKey) {
 }
 
 /**
+ * Verify a TRANSFER (payout) status by tx_ref.
+ * Used by the cron job to check if a payout was delivered.
+ */
+async function getChapaTransferStatus(tx_ref, secretKey) {
+  try {
+    return await chapaFetch(`/transfers/verify/${encodeURIComponent(tx_ref)}`, 'GET', null, secretKey);
+  } catch (err) {
+    // If Chapa returns 404, the transfer reference is not found yet
+    console.warn(`[CHAPA] Transfer verify for ${tx_ref}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Get Chapa balances
  */
 async function getChapaBalance(secretKey) {
   return chapaFetch('/balances', 'GET', null, secretKey);
 }
 
-module.exports = { initChapaDeposit, initChapaPayout, verifyTx, getChapaBalance };
+module.exports = { initChapaDeposit, initChapaPayout, verifyTx, getChapaBalance, getChapaTransferStatus };
