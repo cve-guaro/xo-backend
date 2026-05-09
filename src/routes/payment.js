@@ -63,37 +63,12 @@ const METHODS = [
     return res.status(500).json({ detail: "failed to return payment methods" });
   }
 });
-// Chapa Return Page — After payment completes, close popup and refresh parent
+// Chapa Return Page — After payment completes, redirect to home page
 router.get('/chapa-return', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Payment Complete</title>
-    </head>
-    <body style="background: #060814; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
-      <div style="text-align: center;">
-        <div style="font-size: 48px; margin-bottom: 16px;">✅</div>
-        <p style="font-weight: bold; font-size: 18px; color: #34d399;">Payment Received!</p>
-        <p style="font-size: 13px; color: #888;">Closing this window...</p>
-      </div>
-      <script>
-        // Refresh the parent window (main app) so balance updates
-        try {
-          if (window.opener && !window.opener.closed) {
-            // Send a message to the React Native app to refresh the balance without reloading the page
-            window.opener.postMessage('deposit_success', '*');
-          }
-        } catch(e) {}
-        // Close this popup after a short delay
-        setTimeout(function() {
-          try { window.close(); } catch(e) {}
-        }, 1500);
-      </script>
-    </body>
-    </html>
-  `);
+  const homeUrl = process.env.NODE_ENV === 'production' 
+    ? 'https://xoethiopia.com/home/gameplay' 
+    : 'http://localhost:8081/home/gameplay';
+  res.redirect(homeUrl);
 });
 
 // Intermediate Bounce Page for Telegram/WebView CSRF Fix
