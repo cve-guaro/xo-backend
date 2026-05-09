@@ -1,10 +1,20 @@
 const express = require('express');
+const Sentry = require("@sentry/node");
+
+// ─── SENTRY INITIALIZATION ───────────────────────────────────────────────────
+Sentry.init({
+  dsn: "https://e8add0e934a84e475cc88a4d9c1e1642@o4511351046733824.ingest.us.sentry.io/4511351070392320",
+  environment: process.env.NODE_ENV || "development",
+  tracesSampleRate: 0.2,
+});
+
 const http = require('http');
 const { Server } = require('socket.io');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const Redis = require('ioredis');
 const bodyParser = require("body-parser"); 
 const cors = require('cors');
+const path = require('path');
 require('dotenv').config();
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
@@ -34,8 +44,8 @@ app.use(helmet({
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app"],
-      connectSrc: ["'self'", "https://xo-et-frontend.vercel.app", "https://xoet-pro-frontend.vercel.app", "https://xoethiopia.com", "https://www.xoethiopia.com"],
+      imgSrc: ["'self'", "data:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
+      connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
       frameAncestors: ["'none'"],
       baseUri: ["'self'"],
       formAction: ["'self'"],
@@ -72,10 +82,8 @@ const ALLOWED_ORIGINS = [
   "https://xo-et-frontend.vercel.app",
   "https://xoet-pro-frontend.vercel.app",
 ];
-// Only allow localhost in development
-if (process.env.NODE_ENV !== 'production') {
-  ALLOWED_ORIGINS.push("http://localhost:3000", "http://localhost:8081");
-}
+// Allow localhost for local development/testing
+ALLOWED_ORIGINS.push("http://localhost:3000", "http://localhost:8081", "http://localhost:19006");
 
 const corsOptions = {
   origin: function (origin, callback) {
@@ -92,6 +100,9 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests globally
+
+// Serve uploaded static files
+app.use('/uploads', express.static(path.join(__dirname, '../public/uploads')));
 
 // ─── SOCKET.IO & REDIS ADAPTER ─────────────────────────────────────────────────
 const io = new Server(server, {
@@ -150,18 +161,12 @@ app.use(generalLimiter);
 
 // ─── BODY PARSERS ──────────────────────────────────────────────────────────────
 // Enable raw body capture for all JSON requests to support webhook HMAC signature verification
-app.use(express.raw({ type: 'application/json' }));
-app.use((req, res, next) => {
-  if (req.body instanceof Buffer) {
-    req.rawBody = req.body; // Store exact raw buffer for HMAC checks
-    try {
-      req.body = JSON.parse(req.body.toString());
-    } catch (e) {
-      req.body = {}; // Handle malformed JSON gracefully
-    }
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf; // Store exact raw buffer for HMAC checks
   }
-  next();
-});
+}));
+app.use(express.urlencoded({ extended: true }));
 
 // ─── DETECTION & SECURITY ──────────────────────────────────────────────────────
 app.use(platformDetection);
@@ -222,6 +227,17 @@ app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
 
+// Public route to fetch feature flags and system status
+app.get('/api/features', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist')");
+    const features = {};
+    rows.forEach(r => features[r.key] = r.value);
+    res.json(features);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch features' });
+  }
+});
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
 
@@ -277,11 +293,25 @@ initCron();
         AND (prize_amount IS NULL OR prize_amount = 0);
     `);
 
+    // Create bulk_sms_history table for tracking admin SMS campaigns
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bulk_sms_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        admin_id UUID REFERENCES users(id),
+        message TEXT NOT NULL,
+        filters JSONB DEFAULT '{}',
+        target_count INTEGER DEFAULT 0,
+        success_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+
     console.log('[DB] Migrations applied.');
   } catch (err) {
     console.error('[DB] Migration error:', err);
   }
 })();
+
 
 // ─── CENTRALIZED SECURITY ERROR HANDLER ───────────────────────────────────────
 // Absolutely prevents stack trace or architectural leakage on uncaught crashes

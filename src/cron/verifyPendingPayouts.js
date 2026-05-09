@@ -5,6 +5,7 @@
  */
 const { pool } = require('../db/index');
 const { getChapaTransferStatus } = require('../models/Chapa');
+const { sendWithdrawalSMS } = require('../utils/sms');
 
 async function verifyPendingPayouts() {
   console.log('[CRON] Verifying pending withdrawal payouts...');
@@ -16,7 +17,7 @@ async function verifyPendingPayouts() {
       FROM wallet_transactions
       WHERE tx_type = 'WITHDRAW_REQUEST'
         AND status = 'PENDING'
-        AND created_at < now() - interval '2 minutes'
+        AND created_at < now() - interval '10 seconds'
         AND created_at > now() - interval '48 hours'
       ORDER BY created_at ASC
       LIMIT 20
@@ -47,6 +48,14 @@ async function verifyPendingPayouts() {
             [tx.id]
           );
           console.log(`[CRON] ✅ TX ${tx.id} confirmed DELIVERED — marked COMPLETED`);
+
+          // Send SMS notification to user
+          try {
+            const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [tx.user_id]);
+            const phone = userRow.rows[0]?.number;
+            const uname = userRow.rows[0]?.display_name || userRow.rows[0]?.username;
+            if (phone) sendWithdrawalSMS(phone, Number(tx.amount), uname).catch(e => console.error('[SMS]', e.message));
+          } catch (smsErr) { /* non-critical */ }
 
         } else if (
           status === 'failed' || status === 'cancelled' ||
@@ -104,7 +113,7 @@ async function verifyPendingPayouts() {
         }
 
         // Small delay between Chapa API calls to avoid rate limiting
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 200));
 
       } catch (txErr) {
         console.error(`[CRON] Error verifying TX ${tx.id}:`, txErr.message);

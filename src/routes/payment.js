@@ -63,6 +63,38 @@ const METHODS = [
     return res.status(500).json({ detail: "failed to return payment methods" });
   }
 });
+// Chapa Return Page — After payment completes, close popup and refresh parent
+router.get('/chapa-return', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Payment Complete</title>
+    </head>
+    <body style="background: #060814; color: #fff; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+      <div style="text-align: center;">
+        <div style="font-size: 48px; margin-bottom: 16px;">✅</div>
+        <p style="font-weight: bold; font-size: 18px; color: #34d399;">Payment Received!</p>
+        <p style="font-size: 13px; color: #888;">Closing this window...</p>
+      </div>
+      <script>
+        // Refresh the parent window (main app) so balance updates
+        try {
+          if (window.opener && !window.opener.closed) {
+            // Send a message to the React Native app to refresh the balance without reloading the page
+            window.opener.postMessage('deposit_success', '*');
+          }
+        } catch(e) {}
+        // Close this popup after a short delay
+        setTimeout(function() {
+          try { window.close(); } catch(e) {}
+        }, 1500);
+      </script>
+    </body>
+    </html>
+  `);
+});
 
 // Intermediate Bounce Page for Telegram/WebView CSRF Fix
 router.get('/chapa-bounce', async (req, res) => {
@@ -142,10 +174,10 @@ router.post('/deposit', auth, validate(schemas.deposit), async (req, res) => {
 
 
     // 1. Determine the return destination
-    // After Chapa payment finishes, redirect user back to the gameplay home page
-    const baseUrl = (process.env.FRONTEND_URL || 'https://xoethiopia.com').replace(/\/$/, '');
+    // After Chapa payment finishes, redirect to our chapa-return page which closes the popup and refreshes the main app
+    const backendUrl = (process.env.BACKEND_URL || (process.env.NODE_ENV === 'production' ? 'https://xogpt-production.up.railway.app' : `http://localhost:${process.env.PORT || 2000}`)).replace(/\/$/, '');
     const platformReturnUrl = req.isWeb 
-       ? `${baseUrl}/home/gameplay` 
+       ? `${backendUrl}/payments/chapa-return` 
        : undefined; // Safer to pass undefined for mobile if no scheme is ready
 
     const out = await initDeposit({
@@ -163,8 +195,33 @@ router.post('/deposit', auth, validate(schemas.deposit), async (req, res) => {
     return res.json(out);
   } catch (e) {
     const errorMsg = e.response?.message || e.message || "Deposit init failed";
-    console.error("[DEPOSIT] Error:", e.response || e);
     return res.status(e.status || 500).json({ detail: errorMsg });
+  }
+});
+
+// 1b) CANCEL DEPOSIT (When user closes Chapa popup)
+router.post('/cancel-deposit', auth, async (req, res) => {
+  try {
+    const { txId } = req.body;
+    if (!txId) return res.status(400).json({ detail: "txId required" });
+
+    // Mark as failed only if it belongs to the user and is still pending
+    const result = await pool.query(`
+      UPDATE transactions
+      SET status = 'failed',
+          meta = COALESCE(meta, '{}'::jsonb) || '{"failed_reason": "User cancelled checkout"}'::jsonb
+      WHERE tx_id = $1 AND user_id = $2 AND status = 'pending'
+      RETURNING id
+    `, [txId, req.user.id]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ detail: "Pending deposit not found" });
+    }
+
+    return res.json({ success: true, message: "Deposit cancelled" });
+  } catch (e) {
+    console.error("[DEPOSIT CANCEL] Error:", e);
+    return res.status(500).json({ detail: "Failed to cancel deposit" });
   }
 });
 

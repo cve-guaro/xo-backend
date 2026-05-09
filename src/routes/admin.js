@@ -10,6 +10,10 @@ const { pool, withTx } = require('../db/index');
 const { adminAuth, superAdminAuth } = require('../middleware/Auth');
 const { getChapaBalance } = require('../models/Chapa');
 const { CHAPA } = require('../env');
+const { sendSMS } = require('../utils/sms');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 const router = express.Router();
@@ -723,11 +727,11 @@ router.get('/users/:id', async (req, res) => {
 
 // ──────────────────────────────────────────────
 // PATCH /admin/users/:id
-// Profile-only edit (username, number, role). Balance changes go through /users/:id/balance.
+// Profile-only edit (username, number, full_name, role). Balance changes go through /users/:id/balance.
 // ──────────────────────────────────────────────
 router.patch('/users/:id', async (req, res) => {
   try {
-    const { username, number, role } = req.body;
+    const { username, number, role, full_name } = req.body;
     
     // Build dynamic update — only update provided fields
     const updates = [];
@@ -735,7 +739,12 @@ router.patch('/users/:id', async (req, res) => {
     let idx = 1;
     if (username !== undefined) { updates.push(`username = $${idx++}`); params.push(username); }
     if (number !== undefined) { updates.push(`number = $${idx++}`); params.push(number); }
+    if (full_name !== undefined) { updates.push(`display_name = $${idx++}`); params.push(full_name); }
     if (role !== undefined) {
+      // Block superadmin assignment through API — superadmin can only be set directly in DB
+      if (role === 'superadmin') {
+        return res.status(403).json({ error: 'Superadmin role cannot be assigned through the API.' });
+      }
       const hasAccess = req.user.role === 'superadmin' || req.user.role === 'maintenance' || req.user.role === 'maintenance_admin';
       if (!hasAccess) return res.status(403).json({ error: 'Permission denied: Cannot modify roles.' });
       updates.push(`role = $${idx++}`); params.push(role);
@@ -749,7 +758,7 @@ router.patch('/users/:id', async (req, res) => {
     // NOTE: Wallet balances are NOT modified here.
     // Use PATCH /admin/users/:id/balance for balance changes.
 
-    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, role });
+    await logAdminAction(req.user.id, 'edit_user_profile', req.params.id, { username, number, full_name, role });
 
     return res.json({ ok: true });
   } catch (err) {
@@ -865,7 +874,7 @@ router.patch('/users/:id/role', superAdminAuth, async (req, res) => {
 // ──────────────────────────────────────────────
 router.post('/users', async (req, res) => {
   try {
-    const { username, number, role, balance } = req.body;
+    const { display_name, username, number, role } = req.body;
     if (!username || !number) return res.status(400).json({ error: "Username and Number are required." });
 
     if (role && role !== 'user' && !['admin', 'superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
@@ -875,19 +884,18 @@ router.post('/users', async (req, res) => {
     const newUser = await withTx(async (client) => {
       // 1. Create User
       const userRes = await client.query(
-        `INSERT INTO users (username, number, role) VALUES ($1, $2, $3) RETURNING *`,
-        [username, number, role || 'user']
+        `INSERT INTO users (display_name, username, number, role) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [display_name || '', username, number, role || 'user']
       );
       const user = userRes.rows[0];
 
-      // 2. Initialize Wallet
-      const balCents = Math.round(Number(balance || 0));
+      // 2. Initialize Wallet with 0 balance
       await client.query(
         `INSERT INTO wallets (user_id, available_balance, bonus_balance) VALUES ($1, $2, $3)`,
-        [user.id, balCents, 0]
+        [user.id, 0, 0]
       );
 
-      await logAdminAction(req.user.id, 'created_user_manual', user.id, { username, role, balance });
+      await logAdminAction(req.user.id, 'created_user_manual', user.id, { display_name, username, role });
       return user;
     });
 
@@ -937,52 +945,107 @@ router.delete('/users/:id', async (req, res) => {
 
 // ──────────────────────────────────────────────
 // GET /admin/users/:id/360
-// Aggregates history and transactions
+// Full 360-degree user detail for admin
 // ──────────────────────────────────────────────
 router.get('/users/:id/360', async (req, res) => {
   try {
     const userId = req.params.id;
-    const statsQuery = `
-      SELECT 
-        COUNT(*) FILTER (WHERE winner = $1::uuid) as wins,
-        COUNT(*) FILTER (WHERE winner IS NOT NULL AND winner != $1::uuid) as losses,
-        COUNT(*) as total_games
-      FROM games 
-      WHERE (player_x = $1::uuid OR player_o = $1::uuid)
-        AND status NOT IN ('ongoing', 'live')
-    `;
-    const txQuery = `
-      SELECT id, tx_type as type, amount, status, provider as bank, provider_ref as tx_ref, created_at FROM wallet_transactions 
-      WHERE user_id = $1 
-        AND LOWER(status::text) IN ('completed', 'settled', 'success')
-        AND LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled')
-      ORDER BY created_at DESC LIMIT 50
-    `;
-    const gamesQuery = `
-      SELECT id, status, winner, bet_amount, created_at
-      FROM games
-      WHERE player_x = $1 OR player_o = $1
-      ORDER BY created_at DESC LIMIT 50
-    `;
 
-    const [statsRes, txsRes, gamesRes] = await Promise.all([
-      pool.query(statsQuery, [userId]),
-      pool.query(txQuery, [userId]),
-      pool.query(gamesQuery, [userId])
-    ]);
+    // 1) User profile
+    const userRes = await pool.query(
+      `SELECT id, username, number, role, banned, created_at, display_name,
+              COALESCE(r1_10_wins, 0) as r1_10_wins, COALESCE(r1_25_wins, 0) as r1_25_wins,
+              COALESCE(r1_50_wins, 0) as r1_50_wins, COALESCE(r1_99_wins, 0) as r1_99_wins
+       FROM users WHERE id = $1`, [userId]
+    );
+    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = userRes.rows[0];
 
-    return res.json({ 
-      ok: true, 
-      games: {
-        wins: Number(statsRes.rows[0].wins || 0),
-        losses: Number(statsRes.rows[0].losses || 0),
-        total: Number(statsRes.rows[0].total_games || 0)
-      },
-      txs: txsRes.rows,
-      recent_games: gamesRes.rows
-    });
+    // 2) Wallet (safe)
+    let wallet = { available: 0, withdrawable: 0, bonus: 0 };
+    try {
+      const walletRes = await pool.query(
+        `SELECT available_balance, withdrawable_balance, bonus_balance FROM wallets WHERE user_id = $1`, [userId]
+      );
+      if (walletRes.rows.length) {
+        wallet = {
+          available: Number(walletRes.rows[0].available_balance || 0),
+          withdrawable: Number(walletRes.rows[0].withdrawable_balance || 0),
+          bonus: Number(walletRes.rows[0].bonus_balance || 0),
+        };
+      }
+    } catch (e) { console.warn('[360] wallet query failed:', e.message); }
+
+    // 3) Game stats (safe)
+    let stats = { totalGames: 0, wins: 0, losses: 0, draws: 0 };
+    try {
+      const statsRes = await pool.query(`
+        SELECT
+          COUNT(*) as total_games,
+          SUM(CASE WHEN winner = $1 THEN 1 ELSE 0 END) as wins,
+          SUM(CASE WHEN winner IS NOT NULL AND winner != $1 THEN 1 ELSE 0 END) as losses,
+          SUM(CASE WHEN winner IS NULL AND status = 'completed' THEN 1 ELSE 0 END) as draws
+        FROM games WHERE (player_x = $1 OR player_o = $1) AND status = 'completed'
+      `, [userId]);
+      if (statsRes.rows.length) {
+        stats = {
+          totalGames: Number(statsRes.rows[0].total_games || 0),
+          wins: Number(statsRes.rows[0].wins || 0),
+          losses: Number(statsRes.rows[0].losses || 0),
+          draws: Number(statsRes.rows[0].draws || 0),
+        };
+      }
+    } catch (e) { console.warn('[360] stats query failed:', e.message); }
+
+    // 4) Game history (last 50)
+    let games = [];
+    try {
+      const gamesRes = await pool.query(`
+        SELECT g.id, g.player_x, g.player_o, g.winner, g.bet_amount, g.status,
+               g.finished_at, g.created_at,
+               ux.username as player_x_name, uo.username as player_o_name
+        FROM games g
+        LEFT JOIN users ux ON g.player_x = ux.id
+        LEFT JOIN users uo ON g.player_o = uo.id
+        WHERE (g.player_x = $1 OR g.player_o = $1)
+        ORDER BY g.created_at DESC LIMIT 50
+      `, [userId]);
+      games = gamesRes.rows;
+    } catch (e) { console.warn('[360] games query failed:', e.message); }
+
+    // 5) Transactions (last 50)
+    let transactions = [];
+    try {
+      const txRes = await pool.query(`
+        SELECT id, tx_type as type, amount, status, created_at
+        FROM wallet_transactions
+        WHERE user_id = $1
+        ORDER BY created_at DESC LIMIT 50
+      `, [userId]);
+      transactions = txRes.rows.map(r => ({ ...r, amount: Number(r.amount || 0), createdAt: r.created_at }));
+    } catch (e) { console.warn('[360] transactions query failed:', e.message); }
+
+    // 6) Totals
+    let totals = { totalDeposited: 0, totalWithdrawn: 0 };
+    try {
+      const totalsRes = await pool.query(`
+        SELECT
+          COALESCE(SUM(CASE WHEN tx_type = 'DEPOSIT' AND status = 'COMPLETED' THEN amount ELSE 0 END), 0) as total_deposited,
+          COALESCE(SUM(CASE WHEN tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END), 0) as total_withdrawn
+        FROM wallet_transactions WHERE user_id = $1
+      `, [userId]);
+      if (totalsRes.rows.length) {
+        totals = {
+          totalDeposited: Number(totalsRes.rows[0].total_deposited || 0),
+          totalWithdrawn: Number(totalsRes.rows[0].total_withdrawn || 0),
+        };
+      }
+    } catch (e) { console.warn('[360] totals query failed:', e.message); }
+
+    return res.json({ user, wallet, stats, games, transactions, totals });
   } catch (err) {
-    return res.status(500).json({ error: "Failed to fetch 360 data." });
+    console.error('[ADMIN] /users/:id/360 error', err);
+    return res.status(500).json({ error: 'Failed to fetch user detail' });
   }
 });
 
@@ -1648,6 +1711,264 @@ router.get('/promotion-links/:id/claims', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] GET /promotion-links/:id/claims err', err);
     res.status(500).json({ error: 'Failed to fetch claims' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// Maintenance & Feature Settings
+// ──────────────────────────────────────────────
+router.get('/maintenance/settings', async (req, res) => {
+  try {
+    if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist')");
+    const settings = {};
+    rows.forEach(r => settings[r.key] = r.value);
+    res.json(settings);
+  } catch (err) {
+    console.error('[ADMIN] GET /maintenance/settings err', err);
+    res.status(500).json({ error: 'Failed to fetch maintenance settings' });
+  }
+});
+
+router.post('/maintenance/settings', async (req, res) => {
+  try {
+    if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    const { key, value } = req.body;
+    if (!key) return res.status(400).json({ error: 'Missing key' });
+    
+    await pool.query(
+      `INSERT INTO global_settings (key, value) VALUES ($1, $2::jsonb) 
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [key, JSON.stringify(value)]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ADMIN] POST /maintenance/settings err', err);
+    res.status(500).json({ error: 'Failed to update maintenance settings' });
+  }
+});
+
+router.post('/maintenance/whitelist', async (req, res) => {
+  try {
+    if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    const { identifier } = req.body; // Phone number or username
+    if (!identifier) return res.status(400).json({ error: 'Missing identifier' });
+    
+    const { rows } = await pool.query("SELECT value FROM global_settings WHERE key = 'lockdown_whitelist'");
+    let whitelist = rows.length > 0 ? rows[0].value : [];
+    if (!Array.isArray(whitelist)) whitelist = [];
+    
+    if (!whitelist.includes(identifier)) {
+      whitelist.push(identifier);
+      await pool.query(
+        `INSERT INTO global_settings (key, value) VALUES ('lockdown_whitelist', $1::jsonb) 
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [JSON.stringify(whitelist)]
+      );
+    }
+    res.json({ ok: true, whitelist });
+  } catch (err) {
+    console.error('[ADMIN] POST /maintenance/whitelist err', err);
+    res.status(500).json({ error: 'Failed to update whitelist' });
+  }
+});
+
+router.post('/maintenance/whitelist/remove', async (req, res) => {
+  try {
+    if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    const { identifier } = req.body;
+    if (!identifier) return res.status(400).json({ error: 'Missing identifier' });
+    
+    const { rows } = await pool.query("SELECT value FROM global_settings WHERE key = 'lockdown_whitelist'");
+    let whitelist = rows.length > 0 ? rows[0].value : [];
+    if (!Array.isArray(whitelist)) whitelist = [];
+    
+    whitelist = whitelist.filter(id => id !== identifier);
+    await pool.query(
+      `UPDATE global_settings SET value = $1::jsonb, updated_at = NOW() WHERE key = 'lockdown_whitelist'`,
+      [JSON.stringify(whitelist)]
+    );
+    res.json({ ok: true, whitelist });
+  } catch (err) {
+    console.error('[ADMIN] POST /maintenance/whitelist/remove err', err);
+    res.status(500).json({ error: 'Failed to update whitelist' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// Bulk SMS & Image Upload (Promotions)
+// ──────────────────────────────────────────────
+
+router.get('/promo-popup', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT value FROM global_settings WHERE key = 'promo_popup_config'");
+    const config = rows.length > 0 ? rows[0].value : { image_url: '', display_duration: 5, expires_at: null, is_active: false };
+    res.json({ ok: true, config });
+  } catch (err) {
+    console.error('[ADMIN] GET /promo-popup err', err);
+    res.status(500).json({ error: 'Failed to fetch promo popup config' });
+  }
+});
+
+router.post('/promo-popup', async (req, res) => {
+  try {
+    const { image_url, display_duration, expires_at, is_active } = req.body;
+    const config = { image_url, display_duration, expires_at, is_active };
+    await pool.query(`
+      INSERT INTO global_settings (key, value)
+      VALUES ('promo_popup_config', $1::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    `, [JSON.stringify(config)]);
+    res.json({ ok: true, config });
+  } catch (err) {
+    console.error('[ADMIN] POST /promo-popup err', err);
+    res.status(500).json({ error: 'Failed to save promo popup config' });
+  }
+});
+
+router.post('/bulk-sms', async (req, res) => {
+  try {
+    const { message, role, min_balance, max_balance, min_wins, specific_phone } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message is required' });
+
+    let query = `
+      SELECT u.number, u.username 
+      FROM users u
+      LEFT JOIN wallets w ON u.id = w.user_id
+      WHERE u.number IS NOT NULL AND u.number != '' AND u.banned = false
+    `;
+    const params = [];
+    let paramIdx = 1;
+
+    // Filters
+    if (specific_phone) {
+      const phones = specific_phone.split(',').map(p => p.trim()).filter(Boolean);
+      const phoneList = [];
+      for (let p of phones) {
+        phoneList.push(p);
+        
+        const digits = p.replace(/\D/g, '');
+        let core = '';
+        if (digits.length === 9) core = digits;
+        else if (digits.length === 10 && digits.startsWith('0')) core = digits.slice(1);
+        else if (digits.length === 12 && digits.startsWith('251')) core = digits.slice(3);
+        
+        if (core) {
+            phoneList.push('0' + core);
+            phoneList.push('251' + core);
+            phoneList.push('+251' + core);
+        }
+      }
+      query += ` AND u.number = ANY($${paramIdx}::text[])`;
+      params.push(phoneList);
+      paramIdx++;
+    } else {
+      if (role && role !== 'all') {
+        query += ` AND u.role = $${paramIdx}`;
+        params.push(role);
+        paramIdx++;
+      }
+      if (min_balance !== undefined && min_balance !== null) {
+        query += ` AND w.available_balance >= $${paramIdx}`;
+        params.push(Number(min_balance));
+        paramIdx++;
+      }
+      if (max_balance !== undefined && max_balance !== null) {
+        query += ` AND w.available_balance <= $${paramIdx}`;
+        params.push(Number(max_balance));
+        paramIdx++;
+      }
+      if (min_wins !== undefined && min_wins !== null) {
+        query += ` AND u.room_1_wins >= $${paramIdx}`;
+        params.push(Number(min_wins));
+        paramIdx++;
+      }
+    }
+
+    const { rows } = await pool.query(query, params);
+    if (rows.length === 0) return res.json({ ok: true, queuedCount: 0, message: 'No users matched criteria' });
+
+    // Send SMS sequentially
+    let successCount = 0;
+    for (const user of rows) {
+      if (user.number) {
+        const { sendSMS } = require('../utils/sms');
+        const success = await sendSMS(user.number, message).catch(() => false);
+        if (success) successCount++;
+      }
+    }
+
+    // Log history
+    await pool.query(`
+      INSERT INTO bulk_sms_history (admin_id, message, filters, target_count, success_count)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [
+      req.user.id, 
+      message, 
+      JSON.stringify({ role, min_balance, max_balance, min_wins, specific_phone }), 
+      rows.length, 
+      successCount
+    ]);
+
+    res.json({ ok: true, queuedCount: rows.length, successCount, message: `Queued SMS for ${rows.length} users.` });
+  } catch (err) {
+    console.error('[ADMIN] POST /bulk-sms err', err);
+    res.status(500).json({ error: 'Failed to queue bulk SMS' });
+  }
+});
+
+router.get('/bulk-sms/history', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT b.*, u.username as admin_name
+      FROM bulk_sms_history b
+      LEFT JOIN users u ON b.admin_id = u.id
+      ORDER BY b.created_at DESC
+      LIMIT 50
+    `);
+    res.json({ ok: true, history: rows });
+  } catch (err) {
+    console.error('[ADMIN] GET /bulk-sms/history err', err);
+    res.status(500).json({ error: 'Failed to fetch bulk SMS history' });
+  }
+});
+
+// Set up multer for local uploads (prep for Supabase)
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, '../../public/uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+const upload = multer({ storage: storage });
+
+router.post('/upload-promo', upload.single('image'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    // Return the local URL which the frontend can use
+    // When migrating to Supabase Storage, we would upload the buffer here instead
+    const fileUrl = `/uploads/${req.file.filename}`;
+    res.json({ ok: true, url: fileUrl });
+  } catch (err) {
+    console.error('[ADMIN] POST /upload-promo err', err);
+    res.status(500).json({ error: 'Failed to upload image' });
   }
 });
 

@@ -185,9 +185,32 @@ function findSocketByUser(io, userId) {
 }
 function emitToUser(io, userId, event, payload) {
   const roomName = userRoom(userId);
-  console.log(`[EMIT] Sending '${event}' to user ${userId} in room ${roomName}`);
-  console.log(`[EMIT] Payload keys:`, Object.keys(payload || {}));
-  io.to(roomName).emit(event, payload);
+  const uid = String(userId);
+  let delivered = 0;
+  
+  // PRIMARY: Scan ALL connected sockets and emit directly to every socket belonging to this user
+  // This is the most reliable method — doesn't depend on room join working correctly
+  for (const [socketId, socket] of io.sockets.sockets) {
+    const sockUserId = socket.data?.userId;
+    if (sockUserId && String(sockUserId) === uid) {
+      socket.emit(event, payload);
+      delivered++;
+      // Also ensure they're in their room for future emits
+      try { socket.join(roomName); } catch {}
+    }
+  }
+  
+  // SECONDARY: Also emit to the room in case we missed any (e.g. Redis adapter cross-node)
+  const room = io.sockets.adapter.rooms.get(roomName);
+  const roomSize = room ? room.size : 0;
+  if (roomSize > 0) {
+    io.to(roomName).emit(event, payload);
+  }
+  
+  console.log(`[EMIT] '${event}' → user ${userId} | direct_sockets=${delivered} | room_size=${roomSize}`);
+  if (delivered === 0 && roomSize === 0) {
+    console.log(`[EMIT] ❌ No socket found for user ${userId} — they may be offline`);
+  }
 }
 
 // === REMATCH: helpers ===============================================
@@ -335,29 +358,39 @@ async function startDirectMatch(io, userA, userB, betAmount) {
   await redis.set(`in_game:${X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
   await redis.set(`in_game:${O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
 
+  const usersRes = await pool.query(`SELECT id, username FROM users WHERE id = ANY($1::uuid[])`, [[X, O]]);
+  const userMap = {};
+  for (const r of usersRes.rows) userMap[r.id] = r.username;
+  const nameX = userMap[X] || "Player X";
+  const nameO = userMap[O] || "Player O";
+
   const payloadX = {
     matchId,
     youAre: "X",
     symbol: "X",
     opponentId: O,
+    opponentUsername: nameO,
     opponentSymbol: "O",
     players: { X, O },
     betAmount,
     room: roomNumber,
     roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
-    timerDuration: initialTimer
+    timerDuration: initialTimer,
+    houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
   };
   const payloadO = {
     matchId,
     youAre: "O",
     symbol: "O",
     opponentId: X,
+    opponentUsername: nameX,
     opponentSymbol: "X",
     players: { X, O },
     betAmount,
     room: roomNumber,
     roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
-    timerDuration: initialTimer
+    timerDuration: initialTimer,
+    houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
   };
 
   // ✅ Emit by user room so both sides *definitely* receive it
@@ -580,8 +613,7 @@ function cleanupGame(matchId) {
   if (game.reconnectTimeout) clearTimeout(game.reconnectTimeout);
   if (game.startTimeout) clearTimeout(game.startTimeout); // clear pending start
   const { X, O } = game.players || {};
-  if (X) redis.del(`in_game:${X}`).catch(() => { });
-  if (O) redis.del(`in_game:${O}`).catch(() => { });
+  // DO NOT delete in_game here, wait for leave_room so they appear "in_game" while on results screen
   activeGames.delete(matchId);
   dbg("cleanupGame", { matchId });
 }
@@ -683,6 +715,24 @@ function setupGameSocket(io) {
       } catch { }
     }
 
+    // === AUTO-REGISTER: Join user's personal room on connect =========
+    // This ensures emitToUser() works even before find_match/friend_invite
+    // Critical for: rematch_offer, friend_invite_received arriving on home page
+    try {
+      const tkn = socket.handshake.auth?.token;
+      if (tkn) {
+        const decoded = jwt.verify(tkn, JWT_SECRET);
+        if (decoded?.sub) {
+          const uid = decoded.sub || decoded.id;
+          rememberUser(uid);
+          rememberUserSocket(socket, uid);
+          console.log(`[CONNECT] User ${uid} auto-registered on socket connect`);
+        }
+      }
+    } catch (e) {
+      // Token invalid/expired — user just isn't auto-registered, no harm
+    }
+
     // ------- Matchmaking -------
     socket.on("find_match", async ({ token, betAmount }, ack) => {
       const rid = shortId();
@@ -701,7 +751,7 @@ function setupGameSocket(io) {
       logAlways(`ENTER find_match rid=${rid} sid=${socket.id} bet=${betAmount} platform=${platform}`);
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        userId = decoded.sub;
+        userId = decoded.sub || decoded.id;
         console.log(`[MM] Token verified for user: ${userId}`);
         
         // --- STRICT PAYLOAD SANITIZATION (Security Pen Test Patch) ---
@@ -1068,7 +1118,7 @@ function setupGameSocket(io) {
       let userId = null;
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        userId = decoded.sub;
+        userId = decoded.sub || decoded.id;
         
         // CRITICAL: If already matched/in-game, deny cancellation
         const inGameId = await redis.get(`in_game:${userId}`).catch(() => null);
@@ -1093,6 +1143,147 @@ function setupGameSocket(io) {
       }
     });
 
+    // -------------------------------------------------------
+    // AUTO-REGISTER on connect: decode auth token from handshake
+    // -------------------------------------------------------
+    try {
+      const tkn = socket.handshake.auth?.token;
+      if (tkn) {
+        const decoded = jwt.verify(tkn, JWT_SECRET);
+        const uid = decoded.sub || decoded.userId || decoded.id;
+        if (uid) {
+          rememberUser(uid);
+          rememberUserSocket(socket, uid);
+          console.log(`[CONNECT] User ${uid} auto-registered on socket connect`);
+        }
+      }
+    } catch { /* token invalid/expired — will be caught later on actual events */ }
+
+    // Cleanup on disconnect
+    socket.on("disconnect", () => {
+      const uid = socket.data?.userId;
+      if (uid) {
+        removeUserSocket(uid, socket.id);
+      }
+    });
+
+    // -------------------------------------------------------
+    // FRIEND INVITE (lookup + send)
+    // -------------------------------------------------------
+    socket.on("friend_invite", async ({ token: tkn, targetUsername, betAmount: rawBet }) => {
+      try {
+        const decoded = jwt.verify(tkn, JWT_SECRET);
+        const senderId = decoded.sub || decoded.id;
+        rememberUser(senderId);
+        rememberUserSocket(socket, senderId);
+
+        const safeBet = Number(rawBet) || 0;
+        const isLookupOnly = safeBet <= 0;
+
+        // Validate bet only when actually sending an invite (not lookup)
+        if (!isLookupOnly && (!Number.isFinite(safeBet) || safeBet <= 0)) {
+          return socket.emit("friend_invite_result", { ok: false, reason: "invalid_bet" });
+        }
+
+        // Fetch target with win caps (no balance exposed)
+        const targetRes = await pool.query(
+          `SELECT u.id, u.username, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
+                  COALESCE(w.available_balance,0)+COALESCE(w.bonus_balance,0) as balance
+           FROM users u LEFT JOIN wallets w ON u.id=w.user_id
+           WHERE LOWER(u.username)=LOWER($1)`, [targetUsername]
+        );
+        if (!targetRes.rows.length) return socket.emit("friend_invite_result", { ok: false, reason: "user_not_found" });
+        const target = targetRes.rows[0];
+        if (target.id === senderId) return socket.emit("friend_invite_result", { ok: false, reason: "cannot_invite_self" });
+
+        // Online detection: check userSockets map + active socket connections
+        const targetOnline = userSockets.has(target.id);
+        const inGame = await redis.get(`in_game:${target.id}`).catch(() => null);
+        const status = inGame ? "in_game" : (targetOnline ? "online" : "offline");
+
+        // Sender balance + caps
+        const senderRes = await pool.query(
+          `SELECT COALESCE(w.available_balance,0)+COALESCE(w.bonus_balance,0) as balance,
+                  u.username, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins
+           FROM users u LEFT JOIN wallets w ON u.id=w.user_id
+           WHERE u.id=$1`, [senderId]
+        );
+        const sender = senderRes.rows[0] || {};
+        const senderUsername = sender.username || decoded.username || 'Player';
+        const senderBalance = Number(sender.balance || 0);
+
+        // Build caps for lock checks
+        const senderCaps = { r1_10: sender.r1_10_wins || 0, r1_25: sender.r1_25_wins || 0, r1_50: sender.r1_50_wins || 0, r1_99: sender.r1_99_wins || 0 };
+        const targetCaps = { r1_10: target.r1_10_wins || 0, r1_25: target.r1_25_wins || 0, r1_50: target.r1_50_wins || 0, r1_99: target.r1_99_wins || 0 };
+        const targetBalance = Number(target.balance || 0);
+
+        socket.emit("friend_invite_result", {
+          ok: true,
+          target: { id: target.id, username: target.username, status },
+          senderBalance,
+          targetBalance,
+          senderCaps,
+          targetCaps,
+          betAmount: safeBet,
+        });
+
+        // Only send the actual invite if a real bet was specified and target is online
+        if (!isLookupOnly && status === "online") {
+          // Race condition guard: use sorted pair key so A→B and B→A share the same lock
+          const pairKey = [senderId, target.id].sort().join(":");
+          const inviteKey = `friend_inv:${pairKey}`;
+          const existing = await redis.get(inviteKey).catch(() => null);
+
+          if (existing) {
+            // An invite already exists for this pair — check if it's the OTHER player inviting US
+            const existingData = JSON.parse(existing);
+            if (existingData.senderId === target.id) {
+              // Mutual invite! Auto-accept: the first sender's invite wins
+              await redis.del(inviteKey);
+              console.log(`[FRIEND MATCH] Mutual invite detected: ${senderId} <-> ${target.id}, auto-starting match`);
+              try {
+                const result = await startDirectMatch(io, existingData.senderId, senderId, safeBet);
+                console.log(`[FRIEND MATCH] Mutual match started: ${result.matchId}`);
+              } catch (e) {
+                console.error("[FRIEND MATCH] Mutual match failed:", e.message);
+                socket.emit("error", { message: e.message || "Failed to start friend match" });
+              }
+              return;
+            }
+            // Same sender re-sending — just update the TTL
+          }
+
+          await redis.set(inviteKey, JSON.stringify({ senderId, senderName: senderUsername, targetId: target.id, betAmount: safeBet }), "PX", 45000);
+          emitToUser(io, target.id, "friend_invite_received", { fromUserId: senderId, fromUsername: senderUsername, betAmount: safeBet });
+        }
+      } catch (e) { socket.emit("friend_invite_result", { ok: false, reason: "invite_failed" }); }
+    });
+
+    // -------------------------------------------------------
+    // FRIEND INVITE RESPONSE (accept/decline)
+    // -------------------------------------------------------
+    socket.on("friend_invite_response", async ({ token: tkn, senderId, accept, betAmount }) => {
+      try {
+        const decoded = jwt.verify(tkn, JWT_SECRET);
+        const responderId = decoded.sub || decoded.id;
+        rememberUser(responderId);
+        const pairKey = [senderId, responderId].sort().join(":");
+        const inviteKey = `friend_inv:${pairKey}`;
+        const raw = await redis.get(inviteKey);
+        if (!raw) return socket.emit("error", { message: "Invite expired" });
+        await redis.del(inviteKey);
+        if (!accept) {
+          // Fetch responder username so sender sees who declined
+          const responderRes = await pool.query(`SELECT username FROM users WHERE id=$1`, [responderId]);
+          const responderName = responderRes.rows[0]?.username || 'Your friend';
+          emitToUser(io, senderId, "friend_invite_declined", { byUserId: responderId, byUsername: responderName });
+          return;
+        }
+        const result = await startDirectMatch(io, senderId, responderId, Number(betAmount));
+        console.log(`[FRIEND MATCH] Started: ${result.matchId}`);
+      } catch (e) { socket.emit("error", { message: e.message || "Failed to start friend match" }); }
+    });
+
     // ---------------- Moves ----------------
     socket.on("make_move", async ({ matchId, index }) => {
       const game = activeGames.get(matchId);
@@ -1113,7 +1304,7 @@ function setupGameSocket(io) {
       saveMove(matchId, moveObj).catch(e => console.error("saveMove error:", e));
 
       io.to(matchId).emit("move_made", {
-        index, symbol, board: game.board, turn: game.turn, timers: game.timers,
+        index, symbol, board: game.board, turn: game.turn, timers: game.timers, round: game.round || 1,
       });
 
       startTimer(io, matchId);
@@ -1175,8 +1366,8 @@ function setupGameSocket(io) {
           roomName: game.room ? ROOMS_CONFIG[game.room].name : null
         };
 
-        if (game.sockets.X) game.sockets.X.emit("new_round", roundPayloadX);
-        if (game.sockets.O) game.sockets.O.emit("new_round", roundPayloadO);
+        emitToUser(io, game.players.X, "new_round", roundPayloadX);
+        emitToUser(io, game.players.O, "new_round", roundPayloadO);
 
         // No pre-match delay on subsequent rounds, timer just restarts
         startTimer(io, matchId);
@@ -1200,13 +1391,20 @@ function setupGameSocket(io) {
         const prizeBirr = Number(prize); // TRANSLATOR: Send Birr
 
         await finishAndPayout(matchId, opponentSymbol, winnerId, prize).catch(e => console.error(e));
-        if (game.sockets[opponentSymbol]) game.sockets[opponentSymbol].emit("opponent_forfeited", { prizeAmount: prizeBirr });
+        emitToUser(io, game.players[opponentSymbol], "opponent_forfeited", { prizeAmount: prizeBirr });
         io.to(matchId).emit("game_won", { winnerSymbol: opponentSymbol, winnerId, reason: "opponent_left", prizeAmount: prizeBirr });
         cleanupGame(matchId);
         if (typeof ack === "function") ack({ ok: true, data: { done: true } });
       } catch (e) {
         if (typeof ack === "function") ack({ ok: false, error: "Leave failed" });
       }
+    });
+
+    socket.on("leave_room", async ({ token }) => {
+      try {
+        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        await redis.del(`in_game:${userId}`).catch(() => {});
+      } catch (e) { }
     });
 
     // ---------------- Disconnect / Reconnect ----------------
@@ -1253,8 +1451,7 @@ function setupGameSocket(io) {
         await finishAndPayout(matchId, opponentSymbol, winnerId, prize).catch(err =>
           console.error("finishAndPayout forfeit err:", err)
         );
-        const oppSock = game.sockets[opponentSymbol];
-        if (oppSock) oppSock.emit("opponent_forfeited");
+        emitToUser(io, game.players[opponentSymbol], "opponent_forfeited");
         cleanupGame(matchId);
       }, RECONNECT_GRACE);
     });
@@ -1262,7 +1459,8 @@ function setupGameSocket(io) {
     // === REMATCH: Sender requests a rematch ===========================
     socket.on("rematch_request", async ({ token, opponentId, amount }, ack) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const userId = decoded.sub || decoded.id;
         socket.data = { ...(socket.data || {}), userId };
 
         amount = Number(amount || 0);
@@ -1275,8 +1473,15 @@ function setupGameSocket(io) {
         });
         if (!lockOk) return ack?.({ ok: false, error: "Busy" });
 
+        // Fetch sender's username for the offer notification
+        let fromUsername = "Opponent";
+        try {
+          const userRow = await pool.query("SELECT username, number FROM users WHERE id = $1", [userId]);
+          if (userRow.rows.length) fromUsername = userRow.rows[0].username || `User ${(userRow.rows[0].number || '').slice(-4)}`;
+        } catch (e) { /* fallback to "Opponent" */ }
+
         socket.emit("rematch_waiting", { opponentId, amount, ttlMs: REMATCH_TTL });
-        emitToUser(io, opponentId, "rematch_offer", { fromUserId: userId, amount });
+        emitToUser(io, opponentId, "rematch_offer", { fromUserId: userId, fromUsername, amount });
 
         ack?.({ ok: true });
       } catch (e) {
@@ -1284,10 +1489,16 @@ function setupGameSocket(io) {
       }
     });
 
+    // === EMOJI: Send emoji to opponent ================================
+    socket.on("send_emoji", ({ matchId, emoji }) => {
+      socket.to(matchId).emit("emoji_received", { emoji });
+    });
+
     // === REMATCH: Receiver answers (accept/decline) ===================
     socket.on("rematch_response", async ({ token, opponentId, accept, amount }, ack) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const userId = decoded.sub || decoded.id;
         socket.data = { ...(socket.data || {}), userId };
 
         amount = Number(amount || 0);

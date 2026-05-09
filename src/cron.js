@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const { pool } = require('./db'); // Assuming pool is exported from db/index.js
 const { verifyPendingPayouts } = require('./cron/verifyPendingPayouts');
+const { verifyPendingDeposits } = require('./cron/verifyPendingDeposits');
 
 function initCron() {
   console.log('[CRON] Initializing background scheduler...');
@@ -95,13 +96,32 @@ function initCron() {
      }
   });
 
-  // 4) 💳 Verify Pending Payouts (Runs every 15 minutes)
-  // Checks Chapa transfer status and auto-refunds if Chapa failed/cancelled
-  cron.schedule('*/15 * * * *', async () => {
+  // 4) 💳 Verify Pending Payouts (Runs every 30 seconds for fast processing)
+  // Checks Chapa transfer status and auto-completes/refunds instantly
+  cron.schedule('*/1 * * * *', async () => {
     try {
       await verifyPendingPayouts();
     } catch (err) {
       console.error('[CRON] Task 4 (verifyPendingPayouts) Error:', err.message);
+    }
+  });
+
+  // Run payouts verification every 30 seconds (node-cron doesn't support sub-minute, so use setInterval)
+  setInterval(async () => {
+    try {
+      await verifyPendingPayouts();
+    } catch (err) {
+      console.error('[CRON] Fast payout check error:', err.message);
+    }
+  }, 30_000);
+
+  // 5) 💰 Verify Pending Deposits (Runs every 90 seconds — secondary safety net)
+  // Checks Chapa payment status for deposits that missed the webhook
+  cron.schedule('*/2 * * * *', async () => {
+    try {
+      await verifyPendingDeposits();
+    } catch (err) {
+      console.error('[CRON] Task 5 (verifyPendingDeposits) Error:', err.message);
     }
   });
 

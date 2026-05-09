@@ -3,6 +3,7 @@ const { pool, withTx } = require("../db/index.js");
 const { SQL } = require("./payments.sql.js");
 const { initChapaDeposit, initChapaPayout } = require("./Chapa.js");
 const { CHAPA } = require("../env.js");
+const { sendDepositSMS, sendWithdrawalSMS } = require("../utils/sms.js");
 
 function hash20(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 20);
@@ -293,23 +294,59 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     }
 
     // NOTE: Chapa 'success' only means transfer was QUEUED, not delivered.
-    // The cron job (verifyPendingPayouts) will poll Chapa every 15 min to confirm delivery
-    // and mark COMPLETED only when Chapa confirms the money was actually sent.
+    // Trigger an immediate verification check after a short delay (8s)
+    // so the user doesn't wait for the next cron cycle.
+    setTimeout(async () => {
+      try {
+        const { verifyPendingPayouts } = require('../cron/verifyPendingPayouts');
+        await verifyPendingPayouts();
+      } catch (e) { console.error('[WITHDRAW] Immediate verify failed:', e.message); }
+    }, 8000);
   } catch (chapaErr) {
     const chapaMsg = String(chapaErr?.response?.message || chapaErr?.message || '');
-    console.error('[WITHDRAW] Chapa payout failed — marked as pending_manual for admin:', chapaErr?.response || chapaErr?.message);
+    console.error('[WITHDRAW] Chapa payout failed:', chapaErr?.response || chapaErr?.message);
     
-    // Surface critical Chapa errors back to user
-    if (chapaMsg.toLowerCase().includes('insufficient') || chapaMsg.toLowerCase().includes('balance')) {
-      const e = new Error('CHAPA_INSUFFICIENT_BALANCE');
-      e.status = 503;
-      throw e;
+    const isInsufficient = chapaMsg.toLowerCase().includes('insufficient') || chapaMsg.toLowerCase().includes('balance');
+    const isInvalid = chapaMsg.toLowerCase().includes('invalid account') || chapaMsg.toLowerCase().includes('account not found');
+
+    if (isInsufficient || isInvalid) {
+      // 🚨 COMPENSATION FIX: Refund the wallet and mark as FAILED
+      await withTx(async (client) => {
+        // Refund the deducted amount
+        await client.query(`
+          UPDATE wallets 
+          SET available_balance = available_balance + $1, 
+              withdrawable_balance = withdrawable_balance + $1
+          WHERE user_id = $2
+        `, [amountEtb, userId]);
+
+        // Mark the primary transaction as FAILED
+        await client.query(`
+          UPDATE transactions
+          SET status = 'FAILED'
+          WHERE tx_id = $1
+        `, [reserveTxId]);
+
+        // Mark the withdrawal request as FAILED
+        await client.query(`
+          UPDATE withdraw_requests
+          SET status = 'FAILED'
+          WHERE tx_id = $1
+        `, [reserveTxId]);
+      });
+
+      // Now throw the error to the frontend so it shows the alert
+      if (isInsufficient) {
+        const e = new Error('CHAPA_INSUFFICIENT_BALANCE');
+        e.status = 503;
+        throw e;
+      } else {
+        const e = new Error('CHAPA_INVALID_ACCOUNT');
+        e.status = 422;
+        throw e;
+      }
     }
-    if (chapaMsg.toLowerCase().includes('invalid account') || chapaMsg.toLowerCase().includes('account not found')) {
-      const e = new Error('CHAPA_INVALID_ACCOUNT');
-      e.status = 422;
-      throw e;
-    }
+    
     // Non-critical: log but continue — DB committed, admin manually processes
     chapaStatus = 'pending_manual';
   }
