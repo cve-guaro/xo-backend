@@ -36,7 +36,7 @@ const SQL = {
         END,
         updated_at = now()
     WHERE id = $1::uuid
-      AND status = 'PENDING'
+      AND status IN ('PENDING', 'FAILED')
     RETURNING id, user_id;
   `,
 
