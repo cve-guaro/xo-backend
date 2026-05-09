@@ -82,9 +82,10 @@ const ALLOWED_ORIGINS = [
   "https://xo-et-frontend.vercel.app",
   "https://xoet-pro-frontend.vercel.app",
 ];
-// Allow localhost for local development/testing
-ALLOWED_ORIGINS.push("http://localhost:3000", "http://localhost:8081", "http://localhost:19006");
-
+// Allow localhost ONLY if explicitly defined in local .env configuration
+if (process.env.LOCAL_CORS) {
+  ALLOWED_ORIGINS.push(...process.env.LOCAL_CORS.split(',').map(o => o.trim()));
+}
 const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (mobile apps, server-to-server)

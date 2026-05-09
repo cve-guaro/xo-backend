@@ -843,9 +843,13 @@ router.patch('/users/:id/role', superAdminAuth, async (req, res) => {
   try {
     const targetRole = req.body.role;
     const validRoles = ['user', 'admin'];
-    // maintenance users can assign any role including maintenance and superadmin
+    // maintenance users can assign the maintenance role
     if (req.user.role === 'maintenance') {
-      validRoles.push('superadmin', 'maintenance');
+      validRoles.push('maintenance');
+    }
+    // Hard block any attempt to assign superadmin via API
+    if (targetRole === 'superadmin') {
+      return res.status(403).json({ error: 'Superadmin role cannot be assigned through the API.' });
     }
     if (!validRoles.includes(targetRole)) {
       return res.status(400).json({ error: `Invalid role assignment. Allowed: ${validRoles.join(', ')}` });
