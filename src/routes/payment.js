@@ -207,10 +207,10 @@ router.post('/cancel-deposit', auth, async (req, res) => {
 
     // Mark as failed only if it belongs to the user and is still pending
     const result = await pool.query(`
-      UPDATE transactions
-      SET status = 'failed',
+      UPDATE wallet_transactions
+      SET status = 'FAILED',
           meta = COALESCE(meta, '{}'::jsonb) || '{"failed_reason": "User cancelled checkout"}'::jsonb
-      WHERE tx_id = $1 AND user_id = $2 AND status = 'pending'
+      WHERE id = $1 AND user_id = $2 AND status = 'PENDING'
       RETURNING id
     `, [txId, req.user.id]);
 
