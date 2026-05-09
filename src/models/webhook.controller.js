@@ -167,7 +167,7 @@ async function handleWebhook(req, res) {
 
       // Send SMS notification (fire-and-forget)
       try {
-        const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id = $1 OR tx_id = $1', [providerRef]);
+        const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id::text = $1::text OR provider_ref::text = $1::text', [providerRef]);
         if (txRow.rows[0]) {
           const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [txRow.rows[0].user_id]);
           const phone = userRow.rows[0]?.number;

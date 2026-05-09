@@ -29,11 +29,11 @@ router.patch(
         fields.push(`username = $${idx++}`);
         values.push(username);
       }
-      if (display_name) {
+      if (display_name !== undefined) {
         fields.push(`display_name = $${idx++}`);
-        values.push(display_name);
+        values.push(display_name === '' ? null : display_name);
       }
-      if (avatar) {
+      if (avatar !== undefined) {
         fields.push(`avatar = $${idx++}`);
         values.push(avatar);
       }
