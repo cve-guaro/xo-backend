@@ -165,18 +165,22 @@ async function handleWebhook(req, res) {
       const out = await completeDeposit(providerRef, "CHAPA", realReference, req.body);
       console.log("[WEBHOOK] Deposit completed:", out);
 
-      // Send SMS notification (fire-and-forget)
-      try {
-        const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id::text = $1::text OR provider_ref::text = $1::text', [providerRef]);
-        if (txRow.rows[0]) {
-          const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [txRow.rows[0].user_id]);
-          const phone = userRow.rows[0]?.number;
-          const uname = userRow.rows[0]?.display_name || userRow.rows[0]?.username;
-          if (phone) {
-            sendDepositSMS(phone, Number(txRow.rows[0].amount), uname).catch(e => console.error('[SMS] Deposit SMS failed:', e.message));
+      // Send SMS notification ONLY if this is the first time completing (not a duplicate)
+      if (!out.alreadyCompleted) {
+        try {
+          const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id::text = $1::text OR provider_ref::text = $1::text', [providerRef]);
+          if (txRow.rows[0]) {
+            const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [txRow.rows[0].user_id]);
+            const phone = userRow.rows[0]?.number;
+            const uname = userRow.rows[0]?.display_name || userRow.rows[0]?.username;
+            if (phone) {
+              sendDepositSMS(phone, Number(txRow.rows[0].amount), uname).catch(e => console.error('[SMS] Deposit SMS failed:', e.message));
+            }
           }
-        }
-      } catch (smsErr) { console.error('[SMS] Deposit SMS prep error:', smsErr.message); }
+        } catch (smsErr) { console.error('[SMS] Deposit SMS prep error:', smsErr.message); }
+      } else {
+        console.log("[WEBHOOK] Skipping SMS — deposit was already completed (duplicate webhook).");
+      }
 
       return res.json({ ok: true, ...out });
     }
@@ -184,25 +188,28 @@ async function handleWebhook(req, res) {
     if (event === "payout.success") {
       console.log("[WEBHOOK] Payout success for ref:", providerRef, "— updating transaction status to COMPLETED.");
       
-      await pool.query(
+      const updateResult = await pool.query(
         `UPDATE wallet_transactions 
          SET status = 'COMPLETED', updated_at = now() 
-         WHERE id = $1 AND status = 'PENDING'`,
+         WHERE id = $1 AND status = 'PENDING'
+         RETURNING id, user_id, amount`,
         [providerRef]
       );
 
-      // Send withdrawal SMS notification (fire-and-forget)
-      try {
-        const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id = $1', [providerRef]);
-        if (txRow.rows[0]) {
-          const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [txRow.rows[0].user_id]);
+      // Only send SMS if the UPDATE actually changed a row (first time processing)
+      if (updateResult.rowCount > 0) {
+        try {
+          const row = updateResult.rows[0];
+          const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [row.user_id]);
           const phone = userRow.rows[0]?.number;
           const uname = userRow.rows[0]?.display_name || userRow.rows[0]?.username;
           if (phone) {
-            sendWithdrawalSMS(phone, Number(txRow.rows[0].amount), uname).catch(e => console.error('[SMS] Withdrawal SMS failed:', e.message));
+            sendWithdrawalSMS(phone, Number(row.amount), uname).catch(e => console.error('[SMS] Withdrawal SMS failed:', e.message));
           }
-        }
-      } catch (smsErr) { console.error('[SMS] Withdrawal SMS prep error:', smsErr.message); }
+        } catch (smsErr) { console.error('[SMS] Withdrawal SMS prep error:', smsErr.message); }
+      } else {
+        console.log("[WEBHOOK] Skipping withdrawal SMS — already completed (duplicate webhook).");
+      }
       
       return res.json({ ok: true, event: "payout.success", ref: providerRef });
     }
