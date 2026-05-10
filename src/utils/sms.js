@@ -4,6 +4,12 @@ const axios = require('axios');
 const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
 const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
 
+// Circuit breaker: stop hammering GeezSMS when balance is depleted
+let consecutiveFailures = 0;
+let circuitOpenUntil = 0;
+const MAX_FAILURES = 5;
+const COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
 /**
  * Send SMS via GeezSMS
  * @param {string} phone - Recipient phone number
@@ -15,6 +21,13 @@ async function sendSMS(phone, message) {
     console.warn('[SMS] GeezSMS token not configured, skipping SMS');
     return false;
   }
+
+  // Circuit breaker check
+  if (Date.now() < circuitOpenUntil) {
+    // Silently skip — don't log every single one
+    return false;
+  }
+
   try {
     const res = await axios.post(GEEZ_SMS_URL, {
       token: GEEZ_SMS_TOKEN,
@@ -22,9 +35,19 @@ async function sendSMS(phone, message) {
       msg: message,
     }, { timeout: 10000 });
     console.log(`[SMS] Sent to ${phone}: ${res.status}`);
+    consecutiveFailures = 0; // Reset on success
     return true;
   } catch (e) {
-    console.error('[SMS] Failed:', e.message);
+    consecutiveFailures++;
+    const msg = e.response?.data?.msg || e.message;
+    
+    // Check for "Insufficient amount" = balance depleted
+    if (msg.includes('Insufficient') || consecutiveFailures >= MAX_FAILURES) {
+      circuitOpenUntil = Date.now() + COOLDOWN_MS;
+      console.error(`[SMS] ⛔ Circuit breaker OPEN — ${consecutiveFailures} failures (${msg}). SMS disabled for 10 min.`);
+    } else {
+      console.error(`[SMS] Failed (${consecutiveFailures}/${MAX_FAILURES}):`, msg);
+    }
     return false;
   }
 }

@@ -17,7 +17,7 @@ function initCron() {
         
         const { rows: stuckGames } = await client.query(`
           UPDATE games 
-          SET status = 'abandoned', finished_at = NOW() 
+          SET status = 'completed', winner = NULL, finished_at = NOW() 
           WHERE status IN ('ongoing', 'live', 'countdown') 
             AND created_at < NOW() - INTERVAL '30 MINUTES'
           RETURNING id, player_x, player_o, bet_amount

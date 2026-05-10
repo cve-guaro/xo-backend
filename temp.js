@@ -1,5 +1,5 @@
 const { pool } = require('./src/db');
-pool.query("SELECT pg_get_functiondef(p.oid) FROM pg_proc p WHERE p.proname = 'fn_wallet_apply_existing_tx'")
-  .then(res => console.log(res.rows[0].pg_get_functiondef))
-  .catch(console.error)
-  .finally(() => process.exit());
+// Check what distinct statuses exist
+pool.query(`SELECT DISTINCT status FROM games ORDER BY status`).then(res => {
+  console.log('Existing statuses:', res.rows.map(r => r.status));
+}).catch(console.error).finally(() => process.exit());
