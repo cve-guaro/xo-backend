@@ -1844,7 +1844,7 @@ router.post('/bulk-sms', async (req, res) => {
     if (!message) return res.status(400).json({ error: 'Message is required' });
 
     let query = `
-      SELECT u.number, u.username 
+      SELECT DISTINCT ON (u.number) u.number, u.username 
       FROM users u
       LEFT JOIN wallets w ON u.id = w.user_id
       WHERE u.number IS NOT NULL AND u.number != '' AND u.banned = false
@@ -1900,11 +1900,13 @@ router.post('/bulk-sms', async (req, res) => {
     const { rows } = await pool.query(query, params);
     if (rows.length === 0) return res.json({ ok: true, queuedCount: 0, message: 'No users matched criteria' });
 
-    // Send SMS sequentially
+    // Deduplicate by phone number (safety net)
+    const sentPhones = new Set();
     let successCount = 0;
+    const { sendSMS } = require('../utils/sms');
     for (const user of rows) {
-      if (user.number) {
-        const { sendSMS } = require('../utils/sms');
+      if (user.number && !sentPhones.has(user.number)) {
+        sentPhones.add(user.number);
         const success = await sendSMS(user.number, message).catch(() => false);
         if (success) successCount++;
       }
