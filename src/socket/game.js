@@ -833,7 +833,7 @@ function setupGameSocket(io) {
           return;
         }
 
-        // Room 1 stake-lock check: tier-specific locks after 25 wins
+        // Room 1 stake-lock check: tier-specific locks after 20 wins
         if (roomNumber === 1 && ROOMS_CONFIG[1].betRange.includes(Number(betAmount))) {
           const betNum = Number(betAmount);
           const colMap = { 10: 'r1_10_wins', 25: 'r1_25_wins', 50: 'r1_50_wins', 99: 'r1_99_wins' };
@@ -842,10 +842,10 @@ function setupGameSocket(io) {
           if (col) {
             const lockRes = await pool.query(`SELECT ${col} FROM users WHERE id = $1`, [userId]).catch(() => ({ rows: [] }));
             const wins = Number(lockRes.rows?.[0]?.[col] ?? 0);
-            if (wins >= 25) {
+            if (wins >= 20) {
               dbg(ctx, "STAKE_LOCKED", { userId, betAmount, wins });
               if (typeof ack === "function") ack({ ok: true, data: { state: "STAKE_LOCKED", betAmount, wins } });
-              socket.emit("error", { code: "STAKE_LOCKED", message: `Stake ${betAmountCents} ETB is locked after 25 wins. Try a different stake amount.` });
+              socket.emit("error", { code: "STAKE_LOCKED", message: `Stake ${betAmountCents} ETB is locked after 20 wins. Try a different stake amount.` });
               return;
             }
           }
