@@ -26,16 +26,16 @@ const ROOMS_CONFIG = {
   1: {
     name: "Room 1 - Beginner",
     betRange: [10, 25, 50, 99], // Valid bet amounts for this room
-    houseCutPercent: 20, // 20% cut
+    houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Small bets - 40% total (20% each) - 30s timer"
+    description: "Small bets - 20% total (10% each) - 30s timer"
   },
   2: {
     name: "Room 2 - Intermediate",
     betRange: [100, 250, 500, 999], // Valid bet amounts for this room
-    houseCutPercent: 15, // 15% cut
+    houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Medium bets - 30% total (15% each) - 30s timer"
+    description: "Medium bets - 20% total (10% each) - 30s timer"
   },
   3: {
     name: "Room 3 - Advanced",

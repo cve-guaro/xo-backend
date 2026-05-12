@@ -166,21 +166,20 @@ async function handleWebhook(req, res) {
       console.log("[WEBHOOK] Deposit completed:", out);
 
       // Send SMS notification ONLY if this is the first time completing (not a duplicate)
-      if (!out.alreadyCompleted) {
-        try {
-          const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id::text = $1::text OR provider_ref::text = $1::text', [providerRef]);
-          if (txRow.rows[0]) {
-            const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [txRow.rows[0].user_id]);
-            const phone = userRow.rows[0]?.number;
-            const uname = userRow.rows[0]?.display_name || userRow.rows[0]?.username;
-            if (phone) {
-              sendDepositSMS(phone, Number(txRow.rows[0].amount), uname).catch(e => console.error('[SMS] Deposit SMS failed:', e.message));
-            }
-          }
-        } catch (smsErr) { console.error('[SMS] Deposit SMS prep error:', smsErr.message); }
-      } else {
-        console.log("[WEBHOOK] Skipping SMS — deposit was already completed (duplicate webhook).");
-      }
+      // NOTE: Deposit SMS disabled per admin request — only withdrawal SMS is active
+      // if (!out.alreadyCompleted) {
+      //   try {
+      //     const txRow = await pool.query('SELECT user_id, amount FROM wallet_transactions WHERE id::text = $1::text OR provider_ref::text = $1::text', [providerRef]);
+      //     if (txRow.rows[0]) {
+      //       const userRow = await pool.query('SELECT number, display_name, username FROM users WHERE id = $1', [txRow.rows[0].user_id]);
+      //       const phone = userRow.rows[0]?.number;
+      //       const uname = userRow.rows[0]?.display_name || userRow.rows[0]?.username;
+      //       if (phone) {
+      //         sendDepositSMS(phone, Number(txRow.rows[0].amount), uname).catch(e => console.error('[SMS] Deposit SMS failed:', e.message));
+      //       }
+      //     }
+      //   } catch (smsErr) { console.error('[SMS] Deposit SMS prep error:', smsErr.message); }
+      // }
 
       return res.json({ ok: true, ...out });
     }

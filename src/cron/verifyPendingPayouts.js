@@ -116,7 +116,54 @@ async function verifyPendingPayouts() {
         await new Promise(r => setTimeout(r, 200));
 
       } catch (txErr) {
-        console.error(`[CRON] Error verifying TX ${tx.id}:`, txErr.message);
+        // Chapa returns 404 "Transfer is not found" — track retries and stop after 3
+        if (txErr.status === 404 || (txErr.message && txErr.message.includes('not found'))) {
+          const meta = typeof tx.meta === 'string' ? JSON.parse(tx.meta || '{}') : (tx.meta || {});
+          const retries = (meta.chapa_404_retries || 0) + 1;
+          
+          if (retries >= 3) {
+            // Transfer never existed in Chapa — refund user and stop retrying
+            console.log(`[CRON] ⛔ TX ${tx.id} — Chapa returned 404 three times. Marking FAILED and refunding.`);
+            const client = await pool.connect();
+            try {
+              await client.query('BEGIN');
+              await client.query(
+                `UPDATE wallet_transactions SET status = 'FAILED', updated_at = now(), 
+                 meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb
+                 WHERE id = $1`,
+                [tx.id, JSON.stringify({ failed_reason: 'Chapa transfer not found after 3 retries', chapa_404_retries: retries })]
+              );
+              await client.query(
+                `UPDATE withdraw_requests SET status = 'REJECTED', updated_at = now() WHERE reserve_tx_id = $1`,
+                [tx.id]
+              );
+              const refundAmount = Number(tx.amount);
+              await client.query(
+                `UPDATE wallets SET available_balance = available_balance + $1, withdrawable_balance = withdrawable_balance + $1, updated_at = now() WHERE user_id = $2`,
+                [refundAmount, tx.user_id]
+              );
+              await client.query(
+                `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, idempotency_key, provider, meta)
+                 VALUES ($1, 'REFUND', $2, 'COMPLETED', $3, 'SYSTEM_AUTO_REFUND', $4)`,
+                [tx.user_id, refundAmount, `AUTO_REFUND_404:${tx.id}`, JSON.stringify({ reason: 'Chapa transfer not found', originalTxId: tx.id })]
+              );
+              await client.query('COMMIT');
+              console.log(`[CRON] ✅ Refunded ${refundAmount} ETB to user ${tx.user_id} (TX ${tx.id} — Chapa 404)`);
+            } catch (err) {
+              await client.query('ROLLBACK');
+              console.error(`[CRON] Refund failed for TX ${tx.id}:`, err.message);
+            } finally { client.release(); }
+          } else {
+            // Increment retry counter and check again next cycle
+            await pool.query(
+              `UPDATE wallet_transactions SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb WHERE id = $1`,
+              [tx.id, JSON.stringify({ chapa_404_retries: retries })]
+            );
+            console.log(`[CRON] ⏳ TX ${tx.id} — Chapa 404, retry ${retries}/3. Will check again next cycle.`);
+          }
+        } else {
+          console.error(`[CRON] Error verifying TX ${tx.id}:`, txErr.message);
+        }
       }
     }
 
