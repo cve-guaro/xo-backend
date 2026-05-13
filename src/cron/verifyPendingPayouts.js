@@ -11,7 +11,8 @@ async function verifyPendingPayouts() {
   console.log('[CRON] Verifying pending withdrawal payouts...');
   
   try {
-    // Find all PENDING WITHDRAW_REQUESTs older than 2 minutes (give Chapa time to process)
+    // Find all PENDING WITHDRAW_REQUESTs older than 10 seconds (give Chapa time to process)
+    // FOR UPDATE SKIP LOCKED prevents double-refund if two cron workers run concurrently
     const { rows: pendingTxs } = await pool.query(`
       SELECT id, user_id, amount, meta, created_at
       FROM wallet_transactions
@@ -21,6 +22,7 @@ async function verifyPendingPayouts() {
         AND created_at > now() - interval '48 hours'
       ORDER BY created_at ASC
       LIMIT 20
+      FOR UPDATE SKIP LOCKED
     `);
 
     if (pendingTxs.length === 0) {

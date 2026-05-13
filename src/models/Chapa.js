@@ -109,9 +109,9 @@ async function getChapaTransferStatus(tx_ref, secretKey) {
   try {
     return await chapaFetch(`/transfers/verify/${encodeURIComponent(tx_ref)}`, 'GET', null, secretKey);
   } catch (err) {
-    // If Chapa returns 404, the transfer reference is not found yet
+    // Re-throw so the cron job's catch block can handle retries/refunds for 404s
     console.warn(`[CHAPA] Transfer verify for ${tx_ref}: ${err.message}`);
-    return null;
+    throw err;
   }
 }
 
