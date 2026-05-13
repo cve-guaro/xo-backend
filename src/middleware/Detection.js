@@ -5,7 +5,7 @@ function platformDetection(req, res, next) {
   if (platform === 'web') {
     // Explicit web header — always allow
     req.isWeb = true;
-  } else if (platform === 'mobile-app') {
+  } else if (platform === 'mobile') {
     // Explicit native app header — block if lockout is on
     req.isWeb = false;
   } else {
