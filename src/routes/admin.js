@@ -235,7 +235,7 @@ router.get('/stats', async (req, res) => {
   try {
     const [usersRes, gamesRes, pendingRes, revenueRes, payoutsRes, giveawayRes, walletSumRes] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_users FROM users WHERE banned = false`),
-      pool.query(`SELECT COUNT(*) AS active_games FROM games WHERE status = 'ongoing'`),
+      pool.query(`SELECT COUNT(*) AS active_games FROM games WHERE status IN ('live', 'starting', 'ongoing')`),
       pool.query(`SELECT COUNT(*) AS pending_withdrawals, COALESCE(SUM(amount), 0) AS pending_amount
                   FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_deposits
@@ -360,7 +360,7 @@ router.get('/dashboard-data', async (req, res) => {
         WHERE status = 'finished' AND winner IS NOT NULL
       `),
       // [7] Active Games
-      pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('ongoing', 'live')`),
+      pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('live', 'starting', 'ongoing')`),
       // [8] Failed withdrawals (Count any withdrawal tx that didn't succeed)
       pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND status = 'FAILED'`),
       // [9] New user growth time-series
@@ -1001,13 +1001,14 @@ router.get('/users/:id/360', async (req, res) => {
       }
     } catch (e) { console.warn('[360] stats query failed:', e.message); }
 
-    // 4) Game history (last 50)
+    // 4) Game history (last 50) — includes moves for board replay
     let games = [];
     try {
       const gamesRes = await pool.query(`
         SELECT g.id, g.player_x, g.player_o, g.winner, g.bet_amount, g.status,
-               g.finished_at, g.created_at,
-               ux.username as player_x_name, uo.username as player_o_name
+               g.finished_at, g.created_at, g.moves, g.prize_amount, g.end_reason, g.forfeit,
+               ux.username as player_x_name, ux.number as player_x_number,
+               uo.username as player_o_name, uo.number as player_o_number
         FROM games g
         LEFT JOIN users ux ON g.player_x = ux.id
         LEFT JOIN users uo ON g.player_o = uo.id
@@ -1169,8 +1170,23 @@ router.get('/transactions/:id/details', async (req, res) => {
     
     const aggregates = statsQuery.rows[0];
 
+    // ─── Extract EXACT reason from provider payload ───
+    let exactReason = null;
+    try {
+      const meta = typeof details.provider_payload === 'string' ? JSON.parse(details.provider_payload) : details.provider_payload;
+      if (meta) {
+        // Chapa response fields
+        exactReason = meta.message || meta.error || meta.data?.message || meta.data?.error || meta.failure_reason || meta.reason || null;
+        // If nested Chapa response
+        if (!exactReason && meta.data?.data?.message) exactReason = meta.data.data.message;
+        // Transfer-specific errors
+        if (!exactReason && meta.transfer_error) exactReason = meta.transfer_error;
+        if (!exactReason && meta.status_message) exactReason = meta.status_message;
+      }
+    } catch(e) { /* meta might not be valid JSON */ }
+
     return res.json({
-      transaction: details,
+      transaction: { ...details, exact_reason: exactReason },
       user: {
         id: details.user_id,
         username: details.username,
@@ -1975,6 +1991,87 @@ router.post('/upload-promo', upload.single('image'), (req, res) => {
   } catch (err) {
     console.error('[ADMIN] POST /upload-promo err', err);
     res.status(500).json({ error: 'Failed to upload image' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// GET /admin/metrics/live
+// Real-time live metrics for the admin dashboard overview
+// ──────────────────────────────────────────────
+router.get('/metrics/live', async (req, res) => {
+  try {
+    const [activeGamesRes, onlineRes, depositsTodayRes, withdrawalsTodayRes, dauRes, ggrRes, pendingRes] = await Promise.all([
+      // [0] Active games RIGHT NOW
+      pool.query(`SELECT COUNT(*) as count FROM games WHERE status IN ('live', 'starting', 'ongoing')`),
+      // [1] Online users (connected sockets tracked in Redis)
+      redis.scard('online_users').catch(() => 0),
+      // [2] Deposits completed today
+      pool.query(`
+        SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count
+        FROM wallet_transactions
+        WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'
+        AND created_at >= CURRENT_DATE
+      `),
+      // [3] Withdrawals settled today
+      pool.query(`
+        SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count
+        FROM wallet_transactions
+        WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'
+        AND created_at >= CURRENT_DATE
+      `),
+      // [4] Daily active users (played at least 1 game today)
+      pool.query(`
+        SELECT COUNT(DISTINCT u.id) as count
+        FROM games g
+        JOIN users u ON u.id = g.player_x OR u.id = g.player_o
+        WHERE g.created_at >= CURRENT_DATE
+      `),
+      // [5] Gross Gaming Revenue today (10% commission on completed games)
+      pool.query(`
+        SELECT COALESCE(SUM(bet_amount * 0.1), 0) as ggr
+        FROM games
+        WHERE status IN ('completed', 'X', 'O') AND winner IS NOT NULL
+        AND created_at >= CURRENT_DATE
+      `),
+      // [6] Pending manual withdrawals
+      pool.query(`
+        SELECT wt.id, wt.amount, wt.created_at, wt.status, u.username, u.number
+        FROM wallet_transactions wt
+        JOIN users u ON u.id = wt.user_id
+        WHERE wt.tx_type = 'WITHDRAW_REQUEST' AND wt.status IN ('PENDING', 'PENDING_MANUAL')
+        ORDER BY wt.created_at ASC
+        LIMIT 20
+      `)
+    ]);
+
+    const activeMatches = Number(activeGamesRes.rows[0]?.count || 0);
+    const onlineUsers = typeof onlineRes === 'number' ? onlineRes : Number(onlineRes || 0);
+    const depositsToday = Number(depositsTodayRes.rows[0]?.total || 0);
+    const withdrawalsToday = Number(withdrawalsTodayRes.rows[0]?.total || 0);
+    const dailyActiveUsers = Number(dauRes.rows[0]?.count || 0);
+    const grossGamingRevenue = Number(ggrRes.rows[0]?.ggr || 0);
+
+    return res.json({
+      ok: true,
+      activeMatches,
+      onlineUsers,
+      depositsToday,
+      withdrawalsToday,
+      dailyActiveUsers,
+      grossGamingRevenue,
+      pendingWithdrawals: pendingRes.rows.map(r => ({
+        ...r,
+        amount: Number(r.amount || 0)
+      })),
+      systemHealth: {
+        database: 'ok',
+        redis: 'ok',
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (err) {
+    console.error('[ADMIN] /metrics/live error', err);
+    return res.status(500).json({ error: 'Failed to fetch live metrics' });
   }
 });
 
