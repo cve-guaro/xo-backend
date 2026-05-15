@@ -59,8 +59,8 @@ async function sendSMS(phone, message) {
  * @param {string} [username] - User's display name
  */
 async function sendWithdrawalSMS(phone, amount, username) {
-  const name = username || '\u1270\u1320\u1243\u121A';
-  const msg = `${name}! \u12E8${Number(amount).toLocaleString()} \u1265\u122D withdraw \u1260\u1270\u1233\u12AB \u1201\u1294\u1273 \u12A0\u12CD\u1325\u1270\u12CB\u120D\u1362 Withdraw \u12EB\u12F0\u1228\u1309\u1275\u1295 screenshot\u1293 \u1235\u12AC\u1276\u1295 \u12E8telegram official group\u12A3\u127D\u1295 https://t.me/xoethiopia1\n\u120B\u12ED \u1260\u121B\u130B\u122B\u1275 \u12A8\u12DA\u121D \u1260\u120B\u12ED \u12A5\u1295\u12F5\u1293\u12F5\u130D \u12ED\u122D\u12F1\u1295\u1364\u12A5\u1293\u1218\u1230\u130D\u1293\u1208\u1295\uD83D\uDE4F`;
+  const name = username || 'ተጠቃሚ';
+  const msg = `${name}! ስኬቶን official groupአችን\n 👉https://t.me/xoethiopia1 \nላይ በscreenshot በማጋራት ከዚም በላይ እንድናድግ ይርዱን እናመሰግናለን🙏`;
   return sendSMS(phone, msg);
 }
 
