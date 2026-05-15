@@ -42,30 +42,33 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
-      connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
-      frameAncestors: ["'none'"],
+      imgSrc: ["'self'", "data:", "blob:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
+      connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app", "wss://xoethiopia.com", "wss://www.xoethiopia.com"],
+      // ✅ Allow Flutter WebView to embed this site
+      // 'self' = same origin web, the https domains = production Flutter app
+      // Note: Flutter WebView on Android/iOS has no Origin header so it passes through
+      frameAncestors: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.xoethiopia.com"],
       baseUri: ["'self'"],
       formAction: ["'self'"],
       objectSrc: ["'none'"],
-      upgradeInsecureRequests: []
     }
   },
+  // ✅ Disable X-Frame-Options so Flutter WebView is not blocked
+  // CSP frame-ancestors above is the modern replacement
+  xFrameOptions: false,
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
-  crossOriginOpenerPolicy: { policy: "same-origin" },
+  crossOriginOpenerPolicy: { policy: "unsafe-none" }, // Allow opener for WebView context
   hsts: {
-    maxAge: 31536000, // 1 year
+    maxAge: 31536000,
     includeSubDomains: true,
     preload: true
   },
-  xssFilter: true,
-  noSniff: true,
-  frameguard: { action: 'deny' }, // Block iframe embedding (clickjacking)
   referrerPolicy: { policy: "strict-origin-when-cross-origin" }
 }));
+
 
 // Manually applying Permissions-Policy since helmet doesn't support it natively yet
 app.use((req, res, next) => {
@@ -227,7 +230,7 @@ app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
-
+app.use('/notifications', require('./routes/notifications'));
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
   try {
