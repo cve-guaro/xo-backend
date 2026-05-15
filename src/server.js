@@ -58,14 +58,12 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
   crossOriginOpenerPolicy: { policy: "same-origin" },
-  hsts: {
+  strictTransportSecurity: {
     maxAge: 31536000, // 1 year
     includeSubDomains: true,
     preload: true
   },
-  xssFilter: true,
-  noSniff: true,
-  frameguard: { action: 'deny' }, // Block iframe embedding (clickjacking)
+  xFrameOptions: { action: 'deny' }, // Block iframe embedding (clickjacking)
   referrerPolicy: { policy: "strict-origin-when-cross-origin" }
 }));
 
