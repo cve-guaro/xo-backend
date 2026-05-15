@@ -25,6 +25,7 @@ const userRoutes = require('./routes/user');
 const accountRoutes = require('./routes/account');
 const otpAuthRoutes = require('./routes/otp');
 const adminRoutes = require('./routes/admin');
+const notificationRoutes = require('./routes/notifications');
 
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
@@ -39,20 +40,9 @@ const server = http.createServer(app);
 
 // ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
-      connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
-      frameAncestors: ["'none'"],
-      baseUri: ["'self'"],
-      formAction: ["'self'"],
-      objectSrc: ["'none'"],
-      upgradeInsecureRequests: []
-    }
-  },
+  // CSP disabled: this is an API-only backend. CSP should be set by the frontend (Vercel).
+  // The backend CSP was leaking into browser context via error responses, blocking Sentry/ShakeBugs.
+  contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
   crossOriginOpenerPolicy: { policy: "same-origin" },
@@ -227,6 +217,7 @@ app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
+app.use('/notifications', notificationRoutes);
 
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
@@ -306,6 +297,22 @@ initCron();
         created_at TIMESTAMPTZ DEFAULT now()
       );
     `);
+
+    // Create notifications table for the notification system
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL DEFAULT 'system',
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        read BOOLEAN NOT NULL DEFAULT false,
+        meta JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, read) WHERE read = false;`);
 
     console.log('[DB] Migrations applied.');
   } catch (err) {
