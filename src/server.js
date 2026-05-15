@@ -40,9 +40,21 @@ const server = http.createServer(app);
 
 // ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
 app.use(helmet({
-  // CSP disabled: this is an API-only backend. CSP should be set by the frontend (Vercel).
-  // The backend CSP was leaking into browser context via error responses, blocking Sentry/ShakeBugs.
-  contentSecurityPolicy: false,
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
+      connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app", "https://*.ingest.us.sentry.io", "https://www.shakebugs.com"],
+      workerSrc: ["'self'", "blob:"],
+      frameAncestors: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: []
+    }
+  },
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
   crossOriginOpenerPolicy: { policy: "same-origin" },
