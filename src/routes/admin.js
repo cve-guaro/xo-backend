@@ -201,6 +201,13 @@ router.patch('/settings', async (req, res) => {
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
       `, [key, JSON.stringify(value)]);
     }
+    // ─── CRITICAL: Flush all lockdown/feature caches so changes take effect INSTANTLY ───
+    await Promise.all([
+      redis.del('system_lockdown_status'),
+      redis.del('feature_status_system_emergency_lockout'),
+      redis.del('feature_status_mobile_app_lockout'),
+    ]).catch(() => {});
+
     await logAdminAction(req.user.id, 'updated_global_settings', null, updates);
     return res.json({ ok: true });
   } catch (err) {
