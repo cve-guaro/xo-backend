@@ -232,7 +232,7 @@ router.get("/config", auth, async (req, res) => {
   try {
     const settingsRes = await pool.query(`
       SELECT key, value FROM global_settings 
-      WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled')
+      WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled', 'rooms_locked')
     `);
     const config = {};
     for (const r of settingsRes.rows) {
@@ -245,7 +245,8 @@ router.get("/config", auth, async (req, res) => {
       current_giveaway_version: Number(config.current_giveaway_version || 1),
       welcome_bonus_active: config.welcome_bonus_active === true || config.welcome_bonus_active === 'true',
       welcome_bonus_amount: Number(config.welcome_bonus_amount || 10),
-      referral_enabled: config.referral_enabled !== false && config.referral_enabled !== 'false' // default true if not set
+      referral_enabled: config.referral_enabled !== false && config.referral_enabled !== 'false', // default true if not set
+      rooms_locked: config.rooms_locked === true || config.rooms_locked === 'true' // default false if not set
     });
   } catch (e) {
     console.error("Config fetch error:", e);
