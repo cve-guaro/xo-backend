@@ -68,7 +68,18 @@ CREATE TABLE IF NOT EXISTS user_entries (
 
 CREATE INDEX IF NOT EXISTS idx_user_entries_created ON user_entries(created_at);
 
--- ── 8. Promo popup enhancements ─────────────────────────────────────────────
+-- ── 8. Promo popup table + enhancements ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS promo_popups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  image_url TEXT,
+  display_duration INTEGER DEFAULT 5,
+  expires_at TIMESTAMPTZ,
+  starts_at TIMESTAMPTZ,
+  is_active BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Add starts_at column for older installs that already have the table without it
 ALTER TABLE promo_popups ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;
 
 -- ── 9. Default global settings (only if not already set) ────────────────────

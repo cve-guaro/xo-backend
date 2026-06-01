@@ -416,7 +416,20 @@ initCron();
       ON CONFLICT (key) DO NOTHING;
     `);
 
-    // Add starts_at column to promo_popups
+    // Create promo_popups table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS promo_popups (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        image_url TEXT,
+        display_duration INTEGER DEFAULT 5,
+        expires_at TIMESTAMPTZ,
+        starts_at TIMESTAMPTZ,
+        is_active BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // Add starts_at column to promo_popups (for older installs that lack it)
     await pool.query(`ALTER TABLE promo_popups ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;`);
 
     console.log('[DB] Migrations applied.');
