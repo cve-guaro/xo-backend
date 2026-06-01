@@ -24,7 +24,7 @@ async function run() {
   const localAdmin = new Pool({ connectionString: 'postgresql://postgres:postgres@localhost:5432/postgres' });
   
   try {
-    await localAdmin.query('DROP DATABASE IF EXISTS xoet_local');
+    // await localAdmin.query('DROP DATABASE IF EXISTS xoet_local');
     await localAdmin.query('CREATE DATABASE xoet_local');
     console.log('✅ Database xoet_local created');
   } catch (err) {
