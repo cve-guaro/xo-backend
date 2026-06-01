@@ -234,7 +234,7 @@ router.get("/config", auth, async (req, res) => {
 
     const settingsRes = await pool.query(`
       SELECT key, value FROM global_settings 
-      WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled')
+      WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled', 'rooms_locked')
     `);
     
     // Also fetch the active promo popup
@@ -283,7 +283,8 @@ router.get("/config", auth, async (req, res) => {
       welcome_bonus_amount: Number(config.welcome_bonus_amount || 10),
       referral_enabled: config.referral_enabled !== false && config.referral_enabled !== 'false', // default true if not set
       promo_popup_config: popupRes.rows.length > 0 ? popupRes.rows[0] : null,
-      previousWeekWin
+      previousWeekWin,
+      rooms_locked: config.rooms_locked === true || config.rooms_locked === 'true' // default false if not set
     });
   } catch (e) {
     console.error("Config fetch error:", e);

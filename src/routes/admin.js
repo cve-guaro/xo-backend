@@ -174,7 +174,7 @@ router.get('/settings', async (req, res) => {
 
 router.patch('/settings', async (req, res) => {
   // Security Protocols: only Simon can touch these
-  const restrictedKeys = ['system_emergency_lockout', 'mobile_app_lockout', 'maintenance_mode', 'security_autoban'];
+  const restrictedKeys = ['system_emergency_lockout', 'mobile_app_lockout', 'maintenance_mode', 'security_autoban', 'rooms_locked'];
   const isEditingRestricted = Object.keys(req.body).some(k => restrictedKeys.includes(k));
 
   if (isEditingRestricted) {
@@ -202,6 +202,7 @@ router.patch('/settings', async (req, res) => {
       redis.del('system_lockdown_status'),
       redis.del('feature_status_system_emergency_lockout'),
       redis.del('feature_status_mobile_app_lockout'),
+      redis.del('feature_status_rooms_locked'),
     ]).catch(() => {});
 
     await logAdminAction(req.user.id, 'updated_global_settings', null, updates);
