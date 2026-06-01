@@ -136,19 +136,22 @@ async function handleWebhook(req, res) {
     const isValid = verifyChapaWebhookSignature(req.headers, req.rawBody, req.body);
     if (!isValid) {
       const details = {
-        reason: 'Signature mismatch — processing anyway to prevent stuck deposits',
-        bodyShort: JSON.stringify(req.body || {}).slice(0, 200)
+        reason: 'Webhook signature mismatch — REJECTED for security',
+        bodyShort: JSON.stringify(req.body || {}).slice(0, 200),
+        headers: {
+          'chapa-signature': req.headers['chapa-signature'] ? 'present' : 'missing',
+          'x-chapa-signature': req.headers['x-chapa-signature'] ? 'present' : 'missing',
+        }
       };
 
       await pool.query(
         `INSERT INTO system_alerts (event_type, details, severity, ip_address)
          VALUES ($1, $2, $3, $4)`,
-        ['WEBHOOK_SIGNATURE_WARN', details, 'HIGH', req.ip || req.headers['x-forwarded-for']]
+        ['WEBHOOK_SIGNATURE_REJECTED', details, 'CRITICAL', req.ip || req.headers['x-forwarded-for']]
       ).catch(e => console.error('[ALERTS] Failed to log alert:', e));
 
-      console.warn("[WEBHOOK SECURITY] ⚠️ Signature mismatch — PROCESSING ANYWAY to prevent stuck deposits. Alert logged.");
-      // NOTE: We continue processing instead of rejecting to prevent 2000+ stuck pending deposits.
-      // The deposit verification cron acts as a secondary safety net.
+      console.error("[WEBHOOK SECURITY] ❌ Signature mismatch — REJECTING webhook. Alert logged. Deposit-verify cron will pick up legitimate payments.");
+      return res.status(401).json({ error: 'Invalid webhook signature' });
     }
 
     const { event, providerRef, realReference } = parseProviderEvent(req.body);

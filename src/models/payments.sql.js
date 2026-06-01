@@ -59,6 +59,13 @@ const SQL = {
     WHERE user_id = $1::uuid;
   `,
 
+  getWalletForUpdate: `
+    SELECT user_id, available_balance, withdrawable_balance
+    FROM wallets
+    WHERE user_id = $1::uuid
+    FOR UPDATE;
+  `,
+
   createWithdrawRequest: `
     INSERT INTO withdraw_requests(
       user_id,

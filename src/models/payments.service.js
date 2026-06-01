@@ -103,7 +103,7 @@ async function completeDeposit(txIdOrRef, provider, realReference = null) {
 
     // 2. Mark the transaction as COMPLETED & Store the REAL provider reference
     // We use realReference if provided, otherwise fallback to provider (e.g. 'CHAPA') which is old behaviour
-    const referenceToStore = realReference || provider; 
+    const referenceToStore = realReference || provider;
     await client.query(SQL.markTxCompletedById, [txId, referenceToStore, null]);
     console.log(`[WEBHOOK] Transaction ${txId} marked as COMPLETED with ref: ${referenceToStore}`);
 
@@ -156,7 +156,7 @@ async function creditPrize({ userId, amount, meta }) {
 // ----------- Withdraw request (reserve funds immediately) -----------
 async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payoutDestination }) {
   const amountEtb = Math.round(Number(amount));
-  
+
   // Validation
   if (!amountEtb || amountEtb < 10) {
     const err = new Error("Minimum withdrawal is 10 ETB");
@@ -177,13 +177,13 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   const anchor = `${payoutMethod}:${payoutDestination}:${amountEtb}:${Date.now()}`;
   const idem = makeIdempotencyKey("WREQ", userId, anchor);
 
-    // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
+  // STEP 1: Reserve funds in DB (committed immediately, separate from Chapa)
   const { reserveTxId, withdrawRequest, wallet, requiresManualReview, reviewReason } = await withTx(async (client) => {
     await client.query(SQL.ensureWallet, [userId]);
-    
+
     // 1) Verify user has played at least one match
     const { rows: gameCountRows } = await client.query(
-      `SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, 
+      `SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`,
       [userId]
     );
     const totalGames = Number(gameCountRows[0]?.total || 0);
@@ -194,22 +194,22 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
       throw err;
     }
 
-     // 2) Check balance — ONLY withdrawable_balance counts (bonus is free leverage, not withdrawable)
-     const walletCheck = await client.query(SQL.getWallet, [userId]);
-     const walletData = walletCheck.rows[0];
-     const withdrawable = Number(walletData?.withdrawable_balance || 0);
-     
-     if (withdrawable < amountEtb) {
-       const err = new Error("Insufficient withdrawable balance.");
-       err.status = 400;
-       throw err;
-     }
+    // 2) Check balance — ONLY withdrawable_balance counts (bonus is free leverage, not withdrawable)
+    const walletCheck = await client.query(SQL.getWalletForUpdate, [userId]);
+    const walletData = walletCheck.rows[0];
+    const withdrawable = Number(walletData?.withdrawable_balance || 0);
+
+    if (withdrawable < amountEtb) {
+      const err = new Error("Insufficient withdrawable balance.");
+      err.status = 400;
+      throw err;
+    }
 
     // AML & Security Rules — only the auto-payout threshold matters
     const settingsRes = await client.query(`SELECT key, value FROM global_settings WHERE key IN ('is_manual_approval_enabled', 'auto_payout_threshold')`);
     let manualApproval = false;
     let autoPayoutLimit = 2000;
-    
+
     settingsRes.rows.forEach(r => {
       if (r.key === 'is_manual_approval_enabled') manualApproval = (r.value === true || r.value === 'true');
       if (r.key === 'auto_payout_threshold') autoPayoutLimit = Number(r.value);
@@ -269,7 +269,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   let chapaStatus = 'pending_manual';
   let checkout_url = null;
   const cleanDestination = String(payoutDestination).replace(/\D/g, "");
-  
+
   // Auto-format Ethiopian phone numbers (09xx → 2519xx, 07xx → 2517xx)
   let formattedDestination = cleanDestination;
   if (formattedDestination.startsWith("09") && formattedDestination.length === 10) {
@@ -305,7 +305,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
   } catch (chapaErr) {
     const chapaMsg = String(chapaErr?.response?.message || chapaErr?.message || '');
     console.error('[WITHDRAW] Chapa payout failed:', chapaErr?.response || chapaErr?.message);
-    
+
     const isInsufficient = chapaMsg.toLowerCase().includes('insufficient') || chapaMsg.toLowerCase().includes('balance');
     const isInvalid = chapaMsg.toLowerCase().includes('invalid account') || chapaMsg.toLowerCase().includes('account not found');
 
@@ -346,7 +346,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
         throw e;
       }
     }
-    
+
     // Non-critical: log but continue — DB committed, admin manually processes
     chapaStatus = 'pending_manual';
   }
@@ -357,7 +357,7 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
 // ----------- Giveaway / Promo Code Redemption -----------
 async function redeemPromoCode({ userId, code }) {
   const cleanCode = String(code).toUpperCase().trim();
-  
+
   try {
     return await withTx(async (client) => {
       // 1) Find active giveaway by promo code
@@ -370,7 +370,7 @@ async function redeemPromoCode({ userId, code }) {
           AND (ends_at IS NULL OR ends_at >= now())
         FOR UPDATE
       `, [cleanCode]);
-      
+
       const giveaway = giveawayRes.rows[0];
       if (!giveaway) throw new Error("INVALID_CODE");
 
@@ -388,7 +388,7 @@ async function redeemPromoCode({ userId, code }) {
       // 4) Apply balance to BONUS_BALANCE (requested for giveaways)
       const amount = Number(giveaway.amount);
       const idem = makeIdempotencyKey("GIVEAWAY", userId, giveaway.id);
-      
+
       await client.query(SQL.applyTx, [
         userId,
         "PRIZE",
@@ -432,68 +432,70 @@ async function redeemPromoCode({ userId, code }) {
  */
 async function applyNewUserGiveaways(userId) {
   return withTx(async (client) => {
-    // 🔒 Lock the user's wallet row FIRST to prevent race conditions (e.g. duplicate logins)
+    // 🔒 Lock the user's wallet row FIRST to prevent race conditions
     await client.query(`SELECT 1 FROM wallets WHERE user_id = $1 FOR UPDATE`, [userId]);
 
-    // Find all active NEW_USER giveaways
-    const giveaways = await client.query(`
-      SELECT * FROM giveaways 
-      WHERE type = 'NEW_USER' 
-        AND status = 'ACTIVE'
-        AND (starts_at IS NULL OR starts_at <= now())
-        AND (ends_at IS NULL OR ends_at >= now())
+    // Check if they already claimed the current global giveaway version
+    const settingsRes = await client.query(`
+      SELECT key, value FROM global_settings 
+      WHERE key IN ('current_giveaway_version', 'welcome_bonus_amount', 'welcome_bonus_active')
     `);
+    const config = {};
+    for (const r of settingsRes.rows) config[r.key] = r.value;
 
-    for (const g of giveaways.rows) {
-      try {
-        // Check if already claimed — safe because we hold the wallet FOR UPDATE lock
-        const { rowCount } = await client.query(
-          `SELECT 1 FROM giveaway_claims WHERE giveaway_id = $1 AND user_id = $2`,
-          [g.id, userId]
-        );
-        if (rowCount > 0) continue;
-
-        const amount = Number(g.amount);
-        const idem = makeIdempotencyKey("GIVEAWAY_AUTO", userId, g.id);
-
-        // Apply to wallet transaction ledger
-        await client.query(SQL.applyTx, [
-          userId,
-          "GIFT",
-          amount,
-          "COMPLETED",
-          idem,
-          "GIVEAWAY",
-          g.title,
-          { giveawayId: g.id, type: 'AUTO_NEW_USER' }
-        ]);
-
-        // ✅ Update BOTH available_balance and bonus_balance to keep wallet in sync
-        await client.query(`
-          UPDATE wallets 
-          SET available_balance = available_balance + $1,
-              bonus_balance     = bonus_balance + $1,
-              updated_at        = now()
-          WHERE user_id = $2
-        `, [amount, userId]);
-
-        // Record the claim to prevent double-claiming
-        await client.query(
-          `INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`,
-          [g.id, userId, amount]
-        );
-
-        // Add to bonus_logs for the frontend tracking list
-        await client.query(`
-          INSERT INTO bonus_logs (user_id, amount, reason)
-          VALUES ($1, $2, $3)
-        `, [userId, amount, g.title || 'New User Bonus']);
-
-        console.log(`[GIVEAWAY] Auto-applied "${g.title}" (${amount} ETB) to user ${userId}`);
-      } catch (err) {
-        console.error(`[GIVEAWAY_AUTO_ERR] Failed to apply ${g.id} to ${userId}:`, err.message);
-      }
+    if (config.welcome_bonus_active !== 'true' && config.welcome_bonus_active !== true) {
+      return;
     }
+
+    const currentVersion = Number(config.current_giveaway_version || 1);
+    const amount = Number(config.welcome_bonus_amount || 10);
+
+    // Check if user already claimed this version
+    const userRes = await client.query(
+      `SELECT claimed_giveaway_version FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (!userRes.rows.length) return;
+
+    const userVersion = Number(userRes.rows[0].claimed_giveaway_version || 0);
+    if (userVersion >= currentVersion) return; // Already claimed
+
+    // Apply the bonus by updating the user's claimed version
+    await client.query(`
+      UPDATE users 
+      SET claimed_giveaway_version = $1
+      WHERE id = $2
+    `, [currentVersion, userId]);
+
+    const idem = makeIdempotencyKey("GIVEAWAY_AUTO", userId, currentVersion);
+
+    // Apply to wallet transaction ledger
+    await client.query(SQL.applyTx, [
+      userId,
+      "GIFT",
+      amount,
+      "COMPLETED",
+      idem,
+      "GIVEAWAY",
+      "Welcome Bonus",
+      { version: currentVersion, type: 'AUTO_NEW_USER' }
+    ]);
+
+    // Update ONLY bonus_balance because available_balance is already incremented by fn_wallet_apply_tx
+    await client.query(`
+      UPDATE wallets 
+      SET bonus_balance     = COALESCE(bonus_balance, 0) + $1,
+          updated_at        = now()
+      WHERE user_id = $2
+    `, [amount, userId]);
+
+    // Add to bonus_logs for the frontend tracking list
+    await client.query(`
+      INSERT INTO bonus_logs (user_id, amount, reason)
+      VALUES ($1, $2, $3)
+    `, [userId, amount, 'New User Welcome Bonus']);
+
+    console.log(`[GIVEAWAY] Auto-applied Welcome Bonus (${amount} ETB) to user ${userId}`);
   });
 }
 

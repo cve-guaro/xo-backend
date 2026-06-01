@@ -51,6 +51,9 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     ? user.email 
     : `xo${shortId}@gmail.com`;
 
+  // Sanitise mobile number to digits only (strip "+", spaces, etc.) to satisfy Chapa's requirements
+  const cleanMobile = String(mobile || '').replace(/[^0-9]/g, '');
+
   // Chapa requires email, first_name, last_name for initialization
   const payload = {
     amount,
@@ -59,14 +62,14 @@ async function initChapaDeposit(tx_ref, amount, mobile, bank, callback_url, secr
     email: safeEmail,
     first_name: user.username || 'XOET',
     last_name: 'User',
-    phone_number: mobile,
+    phone_number: cleanMobile,
     callback_url,
     return_url,
     payment_method,
     customization: { title: 'Wallet Top-up', description: `Deposit via ${bank}` },
   };
 
-  console.log('[CHAPA DEBUG] Payload email:', safeEmail, '| user.email was:', user.email);
+  console.log('[CHAPA DEBUG] Payload email:', safeEmail, '| user.email was:', user.email, '| cleanMobile:', cleanMobile);
   return chapaFetch('/transaction/initialize', 'POST', payload, secretKey);
 }
 
@@ -83,13 +86,19 @@ async function initChapaPayout(tx_ref, amount, account_number, bank, account_nam
   };
   const bank_code = bankCodeMap[String(bank).toUpperCase()] || '855';
 
-  console.log('[CHAPA PAYOUT] tx_ref:', tx_ref, '| amount:', amount, '| bank:', bank, '→ code:', bank_code, '| dest:', account_number);
+  // Sanitise account number to digits only if it's a mobile money platform
+  let cleanAccount = String(account_number || '');
+  if (['855', '128', '266'].includes(bank_code)) {
+    cleanAccount = cleanAccount.replace(/[^0-9]/g, '');
+  }
+
+  console.log('[CHAPA PAYOUT] tx_ref:', tx_ref, '| amount:', amount, '| bank:', bank, '→ code:', bank_code, '| dest:', cleanAccount);
   const body = {
     "amount": amount,
     "reference": tx_ref,
     "bank_code": bank_code,
     "account_name": account_name || "XO ET User",
-    "account_number": account_number
+    "account_number": cleanAccount
   };
   return chapaFetch('/transfers', 'POST', body, secretKey);
 }

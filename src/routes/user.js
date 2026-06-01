@@ -52,6 +52,15 @@ router.get('/me', auth, async (req, res) => {
   try {
     const userId = req.user.id;
 
+    pool.query(`
+      INSERT INTO user_entries (user_id)
+      SELECT $1::uuid
+      WHERE NOT EXISTS (
+        SELECT 1 FROM user_entries
+        WHERE user_id = $1::uuid AND created_at >= CURRENT_DATE
+      )
+    `, [userId]).catch(err => console.error('[DAU_LOG_ERR]', err));
+
     const query = `
       SELECT 
         u.id,

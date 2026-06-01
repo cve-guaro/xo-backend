@@ -3,6 +3,9 @@ require('dotenv').config();
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  // SECURITY NOTE: rejectUnauthorized:false is REQUIRED by Supabase's PgBouncer pooler.
+  // Supabase uses self-signed certs on their pooler endpoint. Removing this will break the connection.
+  // This is an accepted tradeoff — the connection is still encrypted (TLS), just not certificate-pinned.
   ssl: process.env.DATABASE_URL?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : (process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false),
@@ -20,8 +23,8 @@ async function withTx(fn, maxRetries = 3) {
   while (attempt < maxRetries) {
     const client = await pool.connect();
     try {
-      // ✅ Military-Grade Financial Integrity: Strict Serialization
-      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      // ✅ Military-Grade Financial Integrity: Strict Read Committed with explicit locking
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       const res = await fn(client);
       await client.query('COMMIT');
       return res;

@@ -42,12 +42,12 @@ async function run() {
         const winnerId = winner;
 
         // Room 1 achievements logic
-        if ([10, 25, 50, 99].includes(betBirr)) {
+        if ([10, 25, 50, 90, 99].includes(betBirr)) {
           let tierCol = "";
           if (betBirr === 10) tierCol = "r1_10_wins";
           else if (betBirr === 25) tierCol = "r1_25_wins";
           else if (betBirr === 50) tierCol = "r1_50_wins";
-          else if (betBirr === 99) tierCol = "r1_99_wins";
+          else if (betBirr === 99 || betBirr === 90) tierCol = "r1_99_wins";
 
           await pool.query(`
             UPDATE users SET 

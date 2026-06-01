@@ -37,6 +37,14 @@ async function systemLockdownCheck(req, res, next) {
   try {
     const url = req.originalUrl.split('?')[0]; // Strip query params for matching
 
+    // ─── BYPASS 0: Local development only ───
+    // SECURITY: Only bypass via explicit NODE_ENV check.
+    // IP-based checks (127.0.0.1, ::1) were removed because X-Forwarded-For
+    // can be spoofed by attackers to bypass the lockdown.
+    if (process.env.NODE_ENV === 'development') {
+      return next();
+    }
+
     // ─── BYPASS 1: Always-allow paths (webhooks, callbacks, health) ───
     if (ALWAYS_ALLOW_PATHS.some(p => url.startsWith(p))) {
       return next();

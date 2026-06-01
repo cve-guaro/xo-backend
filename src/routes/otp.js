@@ -14,20 +14,21 @@ const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
 const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
 const SUPER_ADMIN_NUMBERS = (process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
 
-// Per-phone rate limiter: max 5 OTP requests per phone per 15 min
-const phoneOtpRequestCounts = new Map();
-function checkPhoneRateLimit(phone) {
-  const now = Date.now();
-  const windowMs = 15 * 60 * 1000;
+// Per-phone rate limiter: max 3 OTP requests per phone per 15 min (Redis-backed for multi-instance)
+async function checkPhoneRateLimit(phone) {
+  const windowSec = 15 * 60; // 15 minutes
   const maxRequests = 3;
-  if (!phoneOtpRequestCounts.has(phone)) {
-    phoneOtpRequestCounts.set(phone, []);
+  const key = `otp_rate:${phone}`;
+  try {
+    const current = await redis.incr(key);
+    if (current === 1) {
+      await redis.expire(key, windowSec);
+    }
+    return current <= maxRequests;
+  } catch (err) {
+    console.error('[OTP_RATE] Redis error, allowing request:', err.message);
+    return true; // Fail open on Redis error
   }
-  const times = phoneOtpRequestCounts.get(phone).filter(t => now - t < windowMs);
-  if (times.length >= maxRequests) return false;
-  times.push(now);
-  phoneOtpRequestCounts.set(phone, times);
-  return true;
 }
 
 
@@ -67,10 +68,6 @@ async function sendGeezSMS({ userId, phone, message }) {
 
 
 function genOtp(phoneNumber) {
-  console.log("-----------------------------------------");
-  console.log("--- OTP Request (genOtp) ---");
-  console.log("Phone Received:", phoneNumber);
-
   // Generate random 4-digit OTP
   const n = crypto.randomInt(0, 10000);
   return String(n).padStart(4, "0");
@@ -106,7 +103,8 @@ router.post('/request-otp', async (req, res) => {
     const number = normalizeNumber(raw);
 
     // ─── Per-phone rate limit ───────────────────────
-    if (!checkPhoneRateLimit(number)) {
+    const allowed = await checkPhoneRateLimit(number);
+    if (!allowed) {
       console.warn('[REQUEST_OTP] Rate limited by phone', { number });
       return res.status(429).json({ error: 'TOO_MANY_REQUESTS', message: 'Too many OTP requests. Please wait 15 minutes.' });
     }
@@ -114,7 +112,9 @@ router.post('/request-otp', async (req, res) => {
     const code = genOtp(number);
     const ttl = OTP_TTL;
 
-    console.log(`[DEBUG] OTP requested for ${number} (valid for ${ttl}s)`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEBUG] OTP requested for ${number} (valid for ${ttl}s)`);
+    }
 
     await withTx(async (client) => {
       // 1️⃣ Ensure user exists
@@ -186,14 +186,11 @@ router.post('/verify-otp', async (req, res) => {
   const raw = req.body?.number;
   const code = req.body?.code;
 
-  console.log('[VERIFY_OTP] Incoming request', {
-    raw,
-    hasCode: !!code,
-    ip: req.ip,
-  });
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[VERIFY_OTP] Incoming request', { raw, hasCode: !!code, ip: req.ip });
+  }
 
   if (!raw || !code) {
-    console.warn('[VERIFY_OTP] Missing number or code');
     return res.status(400).json({ error: 'number and code are required' });
   }
 
@@ -206,14 +203,7 @@ router.post('/verify-otp', async (req, res) => {
   }
 
   try {
-    console.log("-----------------------------------------");
-    console.log("--- Login Attempt (verify-otp) ---");
-    console.log("Phone Received:", number);
-    console.log("Code Received:", code);
-
-    console.log("ℹ️ User Path. Proceeding to standard OTP check.");
     const result = await withTx(async (client) => {
-      console.log('[VERIFY_OTP] Looking for active OTP', { number });
 
       // 1) Find latest active OTP
       const { rows } = await client.query(
@@ -230,11 +220,6 @@ router.post('/verify-otp', async (req, res) => {
       }
 
       const otp = rows[0];
-      console.log('[VERIFY_OTP] OTP found', {
-        otpId: otp.id,
-        tried: otp.tried,
-        expiresAt: otp.expires_at,
-      });
 
       // Lock row
       await client.query(`SELECT id FROM otps WHERE id=$1 FOR UPDATE`, [otp.id]);
@@ -264,7 +249,7 @@ router.post('/verify-otp', async (req, res) => {
         return { ok: false, reason: 'invalid_code' };
       }
 
-      console.log('[VERIFY_OTP] OTP verified successfully', { otpId: otp.id });
+      console.log('[VERIFY_OTP] OTP verified successfully');
 
       // 4) Success
       await client.query(`UPDATE otps SET used = TRUE WHERE id = $1`, [otp.id]);
@@ -346,18 +331,15 @@ router.post('/verify-otp', async (req, res) => {
      // ---- FIRE-AND-FORGET: Apply bonuses AFTER login succeeds ----
      if (result.isNewUser) {
        const bonusUserId = result.user.id;
-       const refParam = req.body?.ref || req.query?.ref || null;
-       const promoParam = req.body?.promo || req.query?.promo || null;
+       const sanitizeParam = (val) => (val && val !== 'undefined' && val !== 'null' && String(val).trim() !== '') ? val : null;
+       const refParam = sanitizeParam(req.body?.ref || req.query?.ref);
+       const promoParam = sanitizeParam(req.body?.promo || req.query?.promo);
        setImmediate(async () => {
          try {
            console.log(`[BONUS] Processing bonuses for new user ${bonusUserId}...`);
            
-           // A) Apply giveaway-table promotions — skip if user came via referral or promo link
-           if (!refParam && !promoParam) {
-             await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
-           } else {
-             console.log(`[BONUS] Skipping global giveaway for ref/promo user ${bonusUserId}`);
-           }
+           // A) Apply giveaway-table promotions — always apply welcome bonus to every new user
+           await applyNewUserGiveaways(bonusUserId).catch(err => console.error('[GIVEAWAY_ERR]', err.message));
            
            // B) Process referral bonus
            if (refParam) {

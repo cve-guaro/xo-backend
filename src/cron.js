@@ -125,6 +125,17 @@ function initCron() {
     }
   });
 
+  // 6) 🏆 Weekly Leaderboard Snapshot & Payouts (Runs every Sunday at midnight)
+  cron.schedule('0 0 * * 0', async () => {
+    try {
+      console.log('[CRON] Running Weekly Leaderboard Snapshot...');
+      const { runWeeklyLeaderboardSnapshot } = require('./cron/weeklyLeaderboard');
+      await runWeeklyLeaderboardSnapshot();
+    } catch (err) {
+      console.error('[CRON] Weekly Leaderboard Cron Error:', err.message);
+    }
+  });
+
   console.log('[CRON] Scheduler active.');
 }
 

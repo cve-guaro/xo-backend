@@ -2,11 +2,16 @@ const express = require('express');
 const Sentry = require("@sentry/node");
 
 // ─── SENTRY INITIALIZATION ───────────────────────────────────────────────────
-Sentry.init({
-  dsn: "https://e8add0e934a84e475cc88a4d9c1e1642@o4511351046733824.ingest.us.sentry.io/4511351070392320",
-  environment: process.env.NODE_ENV || "development",
-  tracesSampleRate: 0.2,
-});
+// Only initialize Sentry if DSN is configured (keeps it out of source code)
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || "development",
+    tracesSampleRate: 0.2,
+  });
+} else {
+  console.warn('[SENTRY] No SENTRY_DSN configured — error tracking disabled.');
+}
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -42,8 +47,8 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],  // React Native Web requires inline styles
       imgSrc: ["'self'", "data:", "blob:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
       connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app", "wss://xoethiopia.com", "wss://www.xoethiopia.com"],
       // ✅ Allow Flutter WebView to embed this site
@@ -84,6 +89,10 @@ const ALLOWED_ORIGINS = [
   "https://www.xoethiopia.com",
   "https://xo-et-frontend.vercel.app",
   "https://xoet-pro-frontend.vercel.app",
+  // Local dev origins (Expo web)
+  "http://localhost:8081",
+  "http://localhost:19006",
+  "http://localhost:3000",
 ];
 // Allow localhost ONLY if explicitly defined in local .env configuration
 if (process.env.LOCAL_CORS) {
@@ -140,7 +149,7 @@ const paymentLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500, // Increased to 500 to prevent proxy-related IP exhaustion
+  max: 30, // Strict: 30 auth attempts per 15 min per IP (prevents OTP brute-force)
   message: {
     error: "TOO_MANY_REQUESTS",
     message: "Too many login attempts. For security, please wait 15 minutes before trying again."
@@ -231,6 +240,7 @@ app.use('/auth', otpAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
 app.use('/notifications', require('./routes/notifications'));
+app.use('/leaderboard', require('./routes/leaderboard'));
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
   try {
@@ -242,6 +252,27 @@ app.get('/api/features', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch features' });
   }
 });
+
+// Public route: fetch active promotion popup (no auth needed)
+app.get('/promo-popup/active', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, image_url, display_duration, starts_at, expires_at, is_active
+      FROM promo_popups
+      WHERE is_active = true
+        AND (starts_at IS NULL OR starts_at <= NOW())
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+    if (rows.length === 0) return res.json({ ok: true, popup: null });
+    return res.json({ ok: true, popup: rows[0] });
+  } catch (err) {
+    console.error('[PUBLIC] GET /promo-popup/active err', err);
+    return res.status(500).json({ error: 'Failed to fetch promo popup' });
+  }
+});
+
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
 
@@ -309,6 +340,84 @@ initCron();
         created_at TIMESTAMPTZ DEFAULT now()
       );
     `);
+
+    // ── Leaderboard system tables ──
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        week_start DATE NOT NULL,
+        week_end DATE NOT NULL,
+        user_id UUID REFERENCES users(id),
+        username TEXT,
+        wins INT DEFAULT 0,
+        rank INT,
+        prize_amount DECIMAL(10,2) DEFAULT 0,
+        prize_status TEXT DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS fake_ticker_entries (
+        id SERIAL PRIMARY KEY,
+        username TEXT NOT NULL,
+        amount INT NOT NULL,
+        active BOOLEAN DEFAULT true
+      );
+    `);
+
+    // Self-healing default fake ticker seeder
+    const tickerCountRes = await pool.query('SELECT COUNT(*) FROM fake_ticker_entries');
+    if (parseInt(tickerCountRes.rows[0].count, 10) === 0) {
+      console.log('[DB] Seeding default fake ticker entries...');
+      const defaultFakes = [
+        { username: 'Bekele_Pro', amount: 100 },
+        { username: 'Aster_X', amount: 50 },
+        { username: 'Dawit_XO', amount: 150 },
+        { username: 'Almaz_ET', amount: 200 },
+        { username: 'Genet_Top', amount: 80 },
+        { username: 'Yohannes_Champ', amount: 250 },
+        { username: 'Tigist_Play', amount: 36 },
+        { username: 'Abebe_Hero', amount: 120 },
+        { username: 'Helen_ET', amount: 45 },
+        { username: 'Solomon_Winner', amount: 180 },
+        { username: 'Bereket_XO', amount: 90 },
+        { username: 'Natnael_Pro', amount: 15 },
+        { username: 'Genet_X', amount: 60 },
+        { username: 'Tariku_Champ', amount: 300 },
+        { username: 'Mesfin_Hero', amount: 75 },
+      ];
+      for (const f of defaultFakes) {
+        await pool.query(
+          'INSERT INTO fake_ticker_entries (username, amount, active) VALUES ($1, $2, true)',
+          [f.username, f.amount]
+        );
+      }
+      console.log('[DB] Default fake ticker entries seeded successfully.');
+    }
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_entries (
+        id SERIAL PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_entries_created ON user_entries(created_at);`);
+
+    // Leaderboard settings
+    await pool.query(`
+      INSERT INTO global_settings (key, value) VALUES ('leaderboard_auto_approve', 'false'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
+    `);
+    await pool.query(`
+      INSERT INTO global_settings (key, value) VALUES ('fake_ticker_enabled', 'false'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
+    `);
+
+    // Add starts_at column to promo_popups
+    await pool.query(`ALTER TABLE promo_popups ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;`);
 
     console.log('[DB] Migrations applied.');
   } catch (err) {

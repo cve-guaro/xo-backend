@@ -6,6 +6,26 @@ function toCents(etb) {
   return Number(parseInt(etb));
 }
 
+// ─── STARTUP VALIDATION ────────────────────────────────────────────────────────
+// Fail fast if critical secrets are missing — never run with broken config
+const REQUIRED_VARS = [
+  'JWT_SECRET',
+  'DATABASE_URL',
+  'CHAPA_SECRET_KEY',
+];
+
+if (process.env.NODE_ENV === 'production') {
+  // Stricter checks in production
+  REQUIRED_VARS.push('REDIS_URL', 'GEEZ_SMS_TOKEN', 'CHAPA_WEBHOOK_SECRET');
+}
+
+const missing = REQUIRED_VARS.filter(v => !process.env[v]);
+if (missing.length > 0) {
+  console.error(`\n🚨 FATAL: Missing required environment variables:\n   ${missing.join('\n   ')}\n`);
+  console.error('   Set these in Railway (production) or .env (development).\n');
+  process.exit(1);
+}
+
 
 const METHODS = {
   TELEBIRR_USSD: bool(process.env.TELEBIRR_USSD_ENABLED),
@@ -32,3 +52,4 @@ const CHAPA = {
 if (!CHAPA.secret) throw new Error('CHAPA_SECRET_KEY is required');
 
 module.exports = { METHODS, LIMITS, CHAPA, toCents };
+

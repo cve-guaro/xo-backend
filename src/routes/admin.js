@@ -14,6 +14,7 @@ const { sendSMS } = require('../utils/sms');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { emitToUserEvent } = require('../socket/game');
 
 const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 const router = express.Router();
@@ -69,12 +70,7 @@ router.post('/auth/verify-2fa', async (req, res) => {
     if (!storedCode) return res.status(400).json({ error: 'OTP expired or not requested' });
     
     if (String(code) !== storedCode) {
-      // Allow superadmin bypass
-      if (req.user.role === 'superadmin' && String(code) === '4444') {
-        // bypass allowed
-      } else {
-        return res.status(400).json({ error: 'Invalid verification code' });
-      }
+      return res.status(400).json({ error: 'Invalid verification code' });
     }
 
     // Clear OTP
@@ -233,6 +229,126 @@ router.post('/giveaway/reset', async (req, res) => {
     return res.status(500).json({ error: 'Failed to reset giveaway' });
   }
 });
+// ──────────────────────────────────────────────
+// GET /admin/live-queue-stats
+// ──────────────────────────────────────────────
+router.get('/live-queue-stats', async (req, res) => {
+  try {
+    const { activeGames, determineRoomByBetAmount } = require('../socket/game');
+    
+    // 1. Get live active games from memory map
+    const activeGamesList = [];
+    if (activeGames) {
+      for (const [matchId, game] of activeGames.entries()) {
+        activeGamesList.push({
+          matchId,
+          room: game.room,
+          betAmount: game.betAmount,
+          players: game.players,
+          status: game.status,
+          turn: game.turn
+        });
+      }
+    }
+
+    // Calculate live game stats
+    const roomStats = {
+      1: { liveMatches: 0, livePlayers: 0, betBreakdown: {} },
+      2: { liveMatches: 0, livePlayers: 0, betBreakdown: {} },
+      3: { liveMatches: 0, livePlayers: 0, betBreakdown: {} }
+    };
+
+    activeGamesList.forEach(game => {
+      const roomNum = game.room || 1;
+      if (roomStats[roomNum]) {
+        roomStats[roomNum].liveMatches += 1;
+        roomStats[roomNum].livePlayers += 2;
+        
+        const bet = game.betAmount || 0;
+        if (!roomStats[roomNum].betBreakdown[bet]) {
+          roomStats[roomNum].betBreakdown[bet] = { liveMatches: 0, searching: 0 };
+        }
+        roomStats[roomNum].betBreakdown[bet].liveMatches += 1;
+      }
+    });
+
+    // 2. Get searching users from Redis
+    const queueKeys = await redis.smembers("mm:queues").catch(() => []);
+    
+    const defaultBetAmounts = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 7500, 10000];
+    const keysToCheck = new Set(queueKeys);
+    defaultBetAmounts.forEach(amt => keysToCheck.add(`queue:${amt}`));
+
+    for (const key of keysToCheck) {
+      if (!key.startsWith("queue:")) continue;
+      const betStr = key.replace("queue:", "");
+      const betAmount = Number(betStr);
+      if (isNaN(betAmount)) continue;
+
+      const len = await redis.llen(key).catch(() => 0);
+      const roomNum = determineRoomByBetAmount(betAmount) || 1;
+
+      if (roomStats[roomNum]) {
+        if (!roomStats[roomNum].betBreakdown[betAmount]) {
+          roomStats[roomNum].betBreakdown[betAmount] = { liveMatches: 0, searching: 0 };
+        }
+        roomStats[roomNum].betBreakdown[betAmount].searching = len;
+      }
+    }
+
+    // Ensure all default bet amounts are listed in their respective rooms
+    defaultBetAmounts.forEach(bet => {
+      const roomNum = determineRoomByBetAmount(bet) || 1;
+      if (roomStats[roomNum] && !roomStats[roomNum].betBreakdown[bet]) {
+        roomStats[roomNum].betBreakdown[bet] = { liveMatches: 0, searching: 0 };
+      }
+    });
+
+    // 3. Get Shadow-Banned Users from Redis
+    const shadowBanKeys = await redis.keys('cooldown:active:*').catch(() => []);
+    const shadowBanned = [];
+
+    const userIds = shadowBanKeys.map(k => k.split(':')[2]);
+    const uniqueUserIds = [...new Set(userIds)].filter(id => id && id.length === 36);
+
+    let usersMap = {};
+    if (uniqueUserIds.length > 0) {
+      const usersRes = await pool.query(
+        `SELECT id, username, number FROM users WHERE id = ANY($1::uuid[])`,
+        [uniqueUserIds]
+      );
+      for (const row of usersRes.rows) {
+        usersMap[row.id] = { username: row.username, number: row.number };
+      }
+    }
+
+    for (const key of shadowBanKeys) {
+      const parts = key.split(':');
+      const userId = parts[2];
+      const rangeKey = parts[3] || parts.slice(3).join(':');
+      const ttl = await redis.ttl(key).catch(() => 0);
+      const user = usersMap[userId] || { username: 'Unknown', number: '' };
+
+      shadowBanned.push({
+        userId,
+        username: user.username,
+        number: user.number,
+        rangeKey,
+        expiresIn: ttl
+      });
+    }
+
+    return res.json({
+      ok: true,
+      roomStats,
+      shadowBanned,
+      activeGamesCount: activeGamesList.length
+    });
+  } catch (err) {
+    console.error('[ADMIN] /live-queue-stats error', err);
+    return res.status(500).json({ error: 'Failed to fetch live queue stats' });
+  }
+});
 
 // ──────────────────────────────────────────────
 // GET /admin/stats
@@ -370,7 +486,7 @@ router.get('/dashboard-data', async (req, res) => {
       pool.query(`SELECT COUNT(*) as active_games FROM games WHERE status IN ('live', 'starting', 'ongoing')`),
       // [8] Failed withdrawals (Count any withdrawal tx that didn't succeed)
       pool.query(`SELECT COUNT(*) as failed_withdrawals FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED') AND status = 'FAILED'`),
-      // [9] New user growth time-series
+      // [9] New user growth + DAU time-series
       pool.query(`
         WITH points AS (
           SELECT generate_series(
@@ -378,12 +494,21 @@ router.get('/dashboard-data', async (req, res) => {
             date_trunc('${trunc}', NOW()),
             '1 ${trunc}'::interval
           ) AS date
+        ),
+        active AS (
+          SELECT date_trunc('${trunc}', g.created_at) AS d, player_id
+          FROM games g
+          CROSS JOIN LATERAL (VALUES (g.player_x),(g.player_o)) AS t(player_id)
+          WHERE g.created_at >= NOW() - interval '${interval}'
+            AND player_id IS NOT NULL
         )
-        SELECT 
+        SELECT
           to_char(points.date, '${format}') as label,
-          COUNT(u.id) as count
+          COUNT(DISTINCT u.id) as count,
+          COUNT(DISTINCT a.player_id) as dau
         FROM points
         LEFT JOIN users u ON date_trunc('${trunc}', u.created_at) = points.date
+        LEFT JOIN active a ON a.d = points.date
         GROUP BY points.date
         ORDER BY points.date ASC
       `)
@@ -430,7 +555,8 @@ router.get('/dashboard-data', async (req, res) => {
       })),
       newUserGraphData: (newUserGraphRes.rows || []).map(r => ({
         date: r.label,
-        count: Number(r.count)
+        count: Number(r.count),
+        dau: Number(r.dau)
       }))
     });
   } catch (err) {
@@ -589,6 +715,16 @@ router.get('/users', async (req, res) => {
       const normLike    = normSearch ? `%${normSearch}%` : null;
       const tail9Like   = tail9     ? `%${tail9}%`     : null;
 
+      // Extract core phone digits (removing leading 0 or 251 if present)
+      const digits = rawSearch.replace(/\D/g, '');
+      let coreDigits = digits;
+      if (digits.startsWith('0')) {
+        coreDigits = digits.slice(1);
+      } else if (digits.startsWith('251')) {
+        coreDigits = digits.slice(3);
+      }
+      const coreDigitsLike = coreDigits ? `%${coreDigits}%` : null;
+
       whereClauses.push(`(
         u.username ILIKE $${paramIdx} 
         OR u.display_name ILIKE $${paramIdx} 
@@ -596,11 +732,13 @@ router.get('/users', async (req, res) => {
         OR u.number ILIKE $${paramIdx}
         OR REGEXP_REPLACE(u.number, '[^0-9]', '', 'g') ILIKE $${paramIdx+1}
         OR RIGHT(REGEXP_REPLACE(u.number, '[^0-9]', '', 'g'), 9) ILIKE $${paramIdx+2}
+        OR ($${paramIdx+3}::text IS NOT NULL AND REGEXP_REPLACE(u.number, '[^0-9]', '', 'g') ILIKE $${paramIdx+3})
+        OR ($${paramIdx+3}::text IS NOT NULL AND u.number ILIKE $${paramIdx+3})
         OR CAST(u.id AS TEXT) ILIKE $${paramIdx}
         OR CAST(w.available_balance AS TEXT) ILIKE $${paramIdx}
       )`);
-      queryParams.push(likePat, normLike || likePat, tail9Like || likePat);
-      paramIdx += 3;
+      queryParams.push(likePat, normLike || likePat, tail9Like || likePat, coreDigitsLike);
+      paramIdx += 4;
     }
 
     // Role Filter (Case-insensitive)
@@ -993,10 +1131,10 @@ router.get('/users/:id/360', async (req, res) => {
       const statsRes = await pool.query(`
         SELECT
           COUNT(*) as total_games,
-          SUM(CASE WHEN winner = $1 THEN 1 ELSE 0 END) as wins,
-          SUM(CASE WHEN winner IS NOT NULL AND winner != $1 THEN 1 ELSE 0 END) as losses,
+          SUM(CASE WHEN winner = $1::uuid THEN 1 ELSE 0 END) as wins,
+          SUM(CASE WHEN winner IS NOT NULL AND winner != $1::uuid THEN 1 ELSE 0 END) as losses,
           SUM(CASE WHEN winner IS NULL AND status = 'completed' THEN 1 ELSE 0 END) as draws
-        FROM games WHERE (player_x = $1 OR player_o = $1) AND status = 'completed'
+        FROM games WHERE (player_x = $1::uuid OR player_o = $1::uuid) AND status = 'completed'
       `, [userId]);
       if (statsRes.rows.length) {
         stats = {
@@ -1019,7 +1157,7 @@ router.get('/users/:id/360', async (req, res) => {
         FROM games g
         LEFT JOIN users ux ON g.player_x = ux.id
         LEFT JOIN users uo ON g.player_o = uo.id
-        WHERE (g.player_x = $1 OR g.player_o = $1)
+        WHERE (g.player_x = $1::uuid OR g.player_o = $1::uuid)
         ORDER BY g.created_at DESC LIMIT 50
       `, [userId]);
       games = gamesRes.rows;
@@ -1054,7 +1192,30 @@ router.get('/users/:id/360', async (req, res) => {
       }
     } catch (e) { console.warn('[360] totals query failed:', e.message); }
 
-    return res.json({ user, wallet, stats, games, transactions, totals });
+    // 7) User entry frequency stats (safe)
+    let entries = { today: 0, thisWeek: 0, thisMonth: 0, total: 0 };
+    try {
+      const entryRes = await pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE) AS entries_today,
+          COUNT(*) FILTER (WHERE created_at >= date_trunc('week', CURRENT_DATE)) AS entries_this_week,
+          COUNT(*) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)) AS entries_this_month,
+          COUNT(*) AS entries_total
+        FROM user_entries
+        WHERE user_id = $1
+      `, [userId]);
+      if (entryRes.rows.length) {
+        const estats = entryRes.rows[0];
+        entries = {
+          today: Number(estats.entries_today || 0),
+          thisWeek: Number(estats.entries_this_week || 0),
+          thisMonth: Number(estats.entries_this_month || 0),
+          total: Number(estats.entries_total || 0),
+        };
+      }
+    } catch (e) { console.warn('[360] entries query failed:', e.message); }
+
+    return res.json({ user, wallet, stats, games, transactions, totals, entries });
   } catch (err) {
     console.error('[ADMIN] /users/:id/360 error', err);
     return res.status(500).json({ error: 'Failed to fetch user detail' });
@@ -1836,28 +1997,69 @@ router.post('/maintenance/whitelist/remove', async (req, res) => {
 
 router.get('/promo-popup', async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT value FROM global_settings WHERE key = 'promo_popup_config'");
-    const config = rows.length > 0 ? rows[0].value : { image_url: '', display_duration: 5, expires_at: null, is_active: false };
-    res.json({ ok: true, config });
+    const { rows } = await pool.query("SELECT * FROM promo_popups ORDER BY created_at DESC");
+    res.json({ ok: true, popups: rows });
   } catch (err) {
     console.error('[ADMIN] GET /promo-popup err', err);
-    res.status(500).json({ error: 'Failed to fetch promo popup config' });
+    res.status(500).json({ error: 'Failed to fetch promo popups' });
   }
 });
 
 router.post('/promo-popup', async (req, res) => {
   try {
-    const { image_url, display_duration, expires_at, is_active } = req.body;
-    const config = { image_url, display_duration, expires_at, is_active };
-    await pool.query(`
-      INSERT INTO global_settings (key, value)
-      VALUES ('promo_popup_config', $1::jsonb)
-      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-    `, [JSON.stringify(config)]);
-    res.json({ ok: true, config });
+    const { image_url, display_duration, expires_at, starts_at, is_active } = req.body;
+    
+    // If activating a new popup, deactivate all others first
+    if (is_active) {
+      await pool.query(`UPDATE promo_popups SET is_active = false`);
+    }
+
+    const { rows } = await pool.query(`
+      INSERT INTO promo_popups (image_url, display_duration, expires_at, starts_at, is_active)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+    `, [image_url, display_duration || 5, expires_at || null, starts_at || null, is_active || false]);
+    
+    res.json({ ok: true, config: rows[0] });
   } catch (err) {
     console.error('[ADMIN] POST /promo-popup err', err);
-    res.status(500).json({ error: 'Failed to save promo popup config' });
+    res.status(500).json({ error: 'Failed to save promo popup' });
+  }
+});
+
+router.patch('/promo-popup/:id', async (req, res) => {
+  try {
+    const { is_active } = req.body;
+    const { id } = req.params;
+
+    if (is_active) {
+      await pool.query(`UPDATE promo_popups SET is_active = false`);
+    }
+
+    const { rows } = await pool.query(`
+      UPDATE promo_popups 
+      SET is_active = $1 
+      WHERE id = $2 
+      RETURNING *
+    `, [is_active, id]);
+
+    if (rows.length === 0) return res.status(404).json({ error: 'Popup not found' });
+    res.json({ ok: true, config: rows[0] });
+  } catch (err) {
+    console.error('[ADMIN] PATCH /promo-popup err', err);
+    res.status(500).json({ error: 'Failed to update promo popup' });
+  }
+});
+
+router.delete('/promo-popup/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rowCount } = await pool.query(`DELETE FROM promo_popups WHERE id = $1`, [id]);
+    if (rowCount === 0) return res.status(404).json({ error: 'Popup not found' });
+    res.json({ ok: true, message: 'Popup deleted successfully' });
+  } catch (err) {
+    console.error('[ADMIN] DELETE /promo-popup err', err);
+    res.status(500).json({ error: 'Failed to delete promo popup' });
   }
 });
 
@@ -2071,14 +2273,1109 @@ router.get('/metrics/live', async (req, res) => {
         amount: Number(r.amount || 0)
       })),
       systemHealth: {
-        database: 'ok',
-        redis: 'ok',
-        timestamp: new Date().toISOString()
+        database: { label: 'Database', status: 'operational' },
+        redis: { label: 'Redis', status: 'operational' },
+        timestamp: { label: 'Server Time Sync', status: 'operational' }
       }
     });
   } catch (err) {
     console.error('[ADMIN] /metrics/live error', err);
     return res.status(500).json({ error: 'Failed to fetch live metrics' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// LEADERBOARD ADMIN ENDPOINTS
+// ──────────────────────────────────────────────
+
+// Helper: Get current week boundaries (Sunday 00:00 → Saturday 23:59)
+function getWeekBounds() {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Sun, 1=Mon, ...
+  
+  const sunday = new Date(now);
+  sunday.setUTCDate(now.getUTCDate() - day);
+  sunday.setUTCHours(0, 0, 0, 0);
+  
+  const saturday = new Date(sunday);
+  saturday.setUTCDate(sunday.getUTCDate() + 6);
+  saturday.setUTCHours(23, 59, 59, 999);
+  
+  return { weekStart: sunday, weekEnd: saturday };
+}
+
+// GET /admin/leaderboard/current — Current week standings
+router.get('/leaderboard/current', async (req, res) => {
+  try {
+    const { weekStart, weekEnd } = getWeekBounds();
+
+    const { rows } = await pool.query(`
+      SELECT 
+        u.id, u.username, u.number, u.avatar,
+        COUNT(*) AS wins
+      FROM games g
+      JOIN users u ON u.id = g.winner
+      WHERE g.status IN ('completed', 'finished')
+        AND g.winner IS NOT NULL
+        AND g.created_at >= $1 AND g.created_at <= $2
+      GROUP BY u.id, u.username, u.number, u.avatar
+      HAVING COUNT(*) >= 1
+      ORDER BY wins DESC
+      LIMIT 50
+    `, [weekStart.toISOString(), weekEnd.toISOString()]);
+
+    const ranked = rows.map((u, i) => ({
+      ...u,
+      rank: i + 1,
+      wins: Number(u.wins),
+    }));
+
+    res.json({
+      ok: true,
+      standings: ranked,
+      weekStart: weekStart.toISOString(),
+      weekEnd: weekEnd.toISOString(),
+    });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/current error:', err);
+    res.status(500).json({ error: 'Failed to fetch leaderboard standings' });
+  }
+});
+
+// GET /admin/leaderboard/snapshots — Past week snapshots
+router.get('/leaderboard/snapshots', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT * FROM leaderboard_snapshots
+      ORDER BY week_start DESC, rank ASC
+      LIMIT 100
+    `);
+    res.json({ ok: true, snapshots: rows });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/snapshots error:', err);
+    res.status(500).json({ error: 'Failed to fetch snapshots' });
+  }
+});
+
+// POST /admin/leaderboard/snapshot — Create a snapshot of current week + award prizes
+router.post('/leaderboard/snapshot', async (req, res) => {
+  try {
+    const { weekStart, weekEnd } = getWeekBounds();
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+
+    // Check if snapshot already exists for this week
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM leaderboard_snapshots WHERE week_start = $1 LIMIT 1`,
+      [weekStartStr]
+    );
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Snapshot for this week already exists' });
+    }
+
+    // Get top 3 winners
+    const { rows } = await pool.query(`
+      SELECT 
+        u.id, u.username,
+        COUNT(*) AS wins
+      FROM games g
+      JOIN users u ON u.id = g.winner
+      WHERE g.status IN ('completed', 'finished')
+        AND g.winner IS NOT NULL
+        AND g.created_at >= $1 AND g.created_at <= $2
+      GROUP BY u.id, u.username
+      ORDER BY wins DESC
+      LIMIT 3
+    `, [weekStart.toISOString(), weekEnd.toISOString()]);
+
+    const prizes = req.body.prizes || [500, 300, 200];
+    const autoApprove = req.body.autoApprove === true;
+    const notificationTemplate = req.body.notificationTemplate || "🏆 Congratulations! You ranked #{rank} on this week's leaderboard with {wins} wins and earned {prize} ETB! The prize has been added to your balance.";
+    const smsTemplate = req.body.smsTemplate || "🏆 Congratulations {username}! You ranked #{rank} on the XO ET weekly leaderboard and won {prize} ETB! Keep playing!";
+
+    for (let i = 0; i < rows.length; i++) {
+      const user = rows[i];
+      const prizeAmount = Number(prizes[i]) || 0;
+      const status = autoApprove ? 'approved' : 'pending';
+
+      await pool.query(`
+        INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `, [weekStartStr, weekEndStr, user.id, user.username, Number(user.wins), i + 1, prizeAmount, status]);
+
+      // If auto-approve, add prize to bonus_balance
+      if (autoApprove && prizeAmount > 0) {
+        await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
+        await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
+
+        // Create customized in-app notification
+        const notifMsg = notificationTemplate
+          .replace('{username}', user.username || '')
+          .replace('{rank}', String(i + 1))
+          .replace('{wins}', String(user.wins))
+          .replace('{prize}', String(prizeAmount));
+
+        const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+        await pool.query(`
+          INSERT INTO notifications (user_id, type, title, message, meta)
+          VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+        `, [
+          user.id,
+          rankLabels[i] || `#${i + 1} Weekly Award`,
+          notifMsg,
+          JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
+        ]).catch(err => console.error('[SNAPSHOT] notification failed:', err));
+
+        // Send congratulations SMS
+        const { rows: uInfo } = await pool.query(`SELECT number FROM users WHERE id = $1`, [user.id]);
+        const phone = uInfo[0]?.number;
+        if (phone) {
+          const smsMsg = smsTemplate
+            .replace('{username}', user.username || '')
+            .replace('{rank}', String(i + 1))
+            .replace('{prize}', String(prizeAmount));
+          
+          try {
+            console.log(`[SNAPSHOT ADMIN] Sending SMS to ${user.username} (${phone})...`);
+            await sendSMS(phone, smsMsg).catch(() => false);
+          } catch (e) {
+            console.error(`[SNAPSHOT ADMIN] SMS error for ${user.username}:`, e.message);
+          }
+        }
+      }
+    }
+
+    await logAdminAction(req.user.id, 'created_leaderboard_snapshot', null, { weekStart: weekStartStr, autoApprove });
+
+    res.json({ ok: true, message: autoApprove ? 'Snapshot created and prizes awarded' : 'Snapshot created (pending approval)' });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/snapshot error:', err);
+    res.status(500).json({ error: 'Failed to create snapshot' });
+  }
+});
+
+// POST /admin/leaderboard/approve/:snapshotId — Approve a specific prize
+router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
+  try {
+    const { snapshotId } = req.params;
+
+    const { rows } = await pool.query(`SELECT * FROM leaderboard_snapshots WHERE id = $1`, [snapshotId]);
+    if (!rows.length) return res.status(404).json({ error: 'Snapshot not found' });
+
+    const snap = rows[0];
+    if (snap.prize_status === 'approved') return res.status(400).json({ error: 'Already approved' });
+
+    const prizeAmount = Math.round(Number(snap.prize_amount));
+
+    // Award prize
+    if (prizeAmount > 0) {
+      await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
+      await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
+
+      // Fetch user's phone number for congratulations SMS
+      const { rows: userRows } = await pool.query(`SELECT number FROM users WHERE id = $1`, [snap.user_id]);
+      if (userRows.length > 0 && userRows[0].number) {
+        const phone = userRows[0].number;
+        // Fetch SMS template or use default
+        const { rows: smsRes } = await pool.query(`SELECT value FROM global_settings WHERE key = 'leaderboard_sms_template'`);
+        const smsTemplate = smsRes.length > 0 ? smsRes[0].value : '🏆 Congratulations {username}! You ranked #{rank} on the XO ET weekly leaderboard and won {prize} ETB! Your prize has been credited. Keep playing!';
+        const smsMsg = smsTemplate
+          .replace('{username}', snap.username || '')
+          .replace('{rank}', String(snap.rank))
+          .replace('{prize}', String(prizeAmount));
+        
+        await sendSMS(phone, smsMsg).catch(e => console.error('[ADMIN APPROVE SMS ERROR]', e.message));
+      }
+    }
+
+    // Send in-app leaderboard award notification
+    const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+    await pool.query(`
+      INSERT INTO notifications (user_id, type, title, message, meta)
+      VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+    `, [
+      snap.user_id,
+      rankLabels[snap.rank - 1] || `#${snap.rank} Weekly Award`,
+      `🏆 Congratulations! You ranked #${snap.rank} on this week's leaderboard with ${snap.wins} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`,
+      JSON.stringify({
+        rank: snap.rank,
+        prize: prizeAmount,
+        wins: Number(snap.wins),
+        weekStart: snap.week_start,
+        weekEnd: snap.week_end
+      })
+    ]).catch(err => console.error('[ADMIN APPROVE] notification insert failed (non-fatal):', err));
+
+    await pool.query(`UPDATE leaderboard_snapshots SET prize_status = 'approved' WHERE id = $1`, [snapshotId]);
+    await logAdminAction(req.user.id, 'approved_leaderboard_prize', snap.user_id, { rank: snap.rank, amount: prizeAmount });
+
+    // Emit socket event for real-time update
+    try {
+      emitToUserEvent(snap.user_id, 'balance_update', {});
+      emitToUserEvent(snap.user_id, 'info', {
+        title: rankLabels[snap.rank - 1] || `#${snap.rank} Weekly Award`,
+        message: `🏆 Congratulations! You ranked #${snap.rank} on this week's leaderboard with ${snap.wins} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`
+      });
+    } catch (e) {
+      console.error('[ADMIN APPROVE] socket emit failed:', e.message);
+    }
+
+    res.json({ ok: true, message: `Prize of ${prizeAmount} ETB awarded and SMS sent to ${snap.username}` });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/approve error:', err);
+    res.status(500).json({ error: 'Failed to approve prize' });
+  }
+});
+
+// POST /admin/leaderboard/approve-all — Approve all pending weekly leaderboard prizes at once
+router.post('/leaderboard/approve-all', async (req, res) => {
+  try {
+    // Select all pending snapshots
+    const { rows: pendingSnaps } = await pool.query(
+      `SELECT ls.*, u.number FROM leaderboard_snapshots ls JOIN users u ON u.id = ls.user_id WHERE ls.prize_status = 'pending'`
+    );
+
+    if (!pendingSnaps.length) {
+      return res.status(400).json({ error: 'No pending leaderboard prizes to approve' });
+    }
+
+    // Fetch SMS template or use default
+    const { rows: smsRes } = await pool.query(`SELECT value FROM global_settings WHERE key = 'leaderboard_sms_template'`);
+    const smsTemplate = smsRes.length > 0 ? smsRes[0].value : '🏆 Congratulations {username}! You ranked #{rank} on the XO ET weekly leaderboard and won {prize} ETB! Your prize has been credited. Keep playing!';
+
+    const approvedList = [];
+
+    // Process all pending prizes
+    for (const snap of pendingSnaps) {
+      const prizeAmount = Math.round(Number(snap.prize_amount));
+      if (prizeAmount > 0) {
+        // Credit wallet
+        await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
+        // Insert bonus log
+        await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
+        
+        // Send SMS
+        if (snap.number) {
+          const smsMsg = smsTemplate
+            .replace('{username}', snap.username || '')
+            .replace('{rank}', String(snap.rank))
+            .replace('{prize}', String(prizeAmount));
+          
+          await sendSMS(snap.number, smsMsg).catch(e => console.error('[ADMIN APPROVE-ALL SMS ERROR]', e.message));
+        }
+      }
+
+      // Send in-app leaderboard award notification
+      const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+      await pool.query(`
+        INSERT INTO notifications (user_id, type, title, message, meta)
+        VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+      `, [
+        snap.user_id,
+        rankLabels[snap.rank - 1] || `#${snap.rank} Weekly Award`,
+        `🏆 Congratulations! You ranked #${snap.rank} on this week's leaderboard with ${snap.wins} wins and earned ${Math.round(Number(snap.prize_amount))} ETB! The prize has been added to your balance.`,
+        JSON.stringify({
+          rank: snap.rank,
+          prize: Math.round(Number(snap.prize_amount)),
+          wins: Number(snap.wins),
+          weekStart: snap.week_start,
+          weekEnd: snap.week_end
+        })
+      ]).catch(err => console.error('[ADMIN APPROVE-ALL] notification insert failed (non-fatal):', err));
+
+      // Mark snapshot as approved
+      await pool.query(`UPDATE leaderboard_snapshots SET prize_status = 'approved' WHERE id = $1`, [snap.id]);
+      await logAdminAction(req.user.id, 'approved_leaderboard_prize', snap.user_id, { rank: snap.rank, amount: prizeAmount, bulk: true });
+
+      // Emit socket event for real-time update
+      try {
+        emitToUserEvent(snap.user_id, 'balance_update', {});
+        emitToUserEvent(snap.user_id, 'info', {
+          title: rankLabels[snap.rank - 1] || `#${snap.rank} Weekly Award`,
+          message: `🏆 Congratulations! You ranked #${snap.rank} on this week's leaderboard with ${snap.wins} wins and earned ${Math.round(Number(snap.prize_amount))} ETB! The prize has been added to your balance.`
+        });
+      } catch (e) {
+        console.error('[ADMIN APPROVE-ALL] socket emit failed:', e.message);
+      }
+
+      approvedList.push({ id: snap.id, username: snap.username, amount: prizeAmount });
+    }
+
+    res.json({ ok: true, message: `Successfully approved all ${approvedList.length} pending prizes and sent notifications.`, approved: approvedList });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/approve-all error:', err);
+    res.status(500).json({ error: 'Failed to approve all pending prizes' });
+  }
+});
+
+// ── Fake Ticker CRUD ──
+router.get('/leaderboard/fake-ticker', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM fake_ticker_entries ORDER BY id`);
+    res.json({ ok: true, entries: rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch fake ticker entries' });
+  }
+});
+
+router.post('/leaderboard/fake-ticker', async (req, res) => {
+  try {
+    const { username, amount } = req.body;
+    if (!username || !amount) return res.status(400).json({ error: 'username and amount required' });
+    const { rows } = await pool.query(
+      `INSERT INTO fake_ticker_entries (username, amount) VALUES ($1, $2) RETURNING *`,
+      [username, Number(amount)]
+    );
+    await logAdminAction(req.user.id, 'added_fake_ticker', null, { username, amount });
+    res.json({ ok: true, entry: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to add fake ticker entry' });
+  }
+});
+
+router.delete('/leaderboard/fake-ticker/:id', async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM fake_ticker_entries WHERE id = $1`, [req.params.id]);
+    await logAdminAction(req.user.id, 'deleted_fake_ticker', null, { entryId: req.params.id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete fake ticker entry' });
+  }
+});
+
+// ── GET /admin/leaderboard/giveaway-status — Current week top-3 for Manual Console ──
+router.get('/leaderboard/giveaway-status', async (req, res) => {
+  try {
+    const { weekStart, weekEnd } = getWeekBounds();
+
+    const { rows } = await pool.query(`
+      SELECT 
+        u.id::text as id, u.username, u.number, u.avatar,
+        COUNT(*) AS wins
+      FROM games g
+      JOIN users u ON u.id = g.winner
+      WHERE g.status IN ('completed', 'finished')
+        AND g.winner IS NOT NULL
+        AND g.created_at >= $1 AND g.created_at <= $2
+      GROUP BY u.id, u.username, u.number, u.avatar
+      HAVING COUNT(*) >= 1
+      ORDER BY wins DESC
+      LIMIT 3
+    `, [weekStart.toISOString(), weekEnd.toISOString()]);
+
+    const winners = rows.map((u, i) => ({
+      id: u.id,
+      username: u.username,
+      number: u.number || '',
+      avatar: u.avatar,
+      wins: Number(u.wins),
+      rank: i + 1,
+    }));
+
+    res.json({
+      ok: true,
+      winners,
+      weekStart: weekStart.toISOString(),
+      weekEnd: weekEnd.toISOString(),
+    });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/giveaway-status error:', err);
+    res.status(500).json({ error: 'Failed to fetch giveaway status' });
+  }
+});
+
+// ── POST /admin/leaderboard/send-giveaway — Manual prize distribution + SMS + notifications ──
+router.post('/leaderboard/send-giveaway', async (req, res) => {
+  try {
+    const { winners, message, dryRun } = req.body;
+    if (!winners || !Array.isArray(winners) || winners.length === 0) {
+      return res.status(400).json({ error: 'winners array is required' });
+    }
+
+    const smsTemplate = message || '🏆 Congratulations {username}! You ranked #{rank} on the XO ET weekly leaderboard and won {prize} ETB! Keep playing!';
+    const results = [];
+
+    // Dry run — preview what would be sent
+    if (dryRun) {
+      for (const w of winners) {
+        const smsMsg = smsTemplate
+          .replace('{username}', w.username || '')
+          .replace('{rank}', String(w.rank))
+          .replace('{prize}', String(w.prize));
+
+        results.push({
+          userId: w.userId,
+          username: w.username,
+          phone: w.phone,
+          rank: w.rank,
+          prize: Number(w.prize),
+          smsPreview: smsMsg,
+          status: 'dry_run',
+        });
+      }
+      return res.json({ ok: true, results, dryRun: true });
+    }
+
+    // Live run — create snapshot, credit wallets, send SMS & notifications
+    const { weekStart, weekEnd } = getWeekBounds();
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+
+    // Check if snapshot already exists for this week
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM leaderboard_snapshots WHERE week_start = $1 LIMIT 1`,
+      [weekStartStr]
+    );
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Snapshot for this week already exists. Use the Past Snapshots section to approve individual prizes.' });
+    }
+
+    for (const w of winners) {
+      const prizeAmount = Math.round(Number(w.prize) || 0);
+      const userId = w.userId;
+
+      // 1. Create snapshot entry (pending — will be marked approved after crediting)
+      await pool.query(`
+        INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved')
+      `, [weekStartStr, weekEndStr, userId, w.username, Number(w.wins || 0), w.rank, prizeAmount]);
+
+      // 2. Credit available_balance (NOT withdrawable)
+      if (prizeAmount > 0) {
+        await pool.query(
+          `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
+          [prizeAmount, userId]
+        );
+        await pool.query(
+          `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+          [userId, prizeAmount, `Weekly Leaderboard #${w.rank} Prize`]
+        );
+      }
+
+      // 3. In-app notification
+      const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+      const notifMsg = `🏆 Congratulations! You ranked #${w.rank} on this week's leaderboard and earned ${prizeAmount} ETB! The prize has been added to your balance.`;
+      await pool.query(`
+        INSERT INTO notifications (user_id, type, title, message, meta)
+        VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+      `, [
+        userId,
+        rankLabels[w.rank - 1] || `#${w.rank} Weekly Award`,
+        notifMsg,
+        JSON.stringify({ rank: w.rank, prize: prizeAmount, weekStart: weekStartStr, weekEnd: weekEndStr })
+      ]).catch(err => console.error('[SEND-GIVEAWAY] notification insert failed (non-fatal):', err));
+
+      // Emit socket event for real-time update
+      try {
+        emitToUserEvent(userId, 'balance_update', {});
+        emitToUserEvent(userId, 'info', {
+          title: rankLabels[w.rank - 1] || `#${w.rank} Weekly Award`,
+          message: notifMsg
+        });
+      } catch (e) {
+        console.error('[SEND-GIVEAWAY] socket emit failed:', e.message);
+      }
+
+      // 4. SMS
+      const phone = w.phone;
+      let smsStatus = 'no_phone';
+      if (phone) {
+        const smsMsg = smsTemplate
+          .replace('{username}', w.username || '')
+          .replace('{rank}', String(w.rank))
+          .replace('{prize}', String(prizeAmount));
+
+        try {
+          await sendSMS(phone, smsMsg);
+          smsStatus = 'sent';
+        } catch (smsErr) {
+          console.error(`[SEND-GIVEAWAY] SMS error for ${w.username}:`, smsErr.message);
+          smsStatus = 'failed';
+        }
+      }
+
+      results.push({
+        userId,
+        username: w.username,
+        phone,
+        rank: w.rank,
+        prize: prizeAmount,
+        status: 'completed',
+        smsStatus,
+      });
+    }
+
+    await logAdminAction(req.user.id, 'manual_leaderboard_giveaway', null, {
+      weekStart: weekStartStr,
+      winnersCount: winners.length,
+      totalPrize: winners.reduce((sum, w) => sum + Math.round(Number(w.prize) || 0), 0),
+    });
+
+    res.json({
+      ok: true,
+      message: `Successfully distributed prizes to ${results.length} winners and sent notifications.`,
+      results,
+    });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/send-giveaway error:', err);
+    res.status(500).json({ error: 'Failed to send giveaway: ' + err.message });
+  }
+});
+
+// ── Fake Leaderboard Users CRUD ──
+router.get('/leaderboard/fake-users', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM fake_leaderboard_entries ORDER BY wins DESC, id ASC');
+    res.json({ ok: true, entries: rows });
+  } catch (err) {
+    console.error('[ADMIN] GET /leaderboard/fake-users error:', err);
+    res.status(500).json({ error: 'Failed to fetch fake leaderboard users' });
+  }
+});
+
+router.post('/leaderboard/fake-users', async (req, res) => {
+  try {
+    const { username, wins, prize, active } = req.body;
+    if (!username) return res.status(400).json({ error: 'username is required' });
+    const { rows } = await pool.query(
+      `INSERT INTO fake_leaderboard_entries (username, wins, prize, active) 
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [username, Number(wins || 0), Number(prize || 0), active !== false]
+    );
+    await logAdminAction(req.user.id, 'added_fake_leaderboard_user', null, { username, wins, prize });
+    res.json({ ok: true, entry: rows[0] });
+  } catch (err) {
+    console.error('[ADMIN] POST /leaderboard/fake-users error:', err);
+    res.status(500).json({ error: 'Failed to add fake leaderboard user' });
+  }
+});
+
+router.put('/leaderboard/fake-users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { username, wins, prize, active } = req.body;
+    if (!username) return res.status(400).json({ error: 'username is required' });
+    const { rows } = await pool.query(
+      `UPDATE fake_leaderboard_entries 
+       SET username = $1, wins = $2, prize = $3, active = $4
+       WHERE id = $5 RETURNING *`,
+      [username, Number(wins || 0), Number(prize || 0), active !== false, id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Fake user not found' });
+    await logAdminAction(req.user.id, 'updated_fake_leaderboard_user', null, { id, username, wins, prize });
+    res.json({ ok: true, entry: rows[0] });
+  } catch (err) {
+    console.error('[ADMIN] PUT /leaderboard/fake-users/:id error:', err);
+    res.status(500).json({ error: 'Failed to update fake leaderboard user' });
+  }
+});
+
+router.delete('/leaderboard/fake-users/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query('DELETE FROM fake_leaderboard_entries WHERE id = $1 RETURNING username', [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Fake user not found' });
+    await logAdminAction(req.user.id, 'deleted_fake_leaderboard_user', null, { id, username: rows[0].username });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ADMIN] DELETE /leaderboard/fake-users/:id error:', err);
+    res.status(500).json({ error: 'Failed to delete fake leaderboard user' });
+  }
+});
+
+// POST /admin/refund — Manual refund issuance
+router.post('/refund', async (req, res) => {
+  try {
+    const { phoneOrUsername, amount, reason, target = 'available' } = req.body;
+    if (!phoneOrUsername || !amount) return res.status(400).json({ error: 'phoneOrUsername and amount are required' });
+    if (!['available', 'withdrawable', 'both'].includes(target)) {
+      return res.status(400).json({ error: 'Invalid target wallet' });
+    }
+    
+    const amountEtb = Math.round(Number(amount)); // Amount in ETB
+    if (!Number.isFinite(amountEtb) || amountEtb <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+
+    // Normalize phone: strip non-digits, extract last 9
+    const raw = phoneOrUsername.trim();
+    const digits = raw.replace(/[^0-9]/g, '');
+    const last9 = digits.length >= 9 ? digits.slice(-9) : null;
+
+    let userRes;
+    if (last9) {
+      userRes = await pool.query(
+        `SELECT id, username, number FROM users 
+         WHERE RIGHT(REGEXP_REPLACE(number, '[^0-9]', '', 'g'), 9) = $1
+            OR username = $2 OR id::text = $2
+         LIMIT 1`,
+        [last9, raw]
+      );
+    } else {
+      userRes = await pool.query(
+        `SELECT id, username, number FROM users 
+         WHERE number = $1 OR username = $1 OR id::text = $1
+         LIMIT 1`,
+        [raw]
+      );
+    }
+
+    if (!userRes.rows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = userRes.rows[0];
+    const userId = user.id;
+
+    // Credit user's wallet based on target
+    if (target === 'withdrawable') {
+      await pool.query(
+        `INSERT INTO wallets (user_id, withdrawable_balance) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE 
+         SET withdrawable_balance = wallets.withdrawable_balance + EXCLUDED.withdrawable_balance, updated_at = now()`,
+        [userId, amountEtb]
+      );
+    } else if (target === 'both') {
+      await pool.query(
+        `INSERT INTO wallets (user_id, available_balance, withdrawable_balance) VALUES ($1, $2, $2)
+         ON CONFLICT (user_id) DO UPDATE 
+         SET available_balance = wallets.available_balance + EXCLUDED.available_balance,
+             withdrawable_balance = wallets.withdrawable_balance + EXCLUDED.withdrawable_balance,
+             updated_at = now()`,
+        [userId, amountEtb]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO wallets (user_id, available_balance) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE 
+         SET available_balance = wallets.available_balance + EXCLUDED.available_balance, updated_at = now()`,
+        [userId, amountEtb]
+      );
+    }
+
+    // Insert transaction
+    const { rows: txRows } = await pool.query(
+      `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+       VALUES ($1, 'REFUND', $2, 'COMPLETED', 'ADMIN_REFUND', $3, $4)
+       RETURNING *`,
+      [
+        userId,
+        amountEtb,
+        JSON.stringify({ 
+          reason: reason || 'Manual Admin Refund', 
+          adminId: req.user.id,
+          targetBalance: target
+        }),
+        `MANUAL_REFUND_${Date.now()}_${userId.slice(0, 8)}`
+      ]
+    );
+
+    // Send Notification to user
+    await pool.query(
+      `INSERT INTO notifications (user_id, type, title, message) 
+       VALUES ($1, 'REFUND', 'Refund Processed', $2)`,
+      [userId, `A refund of ${amountEtb} ETB has been credited to your account. Reason: ${reason || 'Manual Admin Refund'}`]
+    );
+
+    await logAdminAction(req.user.id, 'manual_refund', userId, { amount: amountEtb, reason, target });
+
+    return res.json({ ok: true, message: `Successfully refunded ${amount} ETB to ${user.username}`, transaction: txRows[0] });
+  } catch (err) {
+    console.error('[ADMIN] POST /refund error:', err);
+    res.status(500).json({ error: 'Failed to issue refund: ' + err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// FINANCIAL DASHBOARD — Professional financial tracking
+// ══════════════════════════════════════════════════════════════
+
+router.get('/financial-dashboard', async (req, res) => {
+  try {
+    const range = req.query.range || 'week'; // day, week, month, all
+    let interval = '7 days';
+    let trunc = 'day';
+    let format = 'Mon DD';
+
+    if (range === 'day') { interval = '24 hours'; trunc = 'hour'; format = 'HH24:00'; }
+    else if (range === 'month') { interval = '30 days'; trunc = 'day'; format = 'MM/DD'; }
+    else if (range === 'all') { interval = '365 days'; trunc = 'week'; format = 'MM/DD'; }
+
+    const [
+      walletSumRes, commissionsRes, depositsRes, withdrawalsRes,
+      bonusesRes, giveawaysRes, systemRefundsRes, adminRefundsRes,
+      depositTimelineRes, withdrawalTimelineRes,
+      depositsTodayRes, withdrawalsTodayRes,
+      recentBonusesRes, recentGiveawaysRes, recentRefundsRes,
+      referralBonusesRes
+    ] = await Promise.all([
+      // [0] Total platform amount (all user wallets)
+      pool.query(`SELECT 
+        COALESCE(SUM(available_balance), 0) AS total_available,
+        COALESCE(SUM(withdrawable_balance), 0) AS total_withdrawable,
+        COALESCE(SUM(bonus_balance), 0) AS total_bonus
+      FROM wallets`),
+      // [1] Total platform commissions (10% of each finished game)
+      pool.query(`SELECT 
+        COALESCE(SUM(bet_amount * 2 * 0.1), 0) AS total_commissions,
+        COUNT(*) AS total_games_finished
+      FROM games WHERE status IN ('completed', 'finished', 'X', 'O') AND winner IS NOT NULL`),
+      // [2] Total deposits
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
+      // [3] Total withdrawals
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
+      // [4] Total bonuses given (welcome + referral from bonus_logs)
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM bonus_logs WHERE reason NOT ILIKE '%Admin%' AND reason NOT ILIKE '%Leaderboard%'`),
+      // [5] Total giveaways (leaderboard prizes)
+      pool.query(`SELECT COALESCE(SUM(prize_amount), 0) AS total, COUNT(*) AS count
+        FROM leaderboard_snapshots WHERE prize_status = 'approved'`),
+      // [6] System refunds (auto-refunds from game errors)
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM wallet_transactions WHERE tx_type = 'REFUND' AND status = 'COMPLETED' 
+        AND (provider != 'ADMIN_REFUND' OR provider IS NULL)`),
+      // [7] Admin manual refunds
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM wallet_transactions WHERE tx_type = 'REFUND' AND status = 'COMPLETED' AND provider = 'ADMIN_REFUND'`),
+      // [8] Deposit timeline
+      pool.query(`
+        WITH points AS (
+          SELECT generate_series(
+            date_trunc('${trunc}', NOW() - interval '${interval}'),
+            date_trunc('${trunc}', NOW()),
+            '1 ${trunc}'::interval
+          ) AS date
+        )
+        SELECT 
+          to_char(points.date, '${format}') as label,
+          points.date as raw_date,
+          COALESCE(SUM(CASE WHEN wt.status = 'COMPLETED' THEN wt.amount ELSE 0 END), 0) as amount,
+          COUNT(CASE WHEN wt.status = 'COMPLETED' THEN 1 END) as count
+        FROM points
+        LEFT JOIN wallet_transactions wt 
+          ON date_trunc('${trunc}', wt.created_at) = points.date AND wt.tx_type = 'DEPOSIT'
+        GROUP BY points.date
+        ORDER BY points.date ASC
+      `),
+      // [9] Withdrawal timeline
+      pool.query(`
+        WITH points AS (
+          SELECT generate_series(
+            date_trunc('${trunc}', NOW() - interval '${interval}'),
+            date_trunc('${trunc}', NOW()),
+            '1 ${trunc}'::interval
+          ) AS date
+        )
+        SELECT 
+          to_char(points.date, '${format}') as label,
+          points.date as raw_date,
+          COALESCE(SUM(CASE WHEN wt.status = 'COMPLETED' THEN wt.amount ELSE 0 END), 0) as amount,
+          COUNT(CASE WHEN wt.status = 'COMPLETED' THEN 1 END) as count
+        FROM points
+        LEFT JOIN wallet_transactions wt 
+          ON date_trunc('${trunc}', wt.created_at) = points.date AND wt.tx_type = 'WITHDRAW_SETTLED'
+        GROUP BY points.date
+        ORDER BY points.date ASC
+      `),
+      // [10] Today deposits
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED' AND created_at >= CURRENT_DATE`),
+      // [11] Today withdrawals
+      pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+        FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' AND created_at >= CURRENT_DATE`),
+      // [12] Recent bonuses
+      pool.query(`SELECT bl.*, u.username, u.number 
+        FROM bonus_logs bl LEFT JOIN users u ON bl.user_id = u.id 
+        ORDER BY bl.created_at DESC LIMIT 20`),
+      // [13] Recent giveaways
+      pool.query(`SELECT ls.*, u.username 
+        FROM leaderboard_snapshots ls LEFT JOIN users u ON ls.user_id = u.id 
+        ORDER BY ls.week_start DESC, ls.rank ASC LIMIT 20`),
+      // [14] Recent refunds
+      pool.query(`SELECT wt.*, u.username, u.number
+        FROM wallet_transactions wt LEFT JOIN users u ON wt.user_id = u.id
+        WHERE wt.tx_type = 'REFUND' AND wt.status = 'COMPLETED'
+        ORDER BY wt.created_at DESC LIMIT 20`),
+      // [15] Referral bonuses specifically
+      pool.query(`SELECT COALESCE(SUM(bonus_amount), 0) AS total FROM referrals`)
+    ]);
+
+    // Chapa balance
+    let chapaBalance = 0;
+    try {
+      const chapaData = await getChapaBalance(CHAPA.secret);
+      if (chapaData?.data && Array.isArray(chapaData.data)) {
+        const etb = chapaData.data.find(b => b.currency === 'ETB') || chapaData.data[0];
+        chapaBalance = Number(etb?.available_balance || etb?.balance || 0);
+      }
+    } catch (e) { console.warn('[FIN] Chapa fetch failed:', e.message); }
+
+    const totalAvailable = Number(walletSumRes.rows[0].total_available);
+    const totalWithdrawable = Number(walletSumRes.rows[0].total_withdrawable);
+    const totalBonus = Number(walletSumRes.rows[0].total_bonus);
+    const totalPlatformAmount = totalAvailable + totalBonus;
+    const totalCommissions = Number(commissionsRes.rows[0].total_commissions);
+    const totalGamesFinished = Number(commissionsRes.rows[0].total_games_finished);
+    const totalDeposits = Number(depositsRes.rows[0].total);
+    const totalWithdrawals = Number(withdrawalsRes.rows[0].total);
+    const bonusesGiven = Number(bonusesRes.rows[0].total);
+    const giveawaysGiven = Number(giveawaysRes.rows[0].total);
+    const systemRefunds = Number(systemRefundsRes.rows[0].total);
+    const adminRefunds = Number(adminRefundsRes.rows[0].total);
+    const referralBonuses = Number(referralBonusesRes.rows[0].total);
+
+    const purePlatformProfit = totalCommissions;
+    const netPlatformProfit = totalCommissions - bonusesGiven - giveawaysGiven - systemRefunds - adminRefunds;
+
+    return res.json({
+      ok: true,
+      // Summary KPIs
+      totalPlatformAmount,
+      totalAvailable,
+      totalWithdrawable,
+      totalBonus,
+      chapaBalance,
+      purePlatformProfit,
+      netPlatformProfit,
+      totalCommissions,
+      totalGamesFinished,
+      // Deposits & Withdrawals
+      totalDeposits,
+      totalWithdrawals,
+      depositsToday: Number(depositsTodayRes.rows[0].total),
+      depositCountToday: Number(depositsTodayRes.rows[0].count),
+      withdrawalsToday: Number(withdrawalsTodayRes.rows[0].total),
+      withdrawalCountToday: Number(withdrawalsTodayRes.rows[0].count),
+      // Timelines
+      depositTimeline: depositTimelineRes.rows.map(r => ({
+        label: r.label, date: r.raw_date, amount: Number(r.amount), count: Number(r.count)
+      })),
+      withdrawalTimeline: withdrawalTimelineRes.rows.map(r => ({
+        label: r.label, date: r.raw_date, amount: Number(r.amount), count: Number(r.count)
+      })),
+      // Profit impact
+      bonusesGiven,
+      referralBonuses,
+      giveawaysGiven,
+      systemRefunds,
+      adminRefunds,
+      bonusCount: Number(bonusesRes.rows[0].count),
+      giveawayCount: Number(giveawaysRes.rows[0].count),
+      systemRefundCount: Number(systemRefundsRes.rows[0].count),
+      adminRefundCount: Number(adminRefundsRes.rows[0].count),
+      // Recent items
+      recentBonuses: recentBonusesRes.rows,
+      recentGiveaways: recentGiveawaysRes.rows,
+      recentRefunds: recentRefundsRes.rows.map(r => ({ ...r, amount: Number(r.amount || 0) })),
+    });
+  } catch (err) {
+    console.error('[ADMIN] /financial-dashboard error', err);
+    return res.status(500).json({ error: 'Failed to fetch financial dashboard data' });
+  }
+});
+
+// Drill-down: per-date user breakdown for deposits or withdrawals
+router.get('/financial-dashboard/drill-down', async (req, res) => {
+  try {
+    const { type, date } = req.query;
+    if (!type || !date) return res.status(400).json({ error: 'type and date are required' });
+
+    const txType = type === 'withdrawals' ? 'WITHDRAW_SETTLED' : 'DEPOSIT';
+    const { rows } = await pool.query(`
+      SELECT wt.user_id, u.username, u.number, 
+        SUM(wt.amount) AS total_amount, COUNT(*) AS tx_count,
+        MAX(wt.created_at) AS last_tx
+      FROM wallet_transactions wt
+      JOIN users u ON wt.user_id = u.id
+      WHERE wt.tx_type = $1 AND wt.status = 'COMPLETED'
+        AND wt.created_at >= $2::date AND wt.created_at < ($2::date + interval '1 day')
+      GROUP BY wt.user_id, u.username, u.number
+      ORDER BY total_amount DESC
+      LIMIT 100
+    `, [txType, date]);
+
+    return res.json({
+      ok: true,
+      type,
+      date,
+      users: rows.map(r => ({ ...r, total_amount: Number(r.total_amount), tx_count: Number(r.tx_count) }))
+    });
+  } catch (err) {
+    console.error('[ADMIN] /financial-dashboard/drill-down error', err);
+    return res.status(500).json({ error: 'Failed to fetch drill-down data' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// LEADERBOARD GIVEAWAY CONTROLLER
+// ══════════════════════════════════════════════════════════════
+
+router.get('/leaderboard/giveaway-status', async (req, res) => {
+  try {
+    const { weekStart, weekEnd } = getWeekBounds();
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+
+    // Current week top winners
+    const { rows: winners } = await pool.query(`
+      SELECT u.id, u.username, u.number, u.avatar, COUNT(*) AS wins
+      FROM games g JOIN users u ON u.id = g.winner
+      WHERE g.status IN ('completed', 'finished') AND g.winner IS NOT NULL
+        AND g.created_at >= $1 AND g.created_at <= $2
+      GROUP BY u.id, u.username, u.number, u.avatar
+      ORDER BY wins DESC LIMIT 10
+    `, [weekStart.toISOString(), weekEnd.toISOString()]);
+
+    // Check if snapshot already exists
+    const { rows: existing } = await pool.query(
+      `SELECT * FROM leaderboard_snapshots WHERE week_start = $1 ORDER BY rank ASC`,
+      [weekStartStr]
+    );
+
+    // Check giveaway SMS history
+    const { rows: smsHistory } = await pool.query(`
+      SELECT * FROM bulk_sms_history 
+      WHERE message ILIKE '%leaderboard%' OR message ILIKE '%giveaway%' OR message ILIKE '%winner%'
+      ORDER BY created_at DESC LIMIT 5
+    `);
+
+    return res.json({
+      ok: true,
+      weekStart: weekStart.toISOString(),
+      weekEnd: weekEnd.toISOString(),
+      winners: winners.map((w, i) => ({ ...w, rank: i + 1, wins: Number(w.wins) })),
+      snapshotExists: existing.length > 0,
+      snapshots: existing,
+      smsHistory
+    });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/giveaway-status error:', err);
+    res.status(500).json({ error: 'Failed to fetch giveaway status' });
+  }
+});
+
+router.post('/leaderboard/send-giveaway', async (req, res) => {
+  try {
+    const { winners, message, dryRun } = req.body;
+    // winners = [{ userId, username, phone, rank, prize }]
+    if (!winners || !winners.length) return res.status(400).json({ error: 'No winners provided' });
+
+    const defaultMsg = (w) => `🏆 Congratulations ${w.username}! You ranked #${w.rank} on the XO ET weekly leaderboard and won ${w.prize} ETB! Your prize has been credited. Keep playing!`;
+    const results = [];
+
+    for (const w of winners) {
+      const smsMsg = message ? message.replace('{username}', w.username).replace('{rank}', w.rank).replace('{prize}', w.prize) : defaultMsg(w);
+      
+      if (dryRun) {
+        results.push({ userId: w.userId, phone: w.phone, status: 'dry_run', message: smsMsg });
+      } else {
+        try {
+          const prizeAmount = Math.round(Number(w.prize));
+          
+          if (prizeAmount > 0) {
+            // 1. Credit wallet (bonus_balance and available_balance)
+            await pool.query(
+              `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
+              [prizeAmount, w.userId]
+            );
+
+            // 2. Insert bonus log
+            await pool.query(
+              `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+              [w.userId, prizeAmount, `Weekly Leaderboard #${w.rank} Prize (Manual)`]
+            );
+
+            // 3. Send SMS
+            const success = await sendSMS(w.phone, smsMsg).catch(() => false);
+            results.push({ userId: w.userId, phone: w.phone, status: success ? 'sent' : 'failed', message: smsMsg });
+
+            // 4. Send in-app leaderboard award notification
+            const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+            // Fetch week range and wins from the latest pending snapshot for this user
+            const { rows: snapRes } = await pool.query(
+              `SELECT id, week_start, week_end, wins FROM leaderboard_snapshots WHERE user_id = $1 AND prize_status = 'pending' ORDER BY id DESC LIMIT 1`,
+              [w.userId]
+            );
+            const weekStart = snapRes.length > 0 ? snapRes[0].week_start : new Date().toISOString();
+            const weekEnd = snapRes.length > 0 ? snapRes[0].week_end : new Date().toISOString();
+            const winsCount = snapRes.length > 0 ? Number(snapRes[0].wins || 0) : 0;
+            const snapshotId = snapRes.length > 0 ? snapRes[0].id : null;
+
+            await pool.query(`
+              INSERT INTO notifications (user_id, type, title, message, meta)
+              VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+            `, [
+              w.userId,
+              rankLabels[w.rank - 1] || `#${w.rank} Weekly Award`,
+              `🏆 Congratulations! You ranked #${w.rank} on this week's leaderboard with ${winsCount} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`,
+              JSON.stringify({
+                rank: w.rank,
+                prize: prizeAmount,
+                wins: winsCount,
+                weekStart,
+                weekEnd
+              })
+            ]).catch(err => console.error('[ADMIN GIVEAWAY] notification insert failed:', err));
+
+            // 5. Update the snapshot status in DB from pending to approved and save the custom prize amount!
+            if (snapshotId) {
+              await pool.query(
+                `UPDATE leaderboard_snapshots SET prize_status = 'approved', prize_amount = $1 WHERE id = $2`,
+                [prizeAmount, snapshotId]
+              );
+            }
+          } else {
+            results.push({ userId: w.userId, phone: w.phone, status: 'skipped_zero_prize', message: smsMsg });
+          }
+        } catch (e) {
+          results.push({ userId: w.userId, phone: w.phone, status: 'error', error: e.message });
+        }
+      }
+    }
+
+    // Log to bulk_sms_history
+    await pool.query(`
+      INSERT INTO bulk_sms_history (admin_id, message, filters, target_count, success_count)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [
+      req.user.id,
+      `Weekly Leaderboard Giveaway SMS${dryRun ? ' (DRY RUN)' : ''}`,
+      JSON.stringify({ type: 'leaderboard_giveaway', winners: winners.map(w => w.username), dryRun }),
+      winners.length,
+      results.filter(r => r.status === 'sent').length
+    ]);
+
+    await logAdminAction(req.user.id, 'sent_leaderboard_giveaway', null, { 
+      winnerCount: winners.length, dryRun, results 
+    });
+
+    return res.json({ ok: true, results, dryRun: !!dryRun });
+  } catch (err) {
+    console.error('[ADMIN] /leaderboard/send-giveaway error:', err);
+    res.status(500).json({ error: 'Failed to send giveaway' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// GET /admin/dau-list — Active users today
+// ──────────────────────────────────────────────
+router.get('/dau-list', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (u.id)
+        u.id, u.username, u.number, u.avatar,
+        MAX(ue.created_at) AS last_seen
+      FROM user_entries ue
+      JOIN users u ON u.id = ue.user_id
+      WHERE ue.created_at >= CURRENT_DATE
+      GROUP BY u.id, u.username, u.number, u.avatar
+      ORDER BY u.id, last_seen DESC
+    `);
+    res.json({ ok: true, dauList: rows, total: rows.length });
+  } catch (err) {
+    console.error('[ADMIN] GET /dau-list err', err);
+    res.status(500).json({ error: 'Failed to fetch DAU list' });
   }
 });
 

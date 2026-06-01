@@ -14,64 +14,53 @@ function dbg(ctx, ...args) { if (DEBUG_MATCH) console.log(`[MM ${ts()}] ${ctx}`,
 function logAlways(ctx, ...args) { console.log(`[MM ${ts()}] ${ctx}`, ...args); }
 function emitDebug(socket, event, payload) { try { if (DEBUG_MATCH) socket.emit("debug", { event, payload, ts: ts() }); } catch { } }
 
-const JWT_SECRET = process.env.JWT_SECRET || "supersecret";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set. Socket authentication cannot work securely.');
+  process.exit(1);
+}
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 const QUEUE_TTL = 120_000; // 2 minutes
 
 const REMATCH_NS = "rematch";
 const REMATCH_TTL = 30_000; // 30s to respond (tweak as you like)
 
-// ---- Room configuration --------------------------------------------
 const ROOMS_CONFIG = {
   1: {
     name: "Room 1 - Beginner",
-    betRange: [10, 25, 50, 99], // Valid bet amounts for this room
+    betRange: [10, 25, 50, 100], // Valid bet amounts for this room
     houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Small bets - 20% total (10% each) - 30s timer"
+    description: "Small bets - 10-100 ETB - 30s timer"
   },
   2: {
     name: "Room 2 - Intermediate",
-    betRange: [100, 250, 500, 999], // Valid bet amounts for this room
+    betRange: [100, 250, 500, 1000], // Valid bet amounts for this room
     houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Medium bets - 20% total (10% each) - 30s timer"
+    description: "Medium bets - 100-500 ETB - 30s timer"
   },
   3: {
     name: "Room 3 - Advanced",
     betRange: [1000, 2500, 5000, 7500, 10000], // Base bet amounts
     houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
-    description: "Large bets - 20% total (10% each) - 30s timer"
+    description: "Large bets - 500-1000 ETB - 30s timer"
   }
 };
 
 // ---- Helper to determine room based on bet amount ------------------
 function determineRoomByBetAmount(betAmount) {
   const amount = Number(betAmount);
+  if (amount <= 100) return 1;
+  if (amount <= 1000) return 2;
+  return 3;
+}
 
-  // Check Room 1 first
-  if (ROOMS_CONFIG[1].betRange.includes(amount)) {
-    return 1;
-  }
-
-  // Check Room 2
-  if (ROOMS_CONFIG[2].betRange.includes(amount)) {
-    return 2;
-  }
-
-  // Check Room 3
-  if (ROOMS_CONFIG[3].betRange.includes(amount)) {
-    return 3;
-  }
-
-  // For Room 3, check if amount is 10000 or more
-  if (amount >= 10000) {
-    return 3;
-  }
-
-  // If no match found, return null
-  return null;
+// ---- Helper to get timer for a bet amount --------------------------
+function getInitialTimerForBetAmount(betAmount) {
+  const room = determineRoomByBetAmount(betAmount);
+  return room ? ROOMS_CONFIG[room].timerDuration : 30;
 }
 
 // ---- Modified calculatePrize function with room-based cuts ---------
@@ -187,7 +176,7 @@ function emitToUser(io, userId, event, payload) {
   const roomName = userRoom(userId);
   const uid = String(userId);
   let delivered = 0;
-  
+
   // PRIMARY: Scan ALL connected sockets and emit directly to every socket belonging to this user
   // This is the most reliable method — doesn't depend on room join working correctly
   for (const [socketId, socket] of io.sockets.sockets) {
@@ -196,17 +185,17 @@ function emitToUser(io, userId, event, payload) {
       socket.emit(event, payload);
       delivered++;
       // Also ensure they're in their room for future emits
-      try { socket.join(roomName); } catch {}
+      try { socket.join(roomName); } catch { }
     }
   }
-  
+
   // SECONDARY: Also emit to the room in case we missed any (e.g. Redis adapter cross-node)
   const room = io.sockets.adapter.rooms.get(roomName);
   const roomSize = room ? room.size : 0;
   if (roomSize > 0) {
     io.to(roomName).emit(event, payload);
   }
-  
+
   console.log(`[EMIT] '${event}' → user ${userId} | direct_sockets=${delivered} | room_size=${roomSize}`);
   if (delivered === 0 && roomSize === 0) {
     console.log(`[EMIT] ❌ No socket found for user ${userId} — they may be offline`);
@@ -482,21 +471,21 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
 
     if (walletRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
 
-      // For each player, apply bonus-first deduction
-      const playerBonusUsed = {};
-      for (const wallet of walletRes.rows) {
-        const avail = Number(wallet.available_balance);
-        const bonus = Number(wallet.bonus_balance);
-        const userId = wallet.user_id;
+    // For each player, apply bonus-first deduction
+    const playerBonusUsed = {};
+    for (const wallet of walletRes.rows) {
+      const avail = Number(wallet.available_balance);
+      const bonus = Number(wallet.bonus_balance);
+      const userId = wallet.user_id;
 
-        const bonusToUse = Math.min(bonus, betAmount);
-        const realToUse = betAmount - bonusToUse;
+      const bonusToUse = Math.min(bonus, betAmount);
+      const realToUse = betAmount - bonusToUse;
 
-        // Check TOTAL effective balance (available + bonus), not just available
-        if ((avail + bonus) < betAmount) throw new Error("INSUFFICIENT_BALANCE");
-        
-        // Store pre-deduction bonus used amount for this player
-        playerBonusUsed[userId] = bonusToUse;
+      // Check TOTAL effective balance (available + bonus), not just available
+      if ((avail + bonus) < betAmount) throw new Error("INSUFFICIENT_BALANCE");
+
+      // Store pre-deduction bonus used amount for this player
+      playerBonusUsed[userId] = bonusToUse;
 
       // Unified deduction:
       // - available_balance always drops by the full betAmount
@@ -516,7 +505,7 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
     await client.query(
       `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at, bonus_used_x, bonus_used_o)
        VALUES ($1, $2, $3, $4, 'ongoing', '[]'::jsonb, NOW(), $5, $6)`,
-      [matchId, playerXId, playerOId, betAmount, 
+      [matchId, playerXId, playerOId, betAmount,
         playerBonusUsed[playerXId],
         playerBonusUsed[playerOId]
       ]
@@ -546,11 +535,9 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
     if (winnerUserId) {
       const isX = (winnerUserId === game.player_x);
       const bonusUsed = isX ? Number(game.bonus_used_x || 0) : Number(game.bonus_used_o || 0);
-      const withdrawableProfit = prizeAmount - bonusUsed;
 
       // Direct wallet update — MUST succeed before ledger
-      // ✅ Fixed: Only add prizeAmount ONCE. The prize already includes the original wager return!
-      // The old bug: we were adding BOTH prizeAmount AND bonusUsed, creating double credit for bonuses
+      // ✅ Victory payout flow: Add prize amount to available_balance and withdrawable_balance
       await client.query(`
         UPDATE wallets 
         SET available_balance = available_balance + $1,
@@ -558,7 +545,22 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
             withdrawable_balance = withdrawable_balance + $3,
             updated_at = NOW()
         WHERE user_id = $4
-      `, [prizeAmount, 0, withdrawableProfit, winnerUserId]);
+      `, [prizeAmount, 0, prizeAmount, winnerUserId]);
+
+      // Fetch winner username and emit global win event
+      const userRes = await client.query(`SELECT username FROM users WHERE id = $1`, [winnerUserId]);
+      const username = userRes.rows[0]?.username || 'User';
+      if (globalIo) {
+        globalIo.emit("global_win", {
+          username: username,
+          amount: prizeAmount,
+          timestamp: Date.now()
+        });
+      }
+
+
+      // NOTE: Victory/loss notifications removed — already tracked by History page.
+      // Only refund, leaderboard, admin messages, and system updates should appear in notifications.
 
       // Ledger record — non-critical; do NOT let this roll back the wallet credit! Use pool.query so it's a separate transaction.
       await pool.query(`
@@ -577,14 +579,47 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         if (betBirr === 10) tierCol = "r1_10_wins";
         else if (betBirr === 25) tierCol = "r1_25_wins";
         else if (betBirr === 50) tierCol = "r1_50_wins";
-        else if (betBirr === 99) tierCol = "r1_99_wins";
+        else if (betBirr === 99 || betBirr === 90) tierCol = "r1_99_wins";
 
         await client.query(
           `UPDATE users SET room_1_wins = room_1_wins + 1${tierCol ? `, ${tierCol} = ${tierCol} + 1` : ''} WHERE id = $1`,
           [winnerUserId]
         ).catch(err => console.error('[game] room_1_wins increment error:', err));
-        
+
         console.log(`[ACHIEVEMENT] Room 1 win recorded: User=${winnerUserId} Bet=${game.bet_amount} Birr=${betBirr} Tier=${tierCol}`);
+
+        // Determine the rangeKey for winner and loser
+        // We read it from the in-memory activeGames map first, with a fallback
+        const activeGameObj = activeGames.get(gameId);
+        const rangeKeyWinner = activeGameObj 
+          ? (winnerUserId === activeGameObj.players.X ? activeGameObj.rangeX : activeGameObj.rangeO)
+          : null;
+        const rangeKeyLoser = activeGameObj 
+          ? (loserUserId === activeGameObj.players.X ? activeGameObj.rangeX : activeGameObj.rangeO)
+          : null;
+
+        // Fallback guess if activeGameObj is gone
+        const guessedRangeKey = betBirr <= 25 ? "10-25" : (betBirr <= 50 ? "25-50" : "50-100");
+        const finalWinnerRangeKey = rangeKeyWinner || guessedRangeKey;
+        const finalLoserRangeKey = rangeKeyLoser || guessedRangeKey;
+
+        // ── 3-Consecutive-Win Cooldown Tracking ──
+        // Increment winner's consecutive win count for this specific range (expires in 30 min)
+        const consWinKey = `cooldown:wins:${winnerUserId}:${finalWinnerRangeKey}`;
+        const newWinCount = await redis.incr(consWinKey).catch(() => 0);
+        await redis.expire(consWinKey, 1800).catch(() => { }); // 30 min expiry
+
+        if (newWinCount >= 3) {
+          // Activate 3-minute shadow ban cooldown for this range
+          await redis.set(`cooldown:active:${winnerUserId}:${finalWinnerRangeKey}`, '1', 'EX', 180).catch(() => { });
+          // Reset counter
+          await redis.del(consWinKey).catch(() => { });
+          console.log(`[COOLDOWN] User ${winnerUserId} hit 3 consecutive wins in range ${finalWinnerRangeKey} → 3min shadow ban activated`);
+        }
+
+        // Reset loser's consecutive win counter for their range
+        const loserConsKey = `cooldown:wins:${loserUserId}:${finalLoserRangeKey}`;
+        await redis.del(loserConsKey).catch(() => { });
       }
     }
     // No draw payouts — winner takes all, game always continues until a winner
@@ -639,21 +674,21 @@ function scheduleGameStart(io, matchId) {
     const sO = g.sockets.O;
     if (!sX || !sO || sX.disconnected || sO.disconnected) {
       logAlways(`[MM] Ghost Match Cleaning matchId=${matchId}: X disconnected? ${!sX || sX.disconnected}, O disconnected? ${!sO || sO.disconnected}`);
-      
+
       const loserSymbol = (!sX || sX.disconnected) ? "X" : "O";
       const winnerSymbol = (loserSymbol === "X" ? "O" : "X");
       const winnerId = g.players[winnerSymbol];
       const { prize } = calculatePrize(g.betAmount);
-      
+
       if (winnerId) {
         finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
           console.error("Ghost cleanup payout err:", err)
         );
-        io.to(matchId).emit("game_won", { 
-          winnerSymbol, 
-          winnerId, 
-          reason: "opponent_left", 
-          prizeAmount: Number(prize) 
+        io.to(matchId).emit("game_won", {
+          winnerSymbol,
+          winnerId,
+          reason: "opponent_left",
+          prizeAmount: Number(prize)
         });
       }
       cleanupGame(matchId);
@@ -685,10 +720,10 @@ function startTimer(io, matchId) {
       const loserSymbol = g.turn;
       const winnerSymbol = (loserSymbol === "X" ? "O" : "X");
       const winnerId = g.players[winnerSymbol];
-      
+
       const { prize } = calculatePrize(g.betAmount); // use room-specific cut
       const prizeBirr = Number(prize); // TRANSLATOR: Send Birr
-      
+
       if (winnerId) {
         finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
           console.error("finishAndPayout win err:", err)
@@ -703,8 +738,36 @@ function startTimer(io, matchId) {
 // ---- NEW: Pre-match delay before game starts -----------------------
 const PRE_MATCH_DELAY_MS = 3000; // 3 seconds
 
+async function isShadowBanned(userId, betMin, betMax) {
+  const rangeKey = `${betMin}-${betMax}`;
+  const banned = await redis.get(`cooldown:active:${userId}:${rangeKey}`).catch(() => null);
+  return !!banned;
+}
+
 // ---------------- Socket wiring ----------------
+let globalIo = null;
+
 function setupGameSocket(io) {
+  globalIo = io;
+
+  // Background interval for simulated/fake wins ticker (runs once globally)
+  setInterval(async () => {
+    try {
+      const settingsRes = await pool.query("SELECT value FROM global_settings WHERE key = 'fake_ticker_enabled'");
+      const enabled = settingsRes.rows.length > 0 && (settingsRes.rows[0].value === true || settingsRes.rows[0].value === 'true');
+      if (!enabled) return;
+
+      const fakeRes = await pool.query("SELECT username, amount FROM fake_ticker_entries WHERE active = true ORDER BY RANDOM() LIMIT 1");
+      if (fakeRes.rows.length === 0) return;
+
+      const { username, amount } = fakeRes.rows[0];
+      io.emit("global_win", { username, amount });
+      console.log(`[FAKE TICKER] Broadcasted simulated win: ${username} won ${amount} Birr`);
+    } catch (err) {
+      console.error("[FAKE TICKER] background broadcast error:", err);
+    }
+  }, 5000);
+
   io.on("connection", (socket) => {
     // === REMATCH: record socket presence once we learn userId =========
     function rememberUser(userId) {
@@ -733,11 +796,10 @@ function setupGameSocket(io) {
       // Token invalid/expired — user just isn't auto-registered, no harm
     }
 
-    // ------- Matchmaking -------
-    socket.on("find_match", async ({ token, betAmount }, ack) => {
+      socket.on("find_match", async ({ token, betAmount, betMin, betMax }, ack) => {
       const rid = shortId();
       let userId = null;
-      
+
       // Railway proxy may strip extraHeaders on WS upgrade — check auth.platform as fallback
       const platform = (
         socket.handshake.headers['x-platform'] ||
@@ -747,45 +809,71 @@ function setupGameSocket(io) {
       ).toLowerCase();
       const isWeb = platform === 'web';
 
-      console.log("find_match called with token:", token ? token.substring(0, 20) + "..." : "NO_TOKEN", "betAmount:", betAmount, "platform:", platform);
-      logAlways(`ENTER find_match rid=${rid} sid=${socket.id} bet=${betAmount} platform=${platform}`);
+      // Backward compatibility fallback for range parameters
+      const safeBetMin = Number(betMin !== undefined ? betMin : betAmount);
+      const safeBetMax = Number(betMax !== undefined ? betMax : betAmount);
+
+      console.log("find_match called with token:", token ? token.substring(0, 20) + "..." : "NO_TOKEN", "betMin:", safeBetMin, "betMax:", safeBetMax, "platform:", platform);
+      logAlways(`ENTER find_match rid=${rid} sid=${socket.id} min=${safeBetMin} max=${safeBetMax} platform=${platform}`);
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.sub || decoded.id;
         console.log(`[MM] Token verified for user: ${userId}`);
-        
+
         // --- STRICT PAYLOAD SANITIZATION (Security Pen Test Patch) ---
-        const safeBetAmount = Number(betAmount);
-        if (!Number.isFinite(safeBetAmount) || safeBetAmount <= 0) {
-           console.warn(`[SECURITY WARN] Malicious betAmount payload detected from user ${userId}:`, betAmount);
-           if (typeof ack === "function") ack({ ok: true, data: { state: "INVALID_BET_AMOUNT" } });
-           socket.emit("error", { code: "INVALID_BET_AMOUNT", message: "Invalid payload format." });
-           return;
+        if (!Number.isFinite(safeBetMin) || safeBetMin <= 0 || !Number.isFinite(safeBetMax) || safeBetMax < safeBetMin) {
+          console.warn(`[SECURITY WARN] Malicious bet payload detected from user ${userId}:`, { betMin, betMax, betAmount });
+          if (typeof ack === "function") ack({ ok: true, data: { state: "INVALID_BET_AMOUNT" } });
+          socket.emit("error", { code: "INVALID_BET_AMOUNT", message: "Invalid payload format." });
+          return;
         }
 
         rememberUser(userId);
         rememberUserSocket(socket, userId); // track user online
         const username = decoded.username || "";
-        
-        // After validation → Normalize and store as cents internally
-        const roomNumber = determineRoomByBetAmount(safeBetAmount);
+
+        // Determine starting search amount (use max if user has enough balance, otherwise min)
+        const balRes = await pool.query(`SELECT available_balance, COALESCE(bonus_balance, 0) AS bonus_balance FROM wallets WHERE user_id = $1`, [userId]);
+        const avail = Number(balRes.rows?.[0]?.available_balance ?? 0);
+        const bonus = Number(balRes.rows?.[0]?.bonus_balance ?? 0);
+        const effectiveBalance = avail + bonus;
+        dbg(`rid=${rid} sid=${socket.id}`, "prequeue balance", { avail, bonus, effectiveBalance, min: safeBetMin, max: safeBetMax });
+
+        if (!balRes.rows.length || effectiveBalance < safeBetMin) {
+          if (typeof ack === "function") ack({ ok: true, data: { state: "INSUFFICIENT_BALANCE" } });
+          socket.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" });
+          return;
+        }
+
+        let searchAmount = safeBetMin;
+        if (effectiveBalance >= safeBetMax) {
+          searchAmount = safeBetMax;
+        }
+
+        const roomNumber = determineRoomByBetAmount(searchAmount);
         if (!roomNumber) {
-          const validBets = [
-            ...ROOMS_CONFIG[1].betRange,
-            ...ROOMS_CONFIG[2].betRange,
-            ...ROOMS_CONFIG[3].betRange,
-            "10000+ (Room 3)"
-          ];
           if (typeof ack === "function") ack({ ok: true, data: { state: "INVALID_BET_AMOUNT" } });
           socket.emit("error", {
             code: "INVALID_BET_AMOUNT",
-            message: `Invalid bet amount. Valid amounts are: ${validBets.join(", ")}`
+            message: `Invalid bet amount.`
           });
           return;
         }
 
         // --- GLOBAL MOBILE APP LOCKOUT CHECK ---
-        if (!isWeb) {
+        const socketHost = socket.handshake.headers.host || '';
+        const socketIp = socket.handshake.address || '';
+        const isSocketLocal =
+          socketHost.includes('localhost') ||
+          socketHost.includes('127.0.0.1') ||
+          socketHost.includes('192.168.') ||
+          socketHost.includes('10.0.2.2') ||
+          socketHost.includes('::1') ||
+          socketIp.includes('127.0.0.1') ||
+          socketIp.includes('::1') ||
+          process.env.NODE_ENV === 'development';
+
+        if (!isWeb && !isSocketLocal) {
           const lockRes = await pool.query(`SELECT value FROM global_settings WHERE key = 'mobile_app_lockout'`);
           if (lockRes.rows.length > 0 && (lockRes.rows[0].value === true || lockRes.rows[0].value === 'true')) {
             if (typeof ack === "function") ack({ ok: true, data: { state: "APP_DEPRECATED" } });
@@ -808,63 +896,27 @@ function setupGameSocket(io) {
           else if (roomNumber === 3) timerDuration = 20;
         }
 
-        // --- TRANSLATOR: Convert Birr to Cents for DB/Logic ---
-        const betAmountCents = Math.round(safeBetAmount);
-        
-        const ctx = `rid=${rid} sid=${socket.id} uid=${userId} bet=${betAmountCents} isWeb=${isWeb}`;
+        const ctx = `rid=${rid} sid=${socket.id} uid=${userId} bet=${searchAmount} isWeb=${isWeb}`;
         dbg(ctx, "verified token and room");
 
         // already in a game? -> NON-ERROR resume
         const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGame) {
           dbg(ctx, "IN_GAME_BLOCK", { inGame });
-          // Link new socket to the ongoing match room to receive events
           socket.join(inGame);
           const activeGame = activeGames.get(inGame);
           if (activeGame) {
-             const symbol = activeGame.players.X === userId ? "X" : "O";
-             socket.data = { matchId: inGame, userId, symbol };
-             activeGame.sockets[symbol] = socket; // Replace zombie socket with live one
-             // Cancel any pending forfeit disconnect timer
-             if (activeGame.reconnectTimeout) clearTimeout(activeGame.reconnectTimeout);
+            const symbol = activeGame.players.X === userId ? "X" : "O";
+            socket.data = { matchId: inGame, userId, symbol };
+            activeGame.sockets[symbol] = socket; // Replace zombie socket with live one
+            if (activeGame.reconnectTimeout) clearTimeout(activeGame.reconnectTimeout);
           }
           if (typeof ack === "function") ack({ ok: true, data: { state: "IN_GAME", matchId: inGame } });
           socket.emit("resume_game", { matchId: inGame });
           return;
         }
 
-        // Room 1 stake-lock check: tier-specific locks after 20 wins
-        if (roomNumber === 1 && ROOMS_CONFIG[1].betRange.includes(Number(betAmount))) {
-          const betNum = Number(betAmount);
-          const colMap = { 10: 'r1_10_wins', 25: 'r1_25_wins', 50: 'r1_50_wins', 99: 'r1_99_wins' };
-          const col = colMap[betNum];
-          
-          if (col) {
-            const lockRes = await pool.query(`SELECT ${col} FROM users WHERE id = $1`, [userId]).catch(() => ({ rows: [] }));
-            const wins = Number(lockRes.rows?.[0]?.[col] ?? 0);
-            if (wins >= 20) {
-              dbg(ctx, "STAKE_LOCKED", { userId, betAmount, wins });
-              if (typeof ack === "function") ack({ ok: true, data: { state: "STAKE_LOCKED", betAmount, wins } });
-              socket.emit("error", { code: "STAKE_LOCKED", message: `Stake ${betAmountCents} ETB is locked after 20 wins. Try a different stake amount.` });
-              return;
-            }
-          }
-        }
-
-        // pre-queue balance check (bonus_balance + available_balance must cover betAmount)
-        const balRes = await pool.query(`SELECT available_balance, COALESCE(bonus_balance, 0) AS bonus_balance FROM wallets WHERE user_id = $1`, [userId]);
-        const avail = Number(balRes.rows?.[0]?.available_balance ?? 0);
-        const bonus = Number(balRes.rows?.[0]?.bonus_balance ?? 0);
-        const effectiveBalance = avail + bonus;
-        dbg(ctx, "prequeue balance", { avail, bonus, effectiveBalance, required: betAmountCents });
-        if (!balRes.rows.length || effectiveBalance < betAmountCents) {
-          if (typeof ack === "function") ack({ ok: true, data: { state: "INSUFFICIENT_BALANCE" } });
-          socket.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" });
-          return;
-        }
-
-
-        const queueKey = `queue:${betAmountCents}`;
+        const queueKey = `queue:${searchAmount}`;
         await redis.sadd(MM_QUEUES_SET, queueKey).catch(() => { });
         dbg(ctx, "queueKey", queueKey);
 
@@ -887,7 +939,10 @@ function setupGameSocket(io) {
           socketId: socket.id,
           joinedAt: Date.now(),
           rid,
-          betAmount: betAmountCents,
+          betMin: safeBetMin,
+          betMax: safeBetMax,
+          searchAmount,
+          betAmount: searchAmount, // backward compatibility
           room: roomNumber,
           timerDuration: timerDuration
         };
@@ -898,7 +953,7 @@ function setupGameSocket(io) {
           searching: true,
           room: roomNumber,
           roomName: ROOMS_CONFIG[roomNumber].name,
-          betAmount: betAmountCents,
+          betAmount: searchAmount,
           timerDuration: timerDuration,
           houseCutPercent: ROOMS_CONFIG[roomNumber].houseCutPercent
         });
@@ -911,7 +966,7 @@ function setupGameSocket(io) {
             ttlMs: QUEUE_TTL,
             room: roomNumber,
             roomName: ROOMS_CONFIG[roomNumber].name,
-            betAmount: betAmountCents,
+            betAmount: searchAmount,
             timerDuration: timerDuration,
             houseCutPercent: ROOMS_CONFIG[roomNumber].houseCutPercent
           }
@@ -928,47 +983,41 @@ function setupGameSocket(io) {
         }
 
         // matcher (with lock)
-        console.log(`[MM] Checking queue for betAmount: ${betAmountCents}, queueKey: ${queueKey}`);
+        console.log(`[MM] Checking queue for searchAmount: ${searchAmount}, queueKey: ${queueKey}`);
         const queueLen = await redis.llen(queueKey).catch(() => 0);
         console.log(`[MM] Current queue length: ${queueLen}`);
 
-        dbg(ctx, "matcher: try lock", { lock: `lock:matcher:${betAmount}` });
-        const locked = await withRedisLock(redis, `lock:matcher:${betAmount}`, 2000, async () => {
+        dbg(ctx, "matcher: try lock", { lock: `lock:matcher:${searchAmount}` });
+        const locked = await withRedisLock(redis, `lock:matcher:${searchAmount}`, 2000, async () => {
           dbg(ctx, "matcher: lock acquired");
 
           while ((await redis.llen(queueKey)) >= 2) {
-            // pop two from head (FIFO)
             let popped = await lpopN(queueKey, 2);
             dbg(ctx, "matcher: popped raw", popped);
-            
+
             if (!Array.isArray(popped)) popped = [popped].filter(Boolean);
-            
-            // If we somehow didn't get 2, but the queue length was >=2, it means 
-            // another process might have popped them, or Redis was busy.
+
             if (popped.length < 2) {
               if (popped.length === 1) await redis.lpush(queueKey, popped[0]);
-              break; 
+              break;
             }
 
             let p1, p2;
-            try { 
-              p1 = JSON.parse(popped[0]); 
-              p2 = JSON.parse(popped[1]); 
-            } catch { 
-              dbg(ctx, "matcher: JSON parse error; skip segment"); 
-              continue; 
+            try {
+              p1 = JSON.parse(popped[0]);
+              p2 = JSON.parse(popped[1]);
+            } catch {
+              dbg(ctx, "matcher: JSON parse error; skip segment");
+              continue;
             }
 
             if (!p1?.userId || !p2?.userId) { dbg(ctx, "matcher: malformed pair; skip"); continue; }
-            
-            // Critical: Don't match user with themselves. If this happens, push the second one back and try next.
-            if (p1.userId === p2.userId) { 
-              dbg(ctx, "same user twice; push p2 back to front"); 
-              await redis.lpush(queueKey, JSON.stringify(p2)); 
-              // We need another player from the queue to match with p1
+
+            if (p1.userId === p2.userId) {
+              dbg(ctx, "same user twice; push p2 back to front");
+              await redis.lpush(queueKey, JSON.stringify(p2));
               const nextRaw = await redis.lpop(queueKey);
               if (!nextRaw) {
-                // No one else left, put p1 back for later
                 await redis.lpush(queueKey, JSON.stringify(p1));
                 break;
               }
@@ -977,20 +1026,38 @@ function setupGameSocket(io) {
 
             const s1 = io.sockets.sockets.get(p1.socketId);
             const s2 = io.sockets.sockets.get(p2.socketId);
-            
+
             if (!s1 || !s2) {
               dbg(ctx, "One or both sockets missing, re-queuing survivors", { s1: !!s1, s2: !!s2 });
-              if (s1) await redis.lpush(queueKey, JSON.stringify(p1)); // Push to FRONT so they aren't penalized
+              if (s1) await redis.lpush(queueKey, JSON.stringify(p1));
               if (s2) await redis.lpush(queueKey, JSON.stringify(p2));
+              continue;
+            }
+
+            // Check shadow bans (3-win streak cooldown)
+            const p1Banned = await isShadowBanned(p1.userId, p1.betMin, p1.betMax);
+            const p2Banned = await isShadowBanned(p2.userId, p2.betMin, p2.betMax);
+
+            if (p1Banned || p2Banned) {
+              dbg(ctx, "matcher: shadow ban detected", { p1: p1.userId, p1Banned, p2: p2.userId, p2Banned });
+              if (p1Banned && p2Banned) {
+                await redis.rpush(queueKey, JSON.stringify(p1));
+                await redis.rpush(queueKey, JSON.stringify(p2));
+              } else if (p1Banned) {
+                await redis.lpush(queueKey, JSON.stringify(p2));
+                await redis.rpush(queueKey, JSON.stringify(p1));
+              } else {
+                await redis.lpush(queueKey, JSON.stringify(p1));
+                await redis.rpush(queueKey, JSON.stringify(p2));
+              }
               continue;
             }
 
             const matchId = uuidv4();
             try {
-              await lockAndStartMatch(matchId, p1.userId, p2.userId, betAmountCents);
+              await lockAndStartMatch(matchId, p1.userId, p2.userId, searchAmount);
             } catch (e) {
               dbg(ctx, "lockAndStartMatch: FAIL", String(e));
-              // Balances might have changed between enqueue and match
               if (String(e).includes("INSUFFICIENT_BALANCE")) {
                 s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
                 s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
@@ -998,13 +1065,11 @@ function setupGameSocket(io) {
               continue;
             }
 
-            // purge both users from ALL queues (handles dup enqueues)
             await Promise.all([
               purgeUserFromAllQueues(p1.userId),
               purgeUserFromAllQueues(p2.userId),
             ]);
 
-            // build game
             const players = { X: p1.userId, O: p2.userId };
             const sockets = { X: s1, O: s2 };
 
@@ -1017,25 +1082,24 @@ function setupGameSocket(io) {
               players,
               sockets,
               timers: { X: initialTimer, O: initialTimer },
-              betAmount: betAmountCents,
+              betAmount: searchAmount,
               room: roomNumber,
+              rangeX: `${p1.betMin}-${p1.betMax}`,
+              rangeO: `${p2.betMin}-${p2.betMax}`,
               timerInterval: null,
               reconnectTimeout: null,
               startTimeout: null,
-              status: "countdown", // will start after 3s
-              round: 1, // track rounds for history display
+              status: "countdown",
+              round: 1,
             };
             activeGames.set(matchId, game);
 
-            // attach identities
             if (sockets.X) sockets.X.data = { matchId, userId: players.X, symbol: "X" };
             if (sockets.O) sockets.O.data = { matchId, userId: players.O, symbol: "O" };
 
-            // ENSURE all fresh sockets for these users join the game room, not just the original queued socket
             io.in(userRoom(players.X)).socketsJoin(matchId);
             io.in(userRoom(players.O)).socketsJoin(matchId);
 
-            // clear search flags/timers
             socketSearching.delete(p1.socketId);
             socketSearching.delete(p2.socketId);
             clearQueueTimeout(p1.socketId);
@@ -1043,11 +1107,9 @@ function setupGameSocket(io) {
             sockets.X.emit("queue_status", { searching: false });
             sockets.O.emit("queue_status", { searching: false });
 
-            // mark in_game (blocks requeue)
             await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
             await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
 
-            // payloads with room info — fetch real usernames to avoid UUID display
             const nameRes = await pool.query(
               `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
               [[players.X, players.O]]
@@ -1057,46 +1119,23 @@ function setupGameSocket(io) {
             const nameO = nameMap.get(String(players.O)) || p2.username || players.O.slice(0, 8);
 
             const payloadX = {
-              matchId,
-              youAre: "X",
-              symbol: "X",
-              opponentId: players.O,
-              opponentUsername: nameO,
-              opponentSymbol: "O",
-              players,
-              betAmount: Number(betAmountCents), // TRANSLATOR: Send Birr to client
-              room: roomNumber,
+              matchId, youAre: "X", symbol: "X", opponentId: players.O, opponentUsername: nameO, opponentSymbol: "O", players,
+              betAmount: Number(searchAmount), room: roomNumber,
               roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
               timerDuration: initialTimer,
               houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
             };
             const payloadO = {
-              matchId,
-              youAre: "O",
-              symbol: "O",
-              opponentId: players.X,
-              opponentUsername: nameX,
-              opponentSymbol: "X",
-              players,
-              betAmount: Number(betAmountCents), // TRANSLATOR: Send Birr to client
-              room: roomNumber,
+              matchId, youAre: "O", symbol: "O", opponentId: players.X, opponentUsername: nameX, opponentSymbol: "X", players,
+              betAmount: Number(searchAmount), room: roomNumber,
               roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
               timerDuration: initialTimer,
               houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
             };
 
-            console.log('[MM] MATCH FOUND! Emitting to both players');
-            console.log('[MM] Player X:', players.X, 'Socket X:', !!sockets.X);
-            console.log('[MM] Player O:', players.O, 'Socket O:', !!sockets.O);
-            console.log('[MM] Match ID:', matchId);
-            console.log('[MM] Payload X sample:', { matchId, symbol: 'X', opponentUsername: nameO });
-            console.log('[MM] Payload O sample:', { matchId, symbol: 'O', opponentUsername: nameX });
-
             dbg(ctx, "emit match_found", { matchId, players });
             emitToUser(io, players.X, "match_found", payloadX);
             emitToUser(io, players.O, "match_found", payloadO);
-
-            // 3-second pre-start countdown
             scheduleGameStart(io, matchId);
           }
 
@@ -1104,6 +1143,329 @@ function setupGameSocket(io) {
         });
 
         dbg(`rid=${rid} sid=${socket.id}`, locked ? "matcher ran" : "matcher skipped (lock held)");
+
+        // ── 500ms Fallback Timeout ──
+        if (searchAmount === safeBetMax && safeBetMin < safeBetMax) {
+          setTimeout(async () => {
+            try {
+              const currentQueue = socketSearching.get(socket.id);
+              if (currentQueue !== `queue:${safeBetMax}`) return;
+
+              const inGameCheck = await redis.get(`in_game:${userId}`).catch(() => null);
+              if (inGameCheck) return;
+
+              const removedCheck = await removeFromQueue(`queue:${safeBetMax}`, userId);
+              if (!removedCheck) return;
+
+              dbg(ctx, `500ms fallback triggered: ${safeBetMax} → ${safeBetMin}`);
+
+              entry.searchAmount = safeBetMin;
+              entry.betAmount = safeBetMin;
+              entry.joinedAt = Date.now();
+
+              const fallbackQueueKey = `queue:${safeBetMin}`;
+              await redis.sadd(MM_QUEUES_SET, fallbackQueueKey).catch(() => { });
+
+              await redis.rpush(fallbackQueueKey, JSON.stringify(entry));
+              socketSearching.set(socket.id, fallbackQueueKey);
+              startQueueTimeout(socket, fallbackQueueKey, userId);
+
+              await withRedisLock(redis, `lock:matcher:${safeBetMin}`, 2000, async () => {
+                while ((await redis.llen(fallbackQueueKey)) >= 2) {
+                  let popped = await lpopN(fallbackQueueKey, 2);
+                  if (!Array.isArray(popped)) popped = [popped].filter(Boolean);
+                  if (popped.length < 2) {
+                    if (popped.length === 1) await redis.lpush(fallbackQueueKey, popped[0]);
+                    break;
+                  }
+
+                  let p1, p2;
+                  try {
+                    p1 = JSON.parse(popped[0]);
+                    p2 = JSON.parse(popped[1]);
+                  } catch { continue; }
+
+                  if (!p1?.userId || !p2?.userId) continue;
+
+                  if (p1.userId === p2.userId) {
+                    await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                    const nextRaw = await redis.lpop(fallbackQueueKey);
+                    if (!nextRaw) {
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                      break;
+                    }
+                    p2 = JSON.parse(nextRaw);
+                  }
+
+                  const s1 = io.sockets.sockets.get(p1.socketId);
+                  const s2 = io.sockets.sockets.get(p2.socketId);
+
+                  if (!s1 || !s2) {
+                    if (s1) await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                    if (s2) await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                    continue;
+                  }
+
+                  const p1Banned = await isShadowBanned(p1.userId, p1.betMin, p1.betMax);
+                  const p2Banned = await isShadowBanned(p2.userId, p2.betMin, p2.betMax);
+
+                  if (p1Banned || p2Banned) {
+                    if (p1Banned && p2Banned) {
+                      await redis.rpush(fallbackQueueKey, JSON.stringify(p1));
+                      await redis.rpush(fallbackQueueKey, JSON.stringify(p2));
+                    } else if (p1Banned) {
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                      await redis.rpush(fallbackQueueKey, JSON.stringify(p1));
+                    } else {
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                      await redis.rpush(fallbackQueueKey, JSON.stringify(p2));
+                    }
+                    continue;
+                  }
+
+                  const matchId = uuidv4();
+                  try {
+                    await lockAndStartMatch(matchId, p1.userId, p2.userId, safeBetMin);
+                  } catch (e) {
+                    if (String(e).includes("INSUFFICIENT_BALANCE")) {
+                      s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
+                      s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
+                    }
+                    continue;
+                  }
+
+                  await Promise.all([
+                    purgeUserFromAllQueues(p1.userId),
+                    purgeUserFromAllQueues(p2.userId),
+                  ]);
+
+                  const players = { X: p1.userId, O: p2.userId };
+                  const sockets = { X: s1, O: s2 };
+                  const fallbackRoom = determineRoomByBetAmount(safeBetMin);
+                  const fallbackTimer = getInitialTimerForBetAmount(safeBetMin);
+
+                  const game = {
+                    id: matchId,
+                    board: Array(9).fill("_"),
+                    turn: "X",
+                    players,
+                    sockets,
+                    timers: { X: fallbackTimer, O: fallbackTimer },
+                    betAmount: safeBetMin,
+                    room: fallbackRoom,
+                    rangeX: `${p1.betMin}-${p1.betMax}`,
+                    rangeO: `${p2.betMin}-${p2.betMax}`,
+                    timerInterval: null,
+                    reconnectTimeout: null,
+                    startTimeout: null,
+                    status: "countdown",
+                    round: 1,
+                  };
+                  activeGames.set(matchId, game);
+
+                  if (sockets.X) sockets.X.data = { matchId, userId: players.X, symbol: "X" };
+                  if (sockets.O) sockets.O.data = { matchId, userId: players.O, symbol: "O" };
+
+                  io.in(userRoom(players.X)).socketsJoin(matchId);
+                  io.in(userRoom(players.O)).socketsJoin(matchId);
+
+                  socketSearching.delete(p1.socketId);
+                  socketSearching.delete(p2.socketId);
+                  clearQueueTimeout(p1.socketId);
+                  clearQueueTimeout(p2.socketId);
+                  sockets.X.emit("queue_status", { searching: false });
+                  sockets.O.emit("queue_status", { searching: false });
+
+                  await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+                  await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+
+                  const nameRes = await pool.query(
+                    `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
+                    [[players.X, players.O]]
+                  ).catch(() => ({ rows: [] }));
+                  const nameMap = new Map(nameRes.rows.map(r => [String(r.id), r.display_name]));
+                  const nameX = nameMap.get(String(players.X)) || p1.username || players.X.slice(0, 8);
+                  const nameO = nameMap.get(String(players.O)) || p2.username || players.O.slice(0, 8);
+
+                  const payloadX = {
+                    matchId, youAre: "X", symbol: "X", opponentId: players.O, opponentUsername: nameO, opponentSymbol: "O", players,
+                    betAmount: Number(safeBetMin), room: fallbackRoom,
+                    roomName: fallbackRoom ? ROOMS_CONFIG[fallbackRoom].name : null,
+                    timerDuration: fallbackTimer,
+                    houseCutPercent: fallbackRoom ? ROOMS_CONFIG[fallbackRoom].houseCutPercent : null
+                  };
+                  const payloadO = {
+                    matchId, youAre: "O", symbol: "O", opponentId: players.X, opponentUsername: nameX, opponentSymbol: "X", players,
+                    betAmount: Number(safeBetMin), room: fallbackRoom,
+                    roomName: fallbackRoom ? ROOMS_CONFIG[fallbackRoom].name : null,
+                    timerDuration: fallbackTimer,
+                    houseCutPercent: fallbackRoom ? ROOMS_CONFIG[fallbackRoom].houseCutPercent : null
+                  };
+
+                  emitToUser(io, players.X, "match_found", payloadX);
+                  emitToUser(io, players.O, "match_found", payloadO);
+                  scheduleGameStart(io, matchId);
+                }
+              });
+
+            } catch (err) {
+              console.error("[MM] Fallback timeout error:", err);
+            }
+          }, 500);
+        }
+
+        // ── Dynamic Cross-Queue Matching (Fast Fallback 0.5s) ──
+        if (true) {
+          const CROSS_QUEUE_DELAY = 500;
+          const CROSS_QUEUE_MAP = {
+            10: [25],
+            25: [10, 50],
+            50: [25, 100],
+            100: [50, 250],
+            250: [100, 500],
+            500: [250, 1000],
+            1000: [500]
+          };
+          const adjacentBets = CROSS_QUEUE_MAP[searchAmount] || [];
+
+          if (adjacentBets.length > 0) {
+            setTimeout(async () => {
+              try {
+                const stillSearching = socketSearching.has(socket.id);
+                const inGameCheck = await redis.get(`in_game:${userId}`).catch(() => null);
+                if (!stillSearching || inGameCheck) return;
+
+                const primaryLen = await redis.llen(queueKey).catch(() => 0);
+                if (primaryLen >= 2) return;
+
+                for (const adjBet of adjacentBets) {
+                  const adjQueueKey = `queue:${adjBet}`;
+                  const adjLen = await redis.llen(adjQueueKey).catch(() => 0);
+                  if (adjLen === 0) continue;
+
+                  const crossLocked = await withRedisLock(redis, `lock:crossmatch:${searchAmount}:${adjBet}`, 2000, async () => {
+                    const recheck = socketSearching.has(socket.id);
+                    const recheckGame = await redis.get(`in_game:${userId}`).catch(() => null);
+                    if (!recheck || recheckGame) return;
+
+                    const raw = await redis.lpop(adjQueueKey);
+                    if (!raw) return;
+
+                    let opponent;
+                    try { opponent = JSON.parse(raw); } catch { return; }
+                    if (!opponent?.userId || opponent.userId === userId) {
+                      await redis.lpush(adjQueueKey, raw);
+                      return;
+                    }
+
+                    const oppSocket = io.sockets.sockets.get(opponent.socketId);
+                    if (!oppSocket || oppSocket.disconnected) return;
+
+                    // Check shadow bans
+                    const p1Banned = await isShadowBanned(userId, safeBetMin, safeBetMax);
+                    const p2Banned = await isShadowBanned(opponent.userId, opponent.betMin, opponent.betMax);
+
+                    if (p1Banned || p2Banned) {
+                      await redis.lpush(adjQueueKey, raw);
+                      return;
+                    }
+
+                    const crossBet = Math.min(searchAmount, adjBet);
+
+                    await removeAllOccurrencesFromQueue(queueKey, userId);
+                    socketSearching.delete(socket.id);
+                    clearQueueTimeout(socket.id);
+                    socketSearching.delete(opponent.socketId);
+                    clearQueueTimeout(opponent.socketId);
+
+                    const crossMatchId = uuidv4();
+                    try {
+                      await lockAndStartMatch(crossMatchId, userId, opponent.userId, crossBet);
+                    } catch (e) {
+                      await redis.rpush(queueKey, JSON.stringify(entry));
+                      await redis.rpush(adjQueueKey, raw);
+                      socketSearching.set(socket.id, queueKey);
+                      socketSearching.set(opponent.socketId, adjQueueKey);
+                      return;
+                    }
+
+                    await Promise.all([
+                      purgeUserFromAllQueues(userId),
+                      purgeUserFromAllQueues(opponent.userId),
+                    ]);
+
+                    const players = { X: userId, O: opponent.userId };
+                    const sockets = { X: socket, O: oppSocket };
+                    const crossRoom = determineRoomByBetAmount(crossBet);
+                    const crossTimer = getInitialTimerForBetAmount(crossBet);
+
+                    const game = {
+                      id: crossMatchId,
+                      board: Array(9).fill("_"),
+                      turn: "X",
+                      players,
+                      sockets,
+                      timers: { X: crossTimer, O: crossTimer },
+                      betAmount: crossBet,
+                      room: crossRoom,
+                      rangeX: `${safeBetMin}-${safeBetMax}`,
+                      rangeO: `${opponent.betMin}-${opponent.betMax}`,
+                      timerInterval: null,
+                      reconnectTimeout: null,
+                      startTimeout: null,
+                      status: "countdown",
+                      round: 1,
+                      crossMatched: true,
+                    };
+                    activeGames.set(crossMatchId, game);
+
+                    sockets.X.data = { matchId: crossMatchId, userId: players.X, symbol: "X" };
+                    sockets.O.data = { matchId: crossMatchId, userId: players.O, symbol: "O" };
+
+                    io.in(userRoom(players.X)).socketsJoin(crossMatchId);
+                    io.in(userRoom(players.O)).socketsJoin(crossMatchId);
+
+                    socket.emit("queue_status", { searching: false });
+                    oppSocket.emit("queue_status", { searching: false });
+
+                    await redis.set(`in_game:${players.X}`, crossMatchId, "PX", QUEUE_TTL * 10).catch(() => { });
+                    await redis.set(`in_game:${players.O}`, crossMatchId, "PX", QUEUE_TTL * 10).catch(() => { });
+
+                    const nameRes2 = await pool.query(
+                      `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
+                      [[players.X, players.O]]
+                    ).catch(() => ({ rows: [] }));
+                    const nm2 = new Map(nameRes2.rows.map(r => [String(r.id), r.display_name]));
+                    const nX = nm2.get(String(players.X)) || username || players.X.slice(0, 8);
+                    const nO = nm2.get(String(players.O)) || opponent.username || players.O.slice(0, 8);
+
+                    const payX = {
+                      matchId: crossMatchId, youAre: "X", symbol: "X", opponentId: players.O, opponentUsername: nO, opponentSymbol: "O", players, betAmount: Number(crossBet), room: crossRoom,
+                      roomName: crossRoom ? ROOMS_CONFIG[crossRoom].name : null,
+                      timerDuration: crossTimer,
+                      houseCutPercent: crossRoom ? ROOMS_CONFIG[crossRoom].houseCutPercent : null,
+                      crossMatched: true,
+                    };
+                    const payO = {
+                      matchId: crossMatchId, youAre: "O", symbol: "O", opponentId: players.X, opponentUsername: nX, opponentSymbol: "X", players, betAmount: Number(crossBet), room: crossRoom,
+                      roomName: crossRoom ? ROOMS_CONFIG[crossRoom].name : null,
+                      timerDuration: crossTimer,
+                      houseCutPercent: crossRoom ? ROOMS_CONFIG[crossRoom].houseCutPercent : null,
+                      crossMatched: true,
+                    };
+
+                    emitToUser(io, players.X, "match_found", payX);
+                    emitToUser(io, players.O, "match_found", payO);
+                    scheduleGameStart(io, crossMatchId);
+                  });
+                  if (crossLocked) break;
+                }
+              } catch (e) {
+                console.warn("[MM] Cross-queue error:", e?.message || e);
+              }
+            }, CROSS_QUEUE_DELAY);
+          }
+        }
       } catch (err) {
         logAlways(`EXCEPTION find_match rid=${rid} sid=${socket.id} uid=${userId || "?"} err=${String(err)}`);
         socket.emit("error", { code: "MATCH_ERROR", message: "Matchmaking error" });
@@ -1119,13 +1481,13 @@ function setupGameSocket(io) {
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.sub || decoded.id;
-        
+
         // CRITICAL: If already matched/in-game, deny cancellation
         const inGameId = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGameId) {
-           console.log(`[MM] Denying cancel for ${userId} - Already matched in ${inGameId}`);
-            if (typeof ack === "function") ack({ ok: false, error: "ALREADY_MATCHED", matchId: inGameId });
-            return;
+          console.log(`[MM] Denying cancel for ${userId} - Already matched in ${inGameId}`);
+          if (typeof ack === "function") ack({ ok: false, error: "ALREADY_MATCHED", matchId: inGameId });
+          return;
         }
 
         const queueKey = socketSearching.get(socket.id);
@@ -1188,7 +1550,7 @@ function setupGameSocket(io) {
         // Fetch target with win caps (no balance exposed)
         const targetRes = await pool.query(
           `SELECT u.id, u.username, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
-                  COALESCE(w.available_balance,0)+COALESCE(w.bonus_balance,0) as balance
+                  COALESCE(w.available_balance,0) as balance
            FROM users u LEFT JOIN wallets w ON u.id=w.user_id
            WHERE LOWER(u.username)=LOWER($1)`, [targetUsername]
         );
@@ -1203,7 +1565,7 @@ function setupGameSocket(io) {
 
         // Sender balance + caps
         const senderRes = await pool.query(
-          `SELECT COALESCE(w.available_balance,0)+COALESCE(w.bonus_balance,0) as balance,
+          `SELECT COALESCE(w.available_balance,0) as balance,
                   u.username, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins
            FROM users u LEFT JOIN wallets w ON u.id=w.user_id
            WHERE u.id=$1`, [senderId]
@@ -1290,7 +1652,7 @@ function setupGameSocket(io) {
       if (!game) return socket.emit("error", { message: "Invalid game" });
 
       const userId = socket.data?.userId;
-      
+
       // Derive symbol exclusively from server state to prevent client spoofing
       const symbol = game.players.X === userId ? "X" : (game.players.O === userId ? "O" : null);
       if (!symbol || !isValidMove(game, index, symbol)) {
@@ -1403,7 +1765,7 @@ function setupGameSocket(io) {
     socket.on("leave_room", async ({ token }) => {
       try {
         const { sub: userId } = jwt.verify(token, JWT_SECRET);
-        await redis.del(`in_game:${userId}`).catch(() => {});
+        await redis.del(`in_game:${userId}`).catch(() => { });
       } catch (e) { }
     });
 
@@ -1585,4 +1947,16 @@ function setupGameSocket(io) {
   });
 }
 
-module.exports = { setupGameSocket, ROOMS_CONFIG, determineRoomByBetAmount };
+const emitToUserEvent = (userId, event, payload) => {
+  if (globalIo) {
+    emitToUser(globalIo, userId, event, payload);
+  }
+};
+
+module.exports = { 
+  setupGameSocket, 
+  ROOMS_CONFIG, 
+  determineRoomByBetAmount, 
+  activeGames,
+  emitToUserEvent
+};

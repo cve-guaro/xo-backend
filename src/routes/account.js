@@ -204,7 +204,7 @@ router.patch("/welcome-seen", auth, async (req, res) => {
         RETURNING id
       )
       UPDATE wallets
-      SET bonus_balance = bonus_balance + $3, available_balance = available_balance + $3
+      SET bonus_balance = COALESCE(bonus_balance, 0) + $3, available_balance = COALESCE(available_balance, 0) + $3
       WHERE user_id IN (SELECT id FROM updated_user)
       RETURNING user_id;
     `, [currentVersion, userId, bonusAmount]);
@@ -230,14 +230,50 @@ router.patch("/welcome-seen", auth, async (req, res) => {
 // GET /account/config -> Returns public/user-level settings
 router.get("/config", auth, async (req, res) => {
   try {
+    const userId = req.user?.id || req.user?.sub || req.user?.userId;
+
     const settingsRes = await pool.query(`
       SELECT key, value FROM global_settings 
       WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled')
+    `);
+    
+    // Also fetch the active promo popup
+    const popupRes = await pool.query(`
+      SELECT image_url, display_duration, expires_at, is_active 
+      FROM promo_popups 
+      WHERE is_active = true 
+      ORDER BY created_at DESC 
+      LIMIT 1
     `);
     const config = {};
     for (const r of settingsRes.rows) {
       // Postgres jsonb might already be parsed depending on driver, but we'll be safe
       config[r.key] = typeof r.value === 'string' ? JSON.parse(r.value) : r.value;
+    }
+
+    // Check if the current user has an unacknowledged win (top 3) from last week's snapshot
+    let previousWeekWin = null;
+    try {
+      const lastSnapshotRes = await pool.query(`
+        SELECT id, rank, prize_amount, week_start, week_end 
+        FROM leaderboard_snapshots 
+        WHERE user_id = $1 AND prize_status IN ('pending', 'approved') AND rank <= 3
+        ORDER BY week_start DESC 
+        LIMIT 1
+      `, [userId]);
+      
+      if (lastSnapshotRes.rows.length > 0) {
+        const snap = lastSnapshotRes.rows[0];
+        previousWeekWin = {
+          snapshotId: snap.id,
+          rank: Number(snap.rank),
+          prize: Number(snap.prize_amount),
+          weekStart: snap.week_start,
+          weekEnd: snap.week_end
+        };
+      }
+    } catch (e) {
+      console.warn('[CONFIG] Error fetching last week win snapshot:', e.message);
     }
     
     res.json({
@@ -245,7 +281,9 @@ router.get("/config", auth, async (req, res) => {
       current_giveaway_version: Number(config.current_giveaway_version || 1),
       welcome_bonus_active: config.welcome_bonus_active === true || config.welcome_bonus_active === 'true',
       welcome_bonus_amount: Number(config.welcome_bonus_amount || 10),
-      referral_enabled: config.referral_enabled !== false && config.referral_enabled !== 'false' // default true if not set
+      referral_enabled: config.referral_enabled !== false && config.referral_enabled !== 'false', // default true if not set
+      promo_popup_config: popupRes.rows.length > 0 ? popupRes.rows[0] : null,
+      previousWeekWin
     });
   } catch (e) {
     console.error("Config fetch error:", e);
