@@ -9,7 +9,7 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : (process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false),
-  max: 5,
+  max: 25,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
