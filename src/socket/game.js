@@ -281,6 +281,56 @@ async function tx(fn) {
   finally { client.release(); }
 }
 
+// ── Robust Redis Double-Matchmaking Reservation Lock ────────────────
+async function acquireMatchLocks(userId1, userId2, ttlMs = 10000) {
+  const [inGame1, inGame2] = await Promise.all([
+    redis.get(`in_game:${userId1}`).catch(() => null),
+    redis.get(`in_game:${userId2}`).catch(() => null)
+  ]);
+
+  if (inGame1) {
+    if (activeGames.has(inGame1)) {
+      return { ok: false, reason: "IN_GAME", details: { userId1: true, userId2: false } };
+    } else {
+      await redis.del(`in_game:${userId1}`).catch(() => {});
+    }
+  }
+
+  if (inGame2) {
+    if (activeGames.has(inGame2)) {
+      return { ok: false, reason: "IN_GAME", details: { userId1: false, userId2: true } };
+    } else {
+      await redis.del(`in_game:${userId2}`).catch(() => {});
+    }
+  }
+
+  const token = uuidv4();
+  const k1 = `matching:${userId1}`;
+  const k2 = `matching:${userId2}`;
+  const [firstKey, secondKey] = String(userId1) < String(userId2) ? [k1, k2] : [k2, k1];
+
+  const ok1 = await redis.set(firstKey, token, "NX", "PX", ttlMs);
+  if (ok1 !== "OK") {
+    return { ok: false, reason: "ALREADY_LOCKING" };
+  }
+
+  const ok2 = await redis.set(secondKey, token, "NX", "PX", ttlMs);
+  if (ok2 !== "OK") {
+    await redis.del(firstKey).catch(() => {});
+    return { ok: false, reason: "ALREADY_LOCKING" };
+  }
+
+  return {
+    ok: true,
+    release: async () => {
+      await Promise.all([
+        redis.del(k1).catch(() => {}),
+        redis.del(k2).catch(() => {})
+      ]);
+    }
+  };
+}
+
 // ---------------- Queue helpers ----------------
 async function removeFromQueue(queueKey, userId) {
   const items = await redis.lrange(queueKey, 0, -1);
@@ -301,95 +351,104 @@ async function startDirectMatch(io, userA, userB, betAmount) {
   const sB = findSocketByUser(io, userB);
   if (!sA || !sB) throw new Error(`OPPONENT_OFFLINE:${!sA ? userA : userB}`);
 
-  // Stamp identities & user rooms defensively
-  rememberUserSocket(sA, userA);
-  rememberUserSocket(sB, userB);
+  const lockResult = await acquireMatchLocks(userA, userB);
+  if (!lockResult.ok) {
+    throw new Error(lockResult.reason === "IN_GAME" ? "ALREADY_IN_GAME" : "BUSY");
+  }
 
-  // Randomize roles
-  const X = Math.random() < 0.5 ? userA : userB;
-  const O = X === userA ? userB : userA;
+  try {
+    // Stamp identities & user rooms defensively
+    rememberUserSocket(sA, userA);
+    rememberUserSocket(sB, userB);
 
-  const matchId = uuidv4();
-  await lockAndStartMatch(matchId, X, O, betAmount);
+    // Randomize roles
+    const X = Math.random() < 0.5 ? userA : userB;
+    const O = X === userA ? userB : userA;
 
-  // Map the right socket for each userId (don't rely on old socket.data)
-  const sockets = {
-    X: String(userA) === String(X) ? sA : sB,
-    O: String(userA) === String(O) ? sA : sB,
-  };
+    const matchId = uuidv4();
+    await lockAndStartMatch(matchId, X, O, betAmount);
 
-  // Get room configuration based on bet amount
-  const roomNumber = determineRoomByBetAmount(betAmount);
-  const initialTimer = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
+    // Map the right socket for each userId (don't rely on old socket.data)
+    const sockets = {
+      X: String(userA) === String(X) ? sA : sB,
+      O: String(userA) === String(O) ? sA : sB,
+    };
 
-  const game = {
-    id: matchId,
-    board: Array(9).fill("_"),
-    turn: "X",
-    players: { X, O },
-    sockets,
-    timers: { X: initialTimer, O: initialTimer },
-    betAmount,
-    room: roomNumber,
-    timerInterval: null,
-    reconnectTimeout: null,
-    startTimeout: null,
-    status: "countdown",
-  };
-  activeGames.set(matchId, game);
+    // Get room configuration based on bet amount
+    const roomNumber = determineRoomByBetAmount(betAmount);
+    const initialTimer = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
 
-  // Tag and join room for timers / in-game events
-  sockets.X.data = { ...(sockets.X.data || {}), matchId, userId: X, symbol: "X" };
-  sockets.O.data = { ...(sockets.O.data || {}), matchId, userId: O, symbol: "O" };
-  sockets.X.join(matchId);
-  sockets.O.join(matchId);
+    const game = {
+      id: matchId,
+      board: Array(9).fill("_"),
+      turn: "X",
+      players: { X, O },
+      sockets,
+      timers: { X: initialTimer, O: initialTimer },
+      betAmount,
+      room: roomNumber,
+      timerInterval: null,
+      reconnectTimeout: null,
+      startTimeout: null,
+      status: "countdown",
+    };
+    activeGames.set(matchId, game);
 
-  await redis.set(`in_game:${X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
-  await redis.set(`in_game:${O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+    // Tag and join room for timers / in-game events
+    sockets.X.data = { ...(sockets.X.data || {}), matchId, userId: X, symbol: "X" };
+    sockets.O.data = { ...(sockets.O.data || {}), matchId, userId: O, symbol: "O" };
+    sockets.X.join(matchId);
+    sockets.O.join(matchId);
 
-  const usersRes = await pool.query(`SELECT id, username FROM users WHERE id = ANY($1::uuid[])`, [[X, O]]);
-  const userMap = {};
-  for (const r of usersRes.rows) userMap[r.id] = r.username;
-  const nameX = userMap[X] || "Player X";
-  const nameO = userMap[O] || "Player O";
+    await redis.set(`in_game:${X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+    await redis.set(`in_game:${O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
 
-  const payloadX = {
-    matchId,
-    youAre: "X",
-    symbol: "X",
-    opponentId: O,
-    opponentUsername: nameO,
-    opponentSymbol: "O",
-    players: { X, O },
-    betAmount,
-    room: roomNumber,
-    roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
-    timerDuration: initialTimer,
-    houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
-  };
-  const payloadO = {
-    matchId,
-    youAre: "O",
-    symbol: "O",
-    opponentId: X,
-    opponentUsername: nameX,
-    opponentSymbol: "X",
-    players: { X, O },
-    betAmount,
-    room: roomNumber,
-    roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
-    timerDuration: initialTimer,
-    houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
-  };
+    const usersRes = await pool.query(`SELECT id, username FROM users WHERE id = ANY($1::uuid[])`, [[X, O]]);
+    const userMap = {};
+    for (const r of usersRes.rows) userMap[r.id] = r.username;
+    const nameX = userMap[X] || "Player X";
+    const nameO = userMap[O] || "Player O";
 
-  // ✅ Emit by user room so both sides *definitely* receive it
-  emitToUser(io, X, "match_found", payloadX);
-  emitToUser(io, O, "match_found", payloadO);
+    const payloadX = {
+      matchId,
+      youAre: "X",
+      symbol: "X",
+      opponentId: O,
+      opponentUsername: nameO,
+      opponentSymbol: "O",
+      players: { X, O },
+      betAmount,
+      room: roomNumber,
+      roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
+      timerDuration: initialTimer,
+      houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
+    };
+    const payloadO = {
+      matchId,
+      youAre: "O",
+      symbol: "O",
+      opponentId: X,
+      opponentUsername: nameX,
+      opponentSymbol: "X",
+      players: { X, O },
+      betAmount,
+      room: roomNumber,
+      roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null,
+      timerDuration: initialTimer,
+      houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null
+    };
 
-  // 3-second pre-start countdown
-  scheduleGameStart(io, matchId);
+    // ✅ Emit by user room so both sides *definitely* receive it
+    emitToUser(io, X, "match_found", payloadX);
+    emitToUser(io, O, "match_found", payloadO);
 
-  return { matchId, X, O };
+    // 3-second pre-start countdown
+    scheduleGameStart(io, matchId);
+
+    return { matchId, X, O };
+  } finally {
+    await lockResult.release();
+  }
 }
 
 async function removeAllOccurrencesFromQueue(queueKey, userId) {
@@ -902,18 +961,21 @@ function setupGameSocket(io) {
         // already in a game? -> NON-ERROR resume
         const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGame) {
-          dbg(ctx, "IN_GAME_BLOCK", { inGame });
-          socket.join(inGame);
           const activeGame = activeGames.get(inGame);
           if (activeGame) {
+            dbg(ctx, "IN_GAME_BLOCK", { inGame });
+            socket.join(inGame);
             const symbol = activeGame.players.X === userId ? "X" : "O";
             socket.data = { matchId: inGame, userId, symbol };
             activeGame.sockets[symbol] = socket; // Replace zombie socket with live one
             if (activeGame.reconnectTimeout) clearTimeout(activeGame.reconnectTimeout);
+            if (typeof ack === "function") ack({ ok: true, data: { state: "IN_GAME", matchId: inGame } });
+            socket.emit("resume_game", { matchId: inGame });
+            return;
+          } else {
+            dbg(ctx, "Stale in_game key found in Redis, cleaning up", { inGame });
+            await redis.del(`in_game:${userId}`).catch(() => {});
           }
-          if (typeof ack === "function") ack({ ok: true, data: { state: "IN_GAME", matchId: inGame } });
-          socket.emit("resume_game", { matchId: inGame });
-          return;
         }
 
         const queueKey = `queue:${searchAmount}`;
@@ -1053,17 +1115,53 @@ function setupGameSocket(io) {
               continue;
             }
 
+            const lockResult = await acquireMatchLocks(p1.userId, p2.userId);
+            if (!lockResult.ok) {
+              dbg(ctx, "matcher: could not acquire locks, re-queuing survivors", lockResult.reason);
+              if (lockResult.reason === "IN_GAME") {
+                if (!lockResult.details.userId1) await redis.lpush(queueKey, JSON.stringify(p1));
+                if (!lockResult.details.userId2) await redis.lpush(queueKey, JSON.stringify(p2));
+              } else {
+                await redis.lpush(queueKey, JSON.stringify(p1));
+                await redis.lpush(queueKey, JSON.stringify(p2));
+              }
+              continue;
+            }
+
             const matchId = uuidv4();
             try {
               await lockAndStartMatch(matchId, p1.userId, p2.userId, searchAmount);
             } catch (e) {
               dbg(ctx, "lockAndStartMatch: FAIL", String(e));
-              if (String(e).includes("INSUFFICIENT_BALANCE")) {
-                s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
-                s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
+              await lockResult.release();
+
+              let p1Bal = 0, p2Bal = 0;
+              try {
+                const balRes = await pool.query(
+                  `SELECT user_id, (available_balance + COALESCE(bonus_balance, 0)) as balance FROM wallets WHERE user_id = ANY($1::uuid[])`,
+                  [[p1.userId, p2.userId]]
+                );
+                for (const row of balRes.rows) {
+                  if (row.user_id === p1.userId) p1Bal = Number(row.balance);
+                  if (row.user_id === p2.userId) p2Bal = Number(row.balance);
+                }
+              } catch {}
+
+              if (p1Bal < searchAmount) {
+                s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." });
+              } else {
+                await redis.lpush(queueKey, JSON.stringify(p1));
+              }
+
+              if (p2Bal < searchAmount) {
+                s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." });
+              } else {
+                await redis.lpush(queueKey, JSON.stringify(p2));
               }
               continue;
             }
+
+            await lockResult.release();
 
             await Promise.all([
               purgeUserFromAllQueues(p1.userId),
@@ -1223,16 +1321,51 @@ function setupGameSocket(io) {
                     continue;
                   }
 
+                  const lockResult = await acquireMatchLocks(p1.userId, p2.userId);
+                  if (!lockResult.ok) {
+                    if (lockResult.reason === "IN_GAME") {
+                      if (!lockResult.details.userId1) await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                      if (!lockResult.details.userId2) await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                    } else {
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                    }
+                    continue;
+                  }
+
                   const matchId = uuidv4();
                   try {
                     await lockAndStartMatch(matchId, p1.userId, p2.userId, safeBetMin);
                   } catch (e) {
-                    if (String(e).includes("INSUFFICIENT_BALANCE")) {
-                      s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
-                      s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Match failed: Balance check failed." });
+                    await lockResult.release();
+
+                    let p1Bal = 0, p2Bal = 0;
+                    try {
+                      const balRes = await pool.query(
+                        `SELECT user_id, (available_balance + COALESCE(bonus_balance, 0)) as balance FROM wallets WHERE user_id = ANY($1::uuid[])`,
+                        [[p1.userId, p2.userId]]
+                      );
+                      for (const row of balRes.rows) {
+                        if (row.user_id === p1.userId) p1Bal = Number(row.balance);
+                        if (row.user_id === p2.userId) p2Bal = Number(row.balance);
+                      }
+                    } catch {}
+
+                    if (p1Bal < safeBetMin) {
+                      s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." });
+                    } else {
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                    }
+
+                    if (p2Bal < safeBetMin) {
+                      s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." });
+                    } else {
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
                     }
                     continue;
                   }
+
+                  await lockResult.release();
 
                   await Promise.all([
                     purgeUserFromAllQueues(p1.userId),
@@ -1372,6 +1505,12 @@ function setupGameSocket(io) {
 
                     const crossBet = Math.min(searchAmount, adjBet);
 
+                    const lockResult = await acquireMatchLocks(userId, opponent.userId);
+                    if (!lockResult.ok) {
+                      await redis.lpush(adjQueueKey, raw);
+                      return;
+                    }
+
                     await removeAllOccurrencesFromQueue(queueKey, userId);
                     socketSearching.delete(socket.id);
                     clearQueueTimeout(socket.id);
@@ -1382,12 +1521,20 @@ function setupGameSocket(io) {
                     try {
                       await lockAndStartMatch(crossMatchId, userId, opponent.userId, crossBet);
                     } catch (e) {
+                      await lockResult.release();
                       await redis.rpush(queueKey, JSON.stringify(entry));
                       await redis.rpush(adjQueueKey, raw);
                       socketSearching.set(socket.id, queueKey);
                       socketSearching.set(opponent.socketId, adjQueueKey);
+                      startQueueTimeout(socket, queueKey, userId);
+                      const oppSocket = io.sockets.sockets.get(opponent.socketId);
+                      if (oppSocket) {
+                        startQueueTimeout(oppSocket, adjQueueKey, opponent.userId);
+                      }
                       return;
                     }
+
+                    await lockResult.release();
 
                     await Promise.all([
                       purgeUserFromAllQueues(userId),

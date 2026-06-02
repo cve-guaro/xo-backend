@@ -365,7 +365,7 @@ router.get('/stats', async (req, res) => {
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_deposits
                   FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_withdrawals
-                  FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
+                  FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED'`),
       pool.query(`
         SELECT COUNT(*) as claims 
         FROM users 
@@ -442,7 +442,7 @@ router.get('/dashboard-data', async (req, res) => {
                   FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
       // [2] Total settled withdrawals
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total_payouts
-                  FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
+                  FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED'`),
       // [3] Pending MANUAL withdrawal count (only transactions that need admin approval)
       pool.query(`SELECT COUNT(*) AS pending_manual_count
                    FROM wallet_transactions WHERE tx_type = 'WITHDRAW_REQUEST' AND status = 'PENDING_MANUAL'`),
@@ -470,7 +470,7 @@ router.get('/dashboard-data', async (req, res) => {
         SELECT 
           to_char(points.date, '${format}') as label,
           COALESCE(SUM(CASE WHEN pt.tx_type = 'DEPOSIT' AND pt.status = 'COMPLETED' THEN pt.amount ELSE 0 END), 0) -
-          COALESCE(SUM(CASE WHEN pt.tx_type IN ('WITHDRAW_SETTLED') AND pt.status = 'COMPLETED' THEN pt.amount ELSE 0 END), 0) as profit
+          COALESCE(SUM(CASE WHEN pt.tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND pt.status = 'COMPLETED' THEN pt.amount ELSE 0 END), 0) as profit
         FROM points
         LEFT JOIN wallet_transactions pt 
           ON date_trunc('${trunc}', pt.created_at) = points.date
@@ -670,7 +670,7 @@ router.get('/metrics/daily-trends', async (req, res) => {
       SELECT 
         DATE_TRUNC('day', created_at) as date,
         SUM(CASE WHEN tx_type = 'DEPOSIT' THEN amount ELSE 0 END) - 
-        SUM(CASE WHEN tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END) as profit
+        SUM(CASE WHEN tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED' THEN amount ELSE 0 END) as profit
       FROM wallet_transactions
       WHERE created_at > now() - interval '14 days'
       GROUP BY 1 ORDER BY 1 ASC
@@ -1182,7 +1182,7 @@ router.get('/users/:id/360', async (req, res) => {
       const totalsRes = await pool.query(`
         SELECT
           COALESCE(SUM(CASE WHEN tx_type = 'DEPOSIT' AND status = 'COMPLETED' THEN amount ELSE 0 END), 0) as total_deposited,
-          COALESCE(SUM(CASE WHEN tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END), 0) as total_withdrawn
+          COALESCE(SUM(CASE WHEN tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED' THEN amount ELSE 0 END), 0) as total_withdrawn
         FROM wallet_transactions WHERE user_id = $1
       `, [userId]);
       if (totalsRes.rows.length) {
@@ -1241,9 +1241,13 @@ router.get('/transactions', async (req, res) => {
 
     if (type) {
       let mappedType = type.toUpperCase();
-      if (mappedType === 'WITHDRAWAL') mappedType = 'WITHDRAW_REQUEST';
-      conditions.push(`pt.tx_type = $${idx++}`); 
-      params.push(mappedType); 
+      if (mappedType === 'WITHDRAWAL') {
+        conditions.push(`pt.tx_type IN ($${idx++}, $${idx++})`);
+        params.push('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED');
+      } else {
+        conditions.push(`pt.tx_type = $${idx++}`);
+        params.push(mappedType);
+      }
     }
     if (status) {
       const statusList = String(status).split(',').map(s => {
@@ -1332,7 +1336,7 @@ router.get('/transactions/:id/details', async (req, res) => {
     const statsQuery = await pool.query(`
       SELECT 
         SUM(CASE WHEN tx_type::text IN ('DEPOSIT', 'ADMIN_DEPOSIT', 'ADMIN_EDIT') AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_deposit,
-        SUM(CASE WHEN tx_type::text = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_withdraw
+        SUM(CASE WHEN tx_type::text IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED' THEN amount ELSE 0 END) as total_withdraw
       FROM wallet_transactions 
       WHERE user_id = $1
     `, [details.user_id]);
@@ -2226,7 +2230,7 @@ router.get('/metrics/live', async (req, res) => {
       pool.query(`
         SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count
         FROM wallet_transactions
-        WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'
+        WHERE tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED'
         AND created_at >= CURRENT_DATE
       `),
       // [4] Daily active users (played at least 1 game today)
@@ -3026,7 +3030,7 @@ router.get('/financial-dashboard', async (req, res) => {
         FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED'`),
       // [3] Total withdrawals
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-        FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED'`),
+        FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED'`),
       // [4] Total bonuses given (welcome + referral from bonus_logs)
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
         FROM bonus_logs WHERE reason NOT ILIKE '%Admin%' AND reason NOT ILIKE '%Leaderboard%'`),
@@ -3076,7 +3080,7 @@ router.get('/financial-dashboard', async (req, res) => {
           COUNT(CASE WHEN wt.status = 'COMPLETED' THEN 1 END) as count
         FROM points
         LEFT JOIN wallet_transactions wt 
-          ON date_trunc('${trunc}', wt.created_at) = points.date AND wt.tx_type = 'WITHDRAW_SETTLED'
+          ON date_trunc('${trunc}', wt.created_at) = points.date AND wt.tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST')
         GROUP BY points.date
         ORDER BY points.date ASC
       `),
@@ -3085,7 +3089,7 @@ router.get('/financial-dashboard', async (req, res) => {
         FROM wallet_transactions WHERE tx_type = 'DEPOSIT' AND status = 'COMPLETED' AND created_at >= CURRENT_DATE`),
       // [11] Today withdrawals
       pool.query(`SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-        FROM wallet_transactions WHERE tx_type = 'WITHDRAW_SETTLED' AND status = 'COMPLETED' AND created_at >= CURRENT_DATE`),
+        FROM wallet_transactions WHERE tx_type IN ('WITHDRAW_SETTLED', 'WITHDRAW_REQUEST') AND status = 'COMPLETED' AND created_at >= CURRENT_DATE`),
       // [12] Recent bonuses
       pool.query(`SELECT bl.*, u.username, u.number 
         FROM bonus_logs bl LEFT JOIN users u ON bl.user_id = u.id 
@@ -3183,19 +3187,19 @@ router.get('/financial-dashboard/drill-down', async (req, res) => {
     const { type, date } = req.query;
     if (!type || !date) return res.status(400).json({ error: 'type and date are required' });
 
-    const txType = type === 'withdrawals' ? 'WITHDRAW_SETTLED' : 'DEPOSIT';
+    const txTypes = type === 'withdrawals' ? ['WITHDRAW_SETTLED', 'WITHDRAW_REQUEST'] : ['DEPOSIT'];
     const { rows } = await pool.query(`
       SELECT wt.user_id, u.username, u.number, 
         SUM(wt.amount) AS total_amount, COUNT(*) AS tx_count,
         MAX(wt.created_at) AS last_tx
       FROM wallet_transactions wt
       JOIN users u ON wt.user_id = u.id
-      WHERE wt.tx_type = $1 AND wt.status = 'COMPLETED'
+      WHERE wt.tx_type = ANY($1) AND wt.status = 'COMPLETED'
         AND wt.created_at >= $2::date AND wt.created_at < ($2::date + interval '1 day')
       GROUP BY wt.user_id, u.username, u.number
       ORDER BY total_amount DESC
       LIMIT 100
-    `, [txType, date]);
+    `, [txTypes, date]);
 
     return res.json({
       ok: true,
