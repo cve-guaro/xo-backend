@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 const Sentry = require("@sentry/node");
 
 // ─── SENTRY INITIALIZATION ───────────────────────────────────────────────────
@@ -39,6 +40,7 @@ const { pool } = require('./db/index');
 
 
 const app = express();
+app.use(compression());
 app.set('trust proxy', 1);
 const server = http.createServer(app);
 
