@@ -9,9 +9,11 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('supabase') 
     ? { rejectUnauthorized: false } 
     : (process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false),
-  max: 25,
+  // Tuned for Supabase PgBouncer: lower pool prevents over-subscribing the bouncer's own limit
+  max: 12,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis: 3000,   // Faster failure detection (was 5s)
+  statement_timeout: 30000,        // Kill runaway queries after 30s
 });
 
 pool.on('error', (err) => {

@@ -276,6 +276,9 @@ router.get("/config", auth, async (req, res) => {
       console.warn('[CONFIG] Error fetching last week win snapshot:', e.message);
     }
     
+    // Cache for 60s — this endpoint is called from 3 UI locations on every page load
+    // and the data (giveaway version, rooms_locked, etc.) changes very rarely.
+    res.set('Cache-Control', 'private, max-age=60');
     res.json({
       ok: true,
       current_giveaway_version: Number(config.current_giveaway_version || 1),

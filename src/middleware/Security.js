@@ -94,7 +94,7 @@ async function systemLockdownCheck(req, res, next) {
                 const { rows } = await pool.query('SELECT role FROM users WHERE id = $1', [userId]);
                 if (rows.length) {
                   liveRole = rows[0].role;
-                  await redis.setex(cacheKey, 60, liveRole); // Cache for 1 min
+                  await redis.setex(cacheKey, 120, liveRole); // Cache for 2 min (roles change very rarely)
                 }
               }
               if (liveRole && BYPASS_ROLES.includes(liveRole)) {
@@ -133,7 +133,7 @@ async function systemLockdownCheck(req, res, next) {
         if (r.key === 'mobile_app_lockout') isMobileLocked = (r.value === true || r.value === 'true');
         if (r.key === 'lockdown_whitelist') whitelist = Array.isArray(r.value) ? r.value : [];
       }
-      await redis.setex(cacheKey, 30, JSON.stringify({ isEmergencyLocked, isMobileLocked, whitelist }));
+      await redis.setex(cacheKey, 60, JSON.stringify({ isEmergencyLocked, isMobileLocked, whitelist }));
     }
 
     if (isEmergencyLocked) {

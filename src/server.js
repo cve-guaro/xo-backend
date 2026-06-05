@@ -283,8 +283,19 @@ const { initCron } = require('./cron');
 initCron();
 
 // ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
-(async () => {
+// Deferred by 3s so the server can start accepting requests before migrations
+// saturate the DB pool. A global_settings guard skips re-running after first deploy.
+setTimeout(async () => {
   try {
+    // Check if migrations already completed (skip on subsequent deploys)
+    const guardRes = await pool.query(
+      `SELECT value FROM global_settings WHERE key = 'migrations_v3_completed'`
+    );
+    if (guardRes.rows.length > 0 && (guardRes.rows[0].value === true || guardRes.rows[0].value === 'true')) {
+      console.log('[DB] Migrations already completed (v3). Skipping.');
+      return;
+    }
+
     // Basic user preferences
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sound_muted BOOLEAN DEFAULT false;`);
     
@@ -315,9 +326,7 @@ initCron();
     await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS prize_amount NUMERIC DEFAULT 0;`);
 
     // Backfill historical games: calculate prize for completed games with a winner
-    // Uses the same fee logic: Room 1 (bet < 100) = 20% fee → prize = bet * 2 * 0.8
-    // Room 2 (100-999) = 15% fee → prize = bet * 2 * 0.85
-    // Room 3 (1000+) = 10% fee → prize = bet * 2 * 0.9
+    // Only runs on rows where prize_amount is still 0/NULL (idempotent)
     await pool.query(`
       UPDATE games
       SET prize_amount = CASE
@@ -450,11 +459,17 @@ initCron();
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id) WHERE read = false;`);
 
-    console.log('[DB] Migrations applied.');
+    // Mark migrations as completed so subsequent deploys skip this block
+    await pool.query(`
+      INSERT INTO global_settings (key, value) VALUES ('migrations_v3_completed', 'true'::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb;
+    `);
+
+    console.log('[DB] Migrations applied and guard flag set.');
   } catch (err) {
     console.error('[DB] Migration error:', err);
   }
-})();
+}, 3000);
 
 
 // ─── CENTRALIZED SECURITY ERROR HANDLER ───────────────────────────────────────
