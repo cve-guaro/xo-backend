@@ -205,6 +205,11 @@ router.patch('/settings', async (req, res) => {
       redis.del('feature_status_rooms_locked'),
     ]).catch(() => {});
 
+    // Flush settings cache keys
+    for (const key of Object.keys(updates)) {
+      await redis.del(`global_setting:${key}`).catch(() => {});
+    }
+
     await logAdminAction(req.user.id, 'updated_global_settings', null, updates);
     return res.json({ ok: true });
   } catch (err) {
@@ -1152,7 +1157,7 @@ router.get('/users/:id/360', async (req, res) => {
     try {
       const gamesRes = await pool.query(`
         SELECT g.id, g.player_x, g.player_o, g.winner, g.bet_amount, g.status,
-               g.finished_at, g.created_at, g.moves, g.prize_amount, g.end_reason, g.forfeit,
+               g.finished_at, g.created_at, g.moves, g.prize_amount, NULL as end_reason, false as forfeit,
                ux.username as player_x_name, ux.number as player_x_number,
                uo.username as player_o_name, uo.number as player_o_number
         FROM games g

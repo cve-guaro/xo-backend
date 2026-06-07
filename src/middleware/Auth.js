@@ -53,12 +53,7 @@ async function auth(req, res, next) {
       return next();
     }
 
-    // No token provided at all — only log anomaly if it's NOT from localhost
-    const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
-    const isLocalhost = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-    if (!isLocalhost) {
-      await logAnomaly(req, 'Missing JWT token');
-    }
+    // No token provided at all
     return res.status(401).json({ error: 'Unauthorized' });
   } catch (err) {
     // TokenExpiredError is NORMAL — user just needs to refresh. Never flag as anomaly.

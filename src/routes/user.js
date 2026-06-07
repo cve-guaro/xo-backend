@@ -1,6 +1,6 @@
 // user.routes.js
 const express = require('express');
-const { pool } = require('../db/index');
+const { pool, getGlobalSetting } = require('../db/index');
 const { auth } = require('./../middleware/Auth');
 const { redeemPromoCode } = require('../models/payments.service');
 
@@ -159,11 +159,8 @@ router.get('/referral-link', auth, async (req, res) => {
     const refCode = userId.slice(0, 8).toUpperCase();
     const referralUrl = `https://xoethiopia.com/?ref=${refCode}`;
     
-    // Check if referral system is enabled
-    const { rows: settingsRows } = await pool.query(
-      `SELECT value FROM global_settings WHERE key = 'referral_enabled'`
-    );
-    const enabled = settingsRows.length ? settingsRows[0].value === true || settingsRows[0].value === 'true' : true;
+    // Check if referral system is enabled (cached in Redis)
+    const enabled = await getGlobalSetting('referral_enabled', true);
 
     return res.json({ 
       ok: true, 

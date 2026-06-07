@@ -3,7 +3,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const axios = require("axios");
 const crypto = require("crypto");
-const { pool, withTx } = require('../db/index');
+const { pool, withTx, getGlobalSetting } = require('../db/index');
 const { applyNewUserGiveaways } = require('../models/payments.service');
 
 const router = express.Router();
@@ -344,16 +344,9 @@ router.post('/verify-otp', async (req, res) => {
            // B) Process referral bonus
            if (refParam) {
              try {
-               // Check if referral system is enabled
-               const { rows: settingsRows } = await pool.query(
-                 `SELECT value FROM global_settings WHERE key IN ('referral_enabled', 'referral_bonus_amount')`
-               );
-               let enabled = true;
-               let bonusAmount = 2;
-               settingsRows.forEach(r => {
-                 if (r.key === 'referral_enabled') enabled = (r.value === true || r.value === 'true');
-                 if (r.key === 'referral_bonus_amount') bonusAmount = Number(r.value) || 2;
-               });
+                // Check if referral system is enabled (cached in Redis)
+                const enabled = await getGlobalSetting('referral_enabled', true);
+                const bonusAmount = Number(await getGlobalSetting('referral_bonus_amount', 2)) || 2;
 
                if (enabled) {
                  // Find referrer by first 8 chars of their UUID

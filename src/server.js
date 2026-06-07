@@ -50,6 +50,7 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'"],
+      workerSrc: ["'self'", "blob:"],
       styleSrc: ["'self'", "'unsafe-inline'"],  // React Native Web requires inline styles
       imgSrc: ["'self'", "data:", "blob:", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app"],
       connectSrc: ["'self'", "https://xoethiopia.com", "https://www.xoethiopia.com", "https://*.vercel.app", "wss://xoethiopia.com", "wss://www.xoethiopia.com"],
@@ -283,9 +284,8 @@ const { initCron } = require('./cron');
 initCron();
 
 // ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
-// Deferred by 3s so the server can start accepting requests before migrations
-// saturate the DB pool. A global_settings guard skips re-running after first deploy.
-setTimeout(async () => {
+// Awaited on startup so the database schema is guaranteed to be ready before accepting requests.
+async function runMigrations() {
   try {
     // Check if migrations already completed (skip on subsequent deploys)
     const guardRes = await pool.query(
@@ -468,8 +468,9 @@ setTimeout(async () => {
     console.log('[DB] Migrations applied and guard flag set.');
   } catch (err) {
     console.error('[DB] Migration error:', err);
+    throw err;
   }
-}, 3000);
+}
 
 
 // ─── CENTRALIZED SECURITY ERROR HANDLER ───────────────────────────────────────
@@ -490,6 +491,16 @@ app.use((err, req, res, next) => {
   });
 });
 
-let PORT = parseInt(process.env.PORT, 10);
-if (isNaN(PORT)) PORT = 2000;
-server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+async function startServer() {
+  try {
+    await runMigrations();
+  } catch (err) {
+    console.error('[STARTUP] Migrations failed (non-fatal, starting server anyway):', err.message);
+  }
+
+  let PORT = parseInt(process.env.PORT, 10);
+  if (isNaN(PORT)) PORT = 2000;
+  server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+}
+
+startServer();

@@ -21,6 +21,7 @@ if (!JWT_SECRET) {
 }
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 const QUEUE_TTL = 120_000; // 2 minutes
+const IN_GAME_TTL_MS = 3600_000; // 60 minutes
 
 const REMATCH_NS = "rematch";
 const REMATCH_TTL = 30_000; // 30s to respond (tweak as you like)
@@ -391,6 +392,7 @@ async function startDirectMatch(io, userA, userB, betAmount) {
       reconnectTimeout: null,
       startTimeout: null,
       status: "countdown",
+      lastMoveTime: Date.now(),
     };
     activeGames.set(matchId, game);
 
@@ -400,8 +402,8 @@ async function startDirectMatch(io, userA, userB, betAmount) {
     sockets.X.join(matchId);
     sockets.O.join(matchId);
 
-    await redis.set(`in_game:${X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
-    await redis.set(`in_game:${O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+    await redis.set(`in_game:${X}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+    await redis.set(`in_game:${O}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
 
     const usersRes = await pool.query(`SELECT id, username FROM users WHERE id = ANY($1::uuid[])`, [[X, O]]);
     const userMap = {};
@@ -519,6 +521,16 @@ function clearQueueTimeout(socketId) {
 
 // ---------------- Wallets & Games ----------------
 async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
+  // Prevent duplicate concurrent matches for either player
+  for (const activeGame of activeGames.values()) {
+    if (activeGame.players.X === playerXId || activeGame.players.O === playerXId) {
+      throw new Error(`Player X (${playerXId}) is already in an active game`);
+    }
+    if (activeGame.players.X === playerOId || activeGame.players.O === playerOId) {
+      throw new Error(`Player O (${playerOId}) is already in an active game`);
+    }
+  }
+
   return tx(async (client) => {
     const ids = [playerXId, playerOId];
 
@@ -581,10 +593,24 @@ async function saveMove(gameId, moveObj) {
 }
 
 async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
+  const gameObj = activeGames.get(gameId);
+  if (gameObj) {
+    if (gameObj.finished) {
+      console.warn('[DUP_PAYOUT] Game already finished in memory:', gameId);
+      return;
+    }
+    gameObj.finished = true;
+  }
+
   return tx(async (client) => {
-    // Get game details to determine room and bonus used
-    const gameRes = await client.query(`SELECT bet_amount, player_x, player_o, bonus_used_x, bonus_used_o FROM games WHERE id = $1`, [gameId]);
+    // Get game details to determine room and bonus used, with row lock
+    const gameRes = await client.query(`SELECT status, bet_amount, player_x, player_o, bonus_used_x, bonus_used_o FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
     const game = gameRes.rows[0];
+    if (!game) return;
+    if (game.status !== 'ongoing') {
+      console.warn('[DUP_PAYOUT] Game already completed in DB:', gameId);
+      return;
+    }
 
     await client.query(
       `UPDATE games SET status = $1, winner = $2, finished_at = NOW(), prize_amount = $4 WHERE id = $3`,
@@ -680,8 +706,50 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         const loserConsKey = `cooldown:wins:${loserUserId}:${finalLoserRangeKey}`;
         await redis.del(loserConsKey).catch(() => { });
       }
+    } else {
+      // Option A: Refund both players fully
+      const betCents = Number(game.bet_amount || 0);
+
+      // Refund Player X
+      if (game.player_x) {
+        const bonusX = Number(game.bonus_used_x || 0);
+        const realX = Math.max(0, betCents - bonusX);
+        await client.query(`
+          UPDATE wallets 
+          SET available_balance = available_balance + $1,
+              bonus_balance = bonus_balance + $2,
+              withdrawable_balance = withdrawable_balance + $3,
+              updated_at = NOW()
+          WHERE user_id = $4
+        `, [betCents, bonusX, realX, game.player_x]);
+
+        await pool.query(`
+          INSERT INTO payment_transactions (id, user_id, type, status, amount, bank, tx_ref, provider_payload)
+          VALUES (gen_random_uuid(), $1, 'deposit', 'success', $2, 'PRIZE', $3, $4::jsonb)
+        `, [game.player_x, betCents, 'refund-x-' + gameId + '-' + Date.now(), JSON.stringify({ gameId, reason: 'stale_game_refund' })]
+        ).catch(err => console.error('[finishAndPayout] X refund ledger failed:', err));
+      }
+
+      // Refund Player O
+      if (game.player_o) {
+        const bonusO = Number(game.bonus_used_o || 0);
+        const realO = Math.max(0, betCents - bonusO);
+        await client.query(`
+          UPDATE wallets 
+          SET available_balance = available_balance + $1,
+              bonus_balance = bonus_balance + $2,
+              withdrawable_balance = withdrawable_balance + $3,
+              updated_at = NOW()
+          WHERE user_id = $4
+        `, [betCents, bonusO, realO, game.player_o]);
+
+        await pool.query(`
+          INSERT INTO payment_transactions (id, user_id, type, status, amount, bank, tx_ref, provider_payload)
+          VALUES (gen_random_uuid(), $1, 'deposit', 'success', $2, 'PRIZE', $3, $4::jsonb)
+        `, [game.player_o, betCents, 'refund-o-' + gameId + '-' + Date.now(), JSON.stringify({ gameId, reason: 'stale_game_refund' })]
+        ).catch(err => console.error('[finishAndPayout] O refund ledger failed:', err));
+      }
     }
-    // No draw payouts — winner takes all, game always continues until a winner
   });
 }
 
@@ -710,6 +778,41 @@ function cleanupGame(matchId) {
   // DO NOT delete in_game here, wait for leave_room so they appear "in_game" while on results screen
   activeGames.delete(matchId);
   dbg("cleanupGame", { matchId });
+}
+
+async function sweepStuckGames(io) {
+  const now = Date.now();
+  for (const [matchId, game] of activeGames.entries()) {
+    // 1. Clean up countdowns that never started
+    if (game.status === "countdown" && now - game.lastMoveTime > 30000) {
+      console.log(`[SWEEP] Game ${matchId} stuck in countdown for >30s. Cleaning up.`);
+      if (game.players && game.players.X) redis.del(`in_game:${game.players.X}`).catch(() => {});
+      if (game.players && game.players.O) redis.del(`in_game:${game.players.O}`).catch(() => {});
+      cleanupGame(matchId);
+      continue;
+    }
+    
+    // 2. Clean up live games that are stuck (no moves for more than 5 minutes)
+    if (game.status === "live" && now - game.lastMoveTime > 5 * 60 * 1000) {
+      console.warn(`[SWEEP] Game ${matchId} stuck with no moves for >5 minutes. Refunding both players (Option A).`);
+      
+      // Notify client-side
+      io.to(matchId).emit("game_stuck_cleanup", { message: "Game was terminated due to connection inactivity. Funds have been refunded." });
+      
+      // Delete Redis locks
+      if (game.players && game.players.X) redis.del(`in_game:${game.players.X}`).catch(() => {});
+      if (game.players && game.players.O) redis.del(`in_game:${game.players.O}`).catch(() => {});
+      
+      // Process refunds (Option A)
+      try {
+        await finishAndPayout(matchId, "refund", null, 0);
+      } catch (err) {
+        console.error(`[SWEEP] Failed to refund match ${matchId}:`, err.message);
+      }
+      
+      cleanupGame(matchId);
+    }
+  }
 }
 
 // schedule actual game start after PRE_MATCH_DELAY_MS
@@ -768,6 +871,11 @@ function scheduleGameStart(io, matchId) {
 function startTimer(io, matchId) {
   const game = activeGames.get(matchId);
   if (!game) return;
+
+  // Refresh Redis in_game locks (60-minute TTL = 3600 seconds)
+  if (game.players && game.players.X) redis.expire(`in_game:${game.players.X}`, 3600).catch(() => {});
+  if (game.players && game.players.O) redis.expire(`in_game:${game.players.O}`, 3600).catch(() => {});
+
   if (game.timerInterval) clearInterval(game.timerInterval);
   game.timerInterval = setInterval(() => {
     const g = activeGames.get(matchId);
@@ -808,6 +916,15 @@ let globalIo = null;
 
 function setupGameSocket(io) {
   globalIo = io;
+
+  // Background interval for cleaning up stuck/stale games (runs every 60 seconds)
+  setInterval(async () => {
+    try {
+      await sweepStuckGames(io);
+    } catch (err) {
+      console.error("[SWEEP] Stuck games sweep error:", err);
+    }
+  }, 60000);
 
   // Background interval for simulated/fake wins ticker (runs once globally)
   setInterval(async () => {
@@ -969,8 +1086,35 @@ function setupGameSocket(io) {
             socket.data = { matchId: inGame, userId, symbol };
             activeGame.sockets[symbol] = socket; // Replace zombie socket with live one
             if (activeGame.reconnectTimeout) clearTimeout(activeGame.reconnectTimeout);
-            if (typeof ack === "function") ack({ ok: true, data: { state: "IN_GAME", matchId: inGame } });
-            socket.emit("resume_game", { matchId: inGame });
+            const opponentId = symbol === "X" ? activeGame.players.O : activeGame.players.X;
+            const oppRes = await pool.query('SELECT username FROM users WHERE id = $1', [opponentId]).catch(() => ({ rows: [] }));
+            const opponentUsername = oppRes.rows[0]?.username || 'Opponent';
+
+            if (typeof ack === "function") ack({ 
+              ok: true, 
+              data: { 
+                state: "IN_GAME", 
+                matchId: inGame,
+                symbol,
+                board: activeGame.board,
+                turn: activeGame.turn,
+                timers: activeGame.timers,
+                room: activeGame.room,
+                opponentId,
+                opponentUsername
+              } 
+            });
+
+            socket.emit("resume_game", { 
+              matchId: inGame,
+              symbol,
+              board: activeGame.board,
+              turn: activeGame.turn,
+              timers: activeGame.timers,
+              room: activeGame.room,
+              opponentId,
+              opponentUsername
+            });
             return;
           } else {
             dbg(ctx, "Stale in_game key found in Redis, cleaning up", { inGame });
@@ -1205,8 +1349,8 @@ function setupGameSocket(io) {
             sockets.X.emit("queue_status", { searching: false });
             sockets.O.emit("queue_status", { searching: false });
 
-            await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
-            await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+            await redis.set(`in_game:${players.X}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+            await redis.set(`in_game:${players.O}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
 
             const nameRes = await pool.query(
               `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
@@ -1409,8 +1553,8 @@ function setupGameSocket(io) {
                   sockets.X.emit("queue_status", { searching: false });
                   sockets.O.emit("queue_status", { searching: false });
 
-                  await redis.set(`in_game:${players.X}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
-                  await redis.set(`in_game:${players.O}`, matchId, "PX", QUEUE_TTL * 10).catch(() => { });
+                  await redis.set(`in_game:${players.X}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+                  await redis.set(`in_game:${players.O}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
 
                   const nameRes = await pool.query(
                     `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
@@ -1575,8 +1719,8 @@ function setupGameSocket(io) {
                     socket.emit("queue_status", { searching: false });
                     oppSocket.emit("queue_status", { searching: false });
 
-                    await redis.set(`in_game:${players.X}`, crossMatchId, "PX", QUEUE_TTL * 10).catch(() => { });
-                    await redis.set(`in_game:${players.O}`, crossMatchId, "PX", QUEUE_TTL * 10).catch(() => { });
+                    await redis.set(`in_game:${players.X}`, crossMatchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+                    await redis.set(`in_game:${players.O}`, crossMatchId, "PX", IN_GAME_TTL_MS).catch(() => { });
 
                     const nameRes2 = await pool.query(
                       `SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`,
@@ -1808,6 +1952,7 @@ function setupGameSocket(io) {
 
       game.board[index] = symbol;
       game.turn = opposite(symbol);
+      game.lastMoveTime = Date.now();
 
       const moveObj = { index, symbol, user: userId, ts: new Date().toISOString() };
       saveMove(matchId, moveObj).catch(e => console.error("saveMove error:", e));
@@ -1950,6 +2095,13 @@ function setupGameSocket(io) {
       // In-game grace → then forfeit
       if (!matchId || !activeGames.has(matchId)) return;
       const game = activeGames.get(matchId);
+      
+      // Prevent stale sockets from triggering a reconnect/forfeit timeout
+      if (game.sockets && game.sockets[symbol] && game.sockets[symbol].id !== socket.id) {
+        console.log(`[DISCONNECT] Ignore disconnect from stale socket ${socket.id} for user ${userId}`);
+        return;
+      }
+
       if (game.reconnectTimeout) clearTimeout(game.reconnectTimeout);
 
       game.reconnectTimeout = setTimeout(async () => {
@@ -2082,6 +2234,12 @@ function setupGameSocket(io) {
         socket.data = { matchId, userId, symbol };
         socket.join(matchId);
 
+        const opponentSymbol = symbol === "X" ? "O" : "X";
+        const opponentSocket = game.sockets[opponentSymbol];
+        if (opponentSocket) {
+          opponentSocket.emit("opponent_reconnected", { symbol });
+        }
+
         socket.emit("reconnected", {
           matchId, symbol, board: game.board, turn: game.turn, timers: game.timers,
           room: game.room,
@@ -2089,6 +2247,40 @@ function setupGameSocket(io) {
         });
       } catch (e) {
         socket.emit("error", { message: "Reconnect failed" });
+      }
+    });
+
+    socket.on("get_game_state", async ({ token, matchId }, ack) => {
+      try {
+        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const game = activeGames.get(matchId);
+        if (!game) {
+          return ack?.({ ok: false, error: "Game not found or expired" });
+        }
+        const symbol = game.players.X === userId ? "X" : (game.players.O === userId ? "O" : null);
+        if (!symbol) {
+          return ack?.({ ok: false, error: "Not your game" });
+        }
+        
+        const opponentId = symbol === "X" ? game.players.O : game.players.X;
+        const oppRes = await pool.query('SELECT username FROM users WHERE id = $1', [opponentId]).catch(() => ({ rows: [] }));
+        const opponentUsername = oppRes.rows[0]?.username || 'Opponent';
+
+        ack?.({
+          ok: true,
+          matchId,
+          symbol,
+          board: game.board,
+          turn: game.turn,
+          timers: game.timers,
+          room: game.room,
+          roomName: game.room ? ROOMS_CONFIG[game.room].name : null,
+          opponentId,
+          opponentUsername,
+          status: game.status
+        });
+      } catch (err) {
+        ack?.({ ok: false, error: "Auth or lookup failed" });
       }
     });
   });

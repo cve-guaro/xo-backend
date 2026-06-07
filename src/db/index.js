@@ -48,5 +48,25 @@ async function withTx(fn, maxRetries = 3) {
     }
   }
 }
+const Redis = require('ioredis');
+const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 
-module.exports = { pool, withTx };
+// Cache global settings query in Redis with a 30-second TTL
+async function getGlobalSetting(key, defaultValue = null) {
+  const cacheKey = `global_setting:${key}`;
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached !== null) {
+      return JSON.parse(cached);
+    }
+    const { rows } = await pool.query('SELECT value FROM global_settings WHERE key = $1', [key]);
+    const val = rows.length ? rows[0].value : defaultValue;
+    await redis.setex(cacheKey, 30, JSON.stringify(val));
+    return val;
+  } catch (err) {
+    console.error(`[DB] Error fetching global setting ${key}:`, err.message);
+    return defaultValue;
+  }
+}
+
+module.exports = { pool, withTx, getGlobalSetting, redis };
