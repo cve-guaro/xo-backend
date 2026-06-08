@@ -82,6 +82,18 @@ app.use(helmet({
 app.use((req, res, next) => {
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   res.setHeader("X-XSS-Protection", "1; mode=block");
+  
+  // Enforce UTF-8 charset for all application/json responses
+  const originalSend = res.send;
+  res.send = function (body) {
+    if (typeof body === 'string' || Buffer.isBuffer(body)) {
+      const contentType = res.getHeader('Content-Type');
+      if (contentType && contentType.includes('application/json') && !contentType.includes('charset')) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      }
+    }
+    return originalSend.apply(this, arguments);
+  };
   next();
 });
 
