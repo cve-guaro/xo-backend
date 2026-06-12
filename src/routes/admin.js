@@ -788,7 +788,8 @@ router.get('/users', async (req, res) => {
 
     const query = `
       SELECT u.id, u.number, u.username, u.display_name, u.avatar,
-             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins, u.created_at,
+             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
+             u.r2_100_wins, u.r3_1000_wins, u.created_at,
              COALESCE(w.available_balance, 0)    AS available_balance,
              COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
              COALESCE(w.bonus_balance, 0)        AS bonus_balance
@@ -837,7 +838,9 @@ router.get('/users/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT u.id, u.number, u.username, u.display_name, u.avatar,
-             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins, u.created_at,
+             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
+             u.r2_100_wins, u.r3_1000_wins, u.created_at,
+             COALESCE(u.raw_user_meta_data->'accomplishments', '[]'::jsonb) AS accomplishments,
              COALESCE(w.available_balance, 0)    AS available_balance,
              COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
              COALESCE(w.bonus_balance, 0)        AS bonus_balance,
@@ -1110,7 +1113,8 @@ router.get('/users/:id/360', async (req, res) => {
     const userRes = await pool.query(
       `SELECT id, username, number, role, banned, created_at, display_name,
               COALESCE(r1_10_wins, 0) as r1_10_wins, COALESCE(r1_25_wins, 0) as r1_25_wins,
-              COALESCE(r1_50_wins, 0) as r1_50_wins, COALESCE(r1_99_wins, 0) as r1_99_wins
+              COALESCE(r1_50_wins, 0) as r1_50_wins, COALESCE(r1_99_wins, 0) as r1_99_wins,
+              COALESCE(r2_100_wins, 0) as r2_100_wins, COALESCE(r3_1000_wins, 0) as r3_1000_wins
        FROM users WHERE id = $1`, [userId]
     );
     if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -1157,9 +1161,9 @@ router.get('/users/:id/360', async (req, res) => {
     try {
       const gamesRes = await pool.query(`
         SELECT g.id, g.player_x, g.player_o, g.winner, g.bet_amount, g.status,
-               g.finished_at, g.created_at, g.moves, g.prize_amount, NULL as end_reason, false as forfeit,
-               ux.username as player_x_name, ux.number as player_x_number,
-               uo.username as player_o_name, uo.number as player_o_number
+               g.finished_at, g.created_at, g.prize_amount, NULL as end_reason, false as forfeit,
+               ux.username as player_x_name, ux.number as player_x_number, ux.created_at as player_x_created_at,
+               uo.username as player_o_name, uo.number as player_o_number, uo.created_at as player_o_created_at
         FROM games g
         LEFT JOIN users ux ON g.player_x = ux.id
         LEFT JOIN users uo ON g.player_o = uo.id
@@ -1566,12 +1570,14 @@ router.get('/game-logs', async (req, res) => {
 
     const { rows } = await pool.query(`
       SELECT
-        g.id, g.bet_amount, g.status, g.created_at, g.finished_at, g.moves,
+        g.id, g.bet_amount, g.status, g.created_at, g.finished_at,
         g.winner    AS winner_id,
         g.player_x  AS player_x_id,
         g.player_o  AS player_o_id,
         px.username AS player_x_name, px.number AS player_x_number,
-        po.username AS player_o_name, po.number AS player_o_number
+        po.username AS player_o_name, po.number AS player_o_number,
+        px.created_at AS player_x_created_at,
+        po.created_at AS player_o_created_at
       FROM games g
       LEFT JOIN users px ON px.id = g.player_x
       LEFT JOIN users po ON po.id = g.player_o
@@ -2142,7 +2148,12 @@ router.post('/bulk-sms', async (req, res) => {
     for (const user of rows) {
       if (user.number && !sentPhones.has(user.number)) {
         sentPhones.add(user.number);
-        const success = await sendSMS(user.number, message).catch(() => false);
+        // Replace placeholders dynamically
+        const formattedMessage = message
+          .replace(/{username}/g, user.username || '')
+          .replace(/{name}/g, user.name || user.username || '')
+          .replace(/{phone}/g, user.number || '');
+        const success = await sendSMS(user.number, formattedMessage).catch(() => false);
         if (success) successCount++;
       }
     }
@@ -2165,6 +2176,142 @@ router.post('/bulk-sms', async (req, res) => {
     res.status(500).json({ error: 'Failed to queue bulk SMS' });
   }
 });
+
+router.post('/bulk-sms/preview', async (req, res) => {
+  try {
+    const { role, min_balance, max_balance, min_wins, specific_phone } = req.body;
+
+    let query = `
+      SELECT COUNT(DISTINCT u.number) as count
+      FROM users u
+      LEFT JOIN wallets w ON u.id = w.user_id
+      WHERE u.number IS NOT NULL AND u.number != '' AND u.banned = false
+    `;
+    const params = [];
+    let paramIdx = 1;
+
+    // Filters
+    if (specific_phone) {
+      const phones = specific_phone.split(',').map(p => p.trim()).filter(Boolean);
+      const phoneList = [];
+      for (let p of phones) {
+        phoneList.push(p);
+        
+        const digits = p.replace(/\D/g, '');
+        let core = '';
+        if (digits.length === 9) core = digits;
+        else if (digits.length === 10 && digits.startsWith('0')) core = digits.slice(1);
+        else if (digits.length === 12 && digits.startsWith('251')) core = digits.slice(3);
+        
+        if (core) {
+            phoneList.push('0' + core);
+            phoneList.push('251' + core);
+            phoneList.push('+251' + core);
+        }
+      }
+      query += ` AND u.number = ANY($${paramIdx}::text[])`;
+      params.push(phoneList);
+      paramIdx++;
+    } else {
+      if (role && role !== 'all') {
+        query += ` AND u.role = $${paramIdx}`;
+        params.push(role);
+        paramIdx++;
+      }
+      if (min_balance !== undefined && min_balance !== null && min_balance !== '') {
+        query += ` AND w.available_balance >= $${paramIdx}`;
+        params.push(Number(min_balance));
+        paramIdx++;
+      }
+      if (max_balance !== undefined && max_balance !== null && max_balance !== '') {
+        query += ` AND w.available_balance <= $${paramIdx}`;
+        params.push(Number(max_balance));
+        paramIdx++;
+      }
+      if (min_wins !== undefined && min_wins !== null && min_wins !== '') {
+        query += ` AND u.room_1_wins >= $${paramIdx}`;
+        params.push(Number(min_wins));
+        paramIdx++;
+      }
+    }
+
+    const { rows } = await pool.query(query, params);
+    const count = Number(rows[0]?.count || 0);
+    return res.json({ ok: true, count });
+  } catch (err) {
+    console.error('[ADMIN] POST /bulk-sms/preview err', err);
+    res.status(500).json({ error: 'Failed to count preview users' });
+  }
+});
+
+router.get('/bulk-sms/preview', async (req, res) => {
+  try {
+    const { role, min_balance, max_balance, min_wins, specific_phone } = req.query;
+
+    let query = `
+      SELECT DISTINCT u.username, u.display_name as name, u.number as phone
+      FROM users u
+      LEFT JOIN wallets w ON u.id = w.user_id
+      WHERE u.number IS NOT NULL AND u.number != '' AND u.banned = false
+    `;
+    const params = [];
+    let paramIdx = 1;
+
+    // Filters
+    if (specific_phone) {
+      const phones = specific_phone.split(',').map(p => p.trim()).filter(Boolean);
+      const phoneList = [];
+      for (let p of phones) {
+        phoneList.push(p);
+        
+        const digits = p.replace(/\D/g, '');
+        let core = '';
+        if (digits.length === 9) core = digits;
+        else if (digits.length === 10 && digits.startsWith('0')) core = digits.slice(1);
+        else if (digits.length === 12 && digits.startsWith('251')) core = digits.slice(3);
+        
+        if (core) {
+            phoneList.push('0' + core);
+            phoneList.push('251' + core);
+            phoneList.push('+251' + core);
+        }
+      }
+      query += ` AND u.number = ANY($${paramIdx}::text[])`;
+      params.push(phoneList);
+      paramIdx++;
+    } else {
+      if (role && role !== 'all') {
+        query += ` AND u.role = $${paramIdx}`;
+        params.push(role);
+        paramIdx++;
+      }
+      if (min_balance !== undefined && min_balance !== null && min_balance !== '') {
+        query += ` AND w.available_balance >= $${paramIdx}`;
+        params.push(Number(min_balance));
+        paramIdx++;
+      }
+      if (max_balance !== undefined && max_balance !== null && max_balance !== '') {
+        query += ` AND w.available_balance <= $${paramIdx}`;
+        params.push(Number(max_balance));
+        paramIdx++;
+      }
+      if (min_wins !== undefined && min_wins !== null && min_wins !== '') {
+        query += ` AND u.room_1_wins >= $${paramIdx}`;
+        params.push(Number(min_wins));
+        paramIdx++;
+      }
+    }
+
+    query += ` ORDER BY u.username ASC LIMIT 1000`;
+
+    const { rows } = await pool.query(query, params);
+    return res.json({ ok: true, users: rows });
+  } catch (err) {
+    console.error('[ADMIN] GET /bulk-sms/preview err', err);
+    res.status(500).json({ error: 'Failed to fetch preview users' });
+  }
+});
+
 
 router.get('/bulk-sms/history', async (req, res) => {
   try {
@@ -2318,31 +2465,58 @@ function getWeekBounds() {
 router.get('/leaderboard/current', async (req, res) => {
   try {
     const { weekStart, weekEnd } = getWeekBounds();
+    const search = req.query.search ? `%${req.query.search}%` : null;
+    const limit = Math.min(Number(req.query.limit || 50), 100);
+    const offset = Number(req.query.offset || 0);
 
-    const { rows } = await pool.query(`
-      SELECT 
-        u.id, u.username, u.number, u.avatar,
-        COUNT(*) AS wins
-      FROM games g
-      JOIN users u ON u.id = g.winner
-      WHERE g.status IN ('completed', 'finished')
-        AND g.winner IS NOT NULL
-        AND g.created_at >= $1 AND g.created_at <= $2
-      GROUP BY u.id, u.username, u.number, u.avatar
-      HAVING COUNT(*) >= 1
-      ORDER BY wins DESC
-      LIMIT 50
-    `, [weekStart.toISOString(), weekEnd.toISOString()]);
+    const query = `
+      WITH WeeklyWins AS (
+        SELECT 
+          u.id, u.username, u.number, u.avatar,
+          COUNT(g.id) AS wins
+        FROM games g
+        JOIN users u ON u.id = g.winner
+        WHERE g.status IN ('completed', 'finished')
+          AND g.winner IS NOT NULL
+          AND g.created_at >= $1 AND g.created_at <= $2
+        GROUP BY u.id, u.username, u.number, u.avatar
+        HAVING COUNT(g.id) >= 1
+      ),
+      RankedWins AS (
+        SELECT
+          id, username, number, avatar, wins,
+          RANK() OVER (ORDER BY wins DESC) as rank
+        FROM WeeklyWins
+      )
+      SELECT *, COUNT(*) OVER() as total_count 
+      FROM RankedWins
+      WHERE ($3::text IS NULL OR username ILIKE $3 OR number ILIKE $3)
+      ORDER BY rank ASC
+      LIMIT $4 OFFSET $5
+    `;
 
-    const ranked = rows.map((u, i) => ({
-      ...u,
-      rank: i + 1,
+    const { rows } = await pool.query(query, [
+      weekStart.toISOString(), 
+      weekEnd.toISOString(),
+      search,
+      limit,
+      offset
+    ]);
+
+    const totalCount = Number(rows[0]?.total_count || 0);
+    const ranked = rows.map(u => ({
+      id: u.id,
+      username: u.username,
+      number: u.number,
+      avatar: u.avatar,
+      rank: Number(u.rank),
       wins: Number(u.wins),
     }));
 
     res.json({
       ok: true,
       standings: ranked,
+      total: totalCount,
       weekStart: weekStart.toISOString(),
       weekEnd: weekEnd.toISOString(),
     });
@@ -2417,6 +2591,22 @@ router.post('/leaderboard/snapshot', async (req, res) => {
       if (autoApprove && prizeAmount > 0) {
         await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
         await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
+        
+        try {
+          const weekStartMD = formatMonthDay(weekStartStr);
+          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
+          await pool.query(`
+            UPDATE users
+            SET raw_user_meta_data = jsonb_set(
+              COALESCE(raw_user_meta_data, '{}'::jsonb),
+              '{accomplishments}',
+              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+            )
+            WHERE id = $2
+          `, [accomplishmentStr, user.id]);
+        } catch (err) {
+          console.error('[ADMIN SNAPSHOT] accomplishment update failed:', err);
+        }
 
         // Create customized in-app notification
         const notifMsg = notificationTemplate
@@ -2481,6 +2671,22 @@ router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
     if (prizeAmount > 0) {
       await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
       await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
+      
+      try {
+        const weekStartMD = formatMonthDay(snap.week_start);
+        const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snap.rank} - Awarded ${prizeAmount} ETB`;
+        await pool.query(`
+          UPDATE users
+          SET raw_user_meta_data = jsonb_set(
+            COALESCE(raw_user_meta_data, '{}'::jsonb),
+            '{accomplishments}',
+            (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+          )
+          WHERE id = $2
+        `, [accomplishmentStr, snap.user_id]);
+      } catch (err) {
+        console.error('[ADMIN APPROVE] accomplishment update failed:', err);
+      }
 
       // Fetch user's phone number for congratulations SMS
       const { rows: userRows } = await pool.query(`SELECT number FROM users WHERE id = $1`, [snap.user_id]);
@@ -2563,6 +2769,22 @@ router.post('/leaderboard/approve-all', async (req, res) => {
         await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
         // Insert bonus log
         await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
+        
+        try {
+          const weekStartMD = formatMonthDay(snap.week_start);
+          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snap.rank} - Awarded ${prizeAmount} ETB`;
+          await pool.query(`
+            UPDATE users
+            SET raw_user_meta_data = jsonb_set(
+              COALESCE(raw_user_meta_data, '{}'::jsonb),
+              '{accomplishments}',
+              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+            )
+            WHERE id = $2
+          `, [accomplishmentStr, snap.user_id]);
+        } catch (err) {
+          console.error('[ADMIN APPROVE ALL] accomplishment update failed:', err);
+        }
         
         // Send SMS
         if (snap.number) {
@@ -2760,6 +2982,22 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
           `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
           [userId, prizeAmount, `Weekly Leaderboard #${w.rank} Prize`]
         );
+        
+        try {
+          const weekStartMD = formatMonthDay(weekStartStr);
+          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${w.rank} - Awarded ${prizeAmount} ETB`;
+          await pool.query(`
+            UPDATE users
+            SET raw_user_meta_data = jsonb_set(
+              COALESCE(raw_user_meta_data, '{}'::jsonb),
+              '{accomplishments}',
+              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+            )
+            WHERE id = $2
+          `, [accomplishmentStr, userId]);
+        } catch (err) {
+          console.error('[ADMIN SEND GIVEAWAY] accomplishment update failed:', err);
+        }
       }
 
       // 3. In-app notification
@@ -3367,6 +3605,21 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
   }
 });
 
+// GET /admin/games/:id/moves
+router.get('/games/:id/moves', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(`SELECT moves FROM games WHERE id = $1`, [id]);
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Game not found' });
+    }
+    return res.json({ moves: rows[0].moves || [] });
+  } catch (err) {
+    console.error('[ADMIN] GET /games/:id/moves err', err);
+    res.status(500).json({ error: 'Failed to fetch game moves' });
+  }
+});
+
 // ──────────────────────────────────────────────
 // GET /admin/dau-list — Active users today
 // ──────────────────────────────────────────────
@@ -3388,5 +3641,13 @@ router.get('/dau-list', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch DAU list' });
   }
 });
+
+function formatMonthDay(dateInput) {
+  const date = typeof dateInput === 'string' ? new Date(dateInput + 'T00:00:00Z') : dateInput;
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const month = months[date.getUTCMonth()];
+  const day = date.getUTCDate();
+  return `${month} ${day}`;
+}
 
 module.exports = router;

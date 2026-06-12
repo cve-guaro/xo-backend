@@ -27,7 +27,7 @@ function auth(req, res, next) {
     const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
     if (!token) return res.status(401).json({ ok: false, error: "missing_token" });
 
-    const { userId, username } = jwt.verify(token, JWT_SECRET);
+    const { userId, username } = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
 
     // Expect UUID in sub (adjust if you use a different claim)
     if (!userId) return res.status(401).json({ ok: false, error: "bad_token" });

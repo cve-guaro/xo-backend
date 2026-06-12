@@ -1,7 +1,7 @@
 // routes/leaderboard.js — Weekly leaderboard API
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../db/index');
+const { pool, redis } = require('../db/index');
 const { auth } = require('../middleware/Auth');
 
 // ─── Helper: Get current week boundaries (Monday 00:00 → Sunday 23:59) ────────
@@ -44,56 +44,114 @@ router.get('/weekly', auth, async (req, res) => {
     const userId = req.user.id || req.user.userId || req.user.sub;
     const { weekStart, weekEnd } = getWeekBounds();
 
-    // 1. Get real users
-    const { rows } = await pool.query(`
-      SELECT 
-        u.id::text as id,
-        u.username,
-        u.avatar,
-        COUNT(*) AS wins
-      FROM games g
-      JOIN users u ON u.id = g.winner
-      WHERE g.status IN ('completed', 'finished')
-        AND g.winner IS NOT NULL
-        AND g.created_at >= $1 AND g.created_at <= $2
-      GROUP BY u.id, u.username, u.avatar
-      HAVING COUNT(*) >= 1
-      ORDER BY wins DESC, MAX(g.created_at) ASC
-      LIMIT 50
-    `, [weekStart.toISOString(), weekEnd.toISOString()]);
-    
-    const realList = rows.map(r => ({
-      id: r.id,
-      username: r.username,
-      avatar: r.avatar,
-      wins: Number(r.wins),
-      isFake: false
-    }));
+    const search = req.query.search ? String(req.query.search).trim() : '';
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
 
-    // Sort: wins DESC, then alphabetically
-    realList.sort((a, b) => {
-      if (b.wins !== a.wins) return b.wins - a.wins;
-      return a.username.localeCompare(b.username);
-    });
+    const CACHE_KEY = `leaderboard:weekly:${search}:${page}:${limit}`;
+    let cachedGlobal = null;
+    try {
+      const cached = await redis.get(CACHE_KEY);
+      if (cached) cachedGlobal = JSON.parse(cached);
+    } catch (e) { console.error('Redis err', e) }
 
-    // Limit to top 50
-    const top50 = realList.slice(0, 50);
+    let total = 0, realListBase = [], top3Base = [];
 
-    // Assign ranks
-    const ranked = top50.map((u, i) => ({
-      id: u.id,
-      username: u.username,
-      avatar: u.avatar,
-      wins: u.wins,
-      rank: i + 1,
-      isMe: u.id === userId,
-    }));
+    if (cachedGlobal) {
+      ({ total, realListBase, top3Base } = cachedGlobal);
+    } else {
+      // 1. Get total count for pagination
+      let countQuery = `
+        SELECT COUNT(DISTINCT g.winner) AS total
+        FROM games g
+        JOIN users u ON u.id = g.winner
+        WHERE g.status IN ('completed', 'finished')
+          AND g.winner IS NOT NULL
+          AND g.created_at >= $1 AND g.created_at <= $2
+      `;
+      const countParams = [weekStart.toISOString(), weekEnd.toISOString()];
+      if (search) {
+        countQuery += ` AND (u.username ILIKE $3 OR u.phone_number ILIKE $3)`;
+        countParams.push(`%${search}%`);
+      }
+      const countRes = await pool.query(countQuery, countParams);
+      total = parseInt(countRes.rows[0]?.total || 0);
+
+      // 2. Get paginated list
+      let itemsQuery = `
+        SELECT 
+          u.id::text as id,
+          u.username,
+          u.avatar,
+          COUNT(*) AS wins
+        FROM games g
+        JOIN users u ON u.id = g.winner
+        WHERE g.status IN ('completed', 'finished')
+          AND g.winner IS NOT NULL
+          AND g.created_at >= $1 AND g.created_at <= $2
+      `;
+      const itemsParams = [weekStart.toISOString(), weekEnd.toISOString()];
+      if (search) {
+        itemsQuery += ` AND (u.username ILIKE $3 OR u.phone_number ILIKE $3)`;
+        itemsParams.push(`%${search}%`);
+      }
+      itemsQuery += `
+        GROUP BY u.id, u.username, u.avatar
+        ORDER BY wins DESC, MAX(g.created_at) ASC
+        LIMIT $${itemsParams.length + 1} OFFSET $${itemsParams.length + 2}
+      `;
+      itemsParams.push(limit, offset);
+
+      const { rows } = await pool.query(itemsQuery, itemsParams);
+      realListBase = rows.map((r, idx) => ({
+        id: r.id,
+        username: r.username,
+        avatar: r.avatar,
+        wins: Number(r.wins),
+        rank: offset + idx + 1
+      }));
+
+      // 3. Always fetch top 3 global winners for podium
+      const { rows: top3Rows } = await pool.query(`
+        SELECT 
+          u.id::text as id,
+          u.username,
+          u.avatar,
+          COUNT(*) AS wins
+        FROM games g
+        JOIN users u ON u.id = g.winner
+        WHERE g.status IN ('completed', 'finished')
+          AND g.winner IS NOT NULL
+          AND g.created_at >= $1 AND g.created_at <= $2
+        GROUP BY u.id, u.username, u.avatar
+        ORDER BY wins DESC, MAX(g.created_at) ASC
+        LIMIT 3
+      `, [weekStart.toISOString(), weekEnd.toISOString()]);
+
+      top3Base = top3Rows.map((r, idx) => ({
+        id: r.id,
+        username: r.username,
+        avatar: r.avatar,
+        wins: Number(r.wins),
+        rank: idx + 1
+      }));
+
+      try {
+        await redis.setex(CACHE_KEY, 30, JSON.stringify({ total, realListBase, top3Base }));
+      } catch (e) { console.error('Redis set err', e); }
+    }
+
+    const realList = realListBase.map(u => ({ ...u, isMe: u.id === userId }));
+    const top3 = top3Base.map(u => ({ ...u, isMe: u.id === userId }));
 
     // Find current user's rank
-    const meInList = ranked.find(u => u.isMe);
+    const meInList = realList.find(u => u.isMe);
     let myRank = null;
 
-    if (!meInList) {
+    if (meInList) {
+      myRank = meInList;
+    } else {
       // Calculate user's wins
       const { rows: myData } = await pool.query(`
         SELECT COUNT(*) AS wins
@@ -179,13 +237,17 @@ router.get('/weekly', auth, async (req, res) => {
     }
 
     res.json({
-      leaderboard: ranked,
-      myRank: meInList || myRank,
+      leaderboard: realList,
+      myRank: myRank,
       prizes,
       weekStart: weekStart.toISOString(),
       weekEnd: weekEnd.toISOString(),
       secondsRemaining,
       previousWeekWin,
+      top3,
+      total,
+      page,
+      limit
     });
   } catch (err) {
     console.error('[LEADERBOARD] weekly error:', err);
@@ -287,7 +349,11 @@ router.get('/podium', auth, async (req, res) => {
 
 // ─── GET /leaderboard/ticker — Live winner feed ──────────────────────────────
 router.get('/ticker', async (req, res) => {
+  const CACHE_KEY = 'cache:leaderboard_ticker';
   try {
+    const cached = await redis.get(CACHE_KEY);
+    if (cached) return res.json(JSON.parse(cached));
+
     // Fetch config switches
     const config = await getSettings(['fake_ticker_enabled', 'real_ticker_enabled']);
     const showReal = config.real_ticker_enabled !== false && config.real_ticker_enabled !== 'false';
@@ -345,8 +411,10 @@ router.get('/ticker', async (req, res) => {
       tickerData = fakeEntriesList;
     }
 
+    const responsePayload = { ticker: tickerData.slice(0, 30) };
+    await redis.setex(CACHE_KEY, 30, JSON.stringify(responsePayload));
     // Limit to 30 entries
-    res.json({ ticker: tickerData.slice(0, 30) });
+    res.json(responsePayload);
   } catch (err) {
     console.error('[LEADERBOARD] ticker error:', err);
     res.status(500).json({ error: 'Failed to fetch ticker' });
@@ -371,6 +439,65 @@ router.post('/claim', auth, async (req, res) => {
   } catch (err) {
     console.error('[LEADERBOARD] claim error:', err);
     res.status(500).json({ error: 'Failed to claim prize' });
+  }
+});
+
+// ─── GET /leaderboard/user/:id — User details for modal ────────────────────────
+router.get('/user/:id', auth, async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(targetUserId)) {
+      return res.status(400).json({ error: 'Invalid user ID format' });
+    }
+    
+    // 1. Fetch user base info
+    const userRes = await pool.query('SELECT created_at, username FROM users WHERE id = $1', [targetUserId]);
+    if (!userRes.rows.length) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const { created_at, username } = userRes.rows[0];
+
+    // 2. Fetch game stats
+    const gamesPlayedRes = await pool.query(
+      'SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1',
+      [targetUserId]
+    );
+    const totalGames = Number(gamesPlayedRes.rows[0]?.total || 0);
+
+    const winsRes = await pool.query(
+      'SELECT COUNT(*) AS total FROM games WHERE winner = $1',
+      [targetUserId]
+    );
+    const totalWins = Number(winsRes.rows[0]?.total || 0);
+
+    // 3. Fetch snapshots of prizes won
+    const snapshotsRes = await pool.query(
+      `SELECT id, rank, prize_amount, week_start, week_end, prize_status 
+       FROM leaderboard_snapshots 
+       WHERE user_id = $1 
+       ORDER BY week_start DESC`,
+      [targetUserId]
+    );
+
+    res.json({
+      ok: true,
+      username,
+      createdAt: created_at,
+      totalGames,
+      totalWins,
+      prizes: snapshotsRes.rows.map(row => ({
+        id: row.id,
+        rank: Number(row.rank),
+        prizeAmount: Number(row.prize_amount),
+        weekStart: row.week_start,
+        weekEnd: row.week_end,
+        prizeStatus: row.prize_status,
+      }))
+    });
+  } catch (err) {
+    console.error('[LEADERBOARD] user details error:', err);
+    res.status(500).json({ error: 'Failed to fetch user leaderboard details' });
   }
 });
 

@@ -98,6 +98,23 @@ async function runWeeklyLeaderboardSnapshot() {
         [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]
       );
       
+      // 2b) Record accomplishment
+      try {
+        const weekStartMD = formatMonthDay(weekStartStr);
+        const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
+        await pool.query(`
+          UPDATE users
+          SET raw_user_meta_data = jsonb_set(
+            COALESCE(raw_user_meta_data, '{}'::jsonb),
+            '{accomplishments}',
+            (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+          )
+          WHERE id = $2
+        `, [accomplishmentStr, user.id]);
+      } catch (err) {
+        console.error('[LEADERBOARD CRON] accomplishment update failed:', err);
+      }
+      
       // 3) Create in-app leaderboard award notification
       const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
       await pool.query(`
@@ -129,6 +146,14 @@ async function runWeeklyLeaderboardSnapshot() {
   }
 
   console.log('[LEADERBOARD CRON] Weekly snapshot process completed successfully.');
+}
+
+function formatMonthDay(dateInput) {
+  const date = typeof dateInput === 'string' ? new Date(dateInput + 'T00:00:00Z') : dateInput;
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const month = months[date.getUTCMonth()];
+  const day = date.getUTCDate();
+  return `${month} ${day}`;
 }
 
 module.exports = { runWeeklyLeaderboardSnapshot };

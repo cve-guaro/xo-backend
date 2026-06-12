@@ -15,7 +15,7 @@ function authUser(req, res, next) {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'No token' });
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
     req.userId = decoded.sub || decoded.id;
     req.user = decoded;
     next();

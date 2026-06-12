@@ -1,13 +1,15 @@
 // gameSocket.js
 const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
-const { pool } = require("../db/index");
+const { pool, getGlobalSetting } = require("../db/index");
 const Redis = require("ioredis");
 require('dotenv').config();
 const { creditPrize } = require('../models/payments.service')
 
 // ---- Debug helpers -------------------------------------------------
-const DEBUG_MATCH = process.env.DEBUG_MATCH === "1" || process.env.NODE_ENV !== "production";
+// Opt-in only. Previously defaulted ON whenever NODE_ENV !== 'production', which floods
+// synchronous console.log on the matchmaking hot path if NODE_ENV is unset in prod.
+const DEBUG_MATCH = process.env.DEBUG_MATCH === "1";
 const shortId = () => uuidv4().slice(0, 8);
 const ts = () => new Date().toISOString();
 function dbg(ctx, ...args) { if (DEBUG_MATCH) console.log(`[MM ${ts()}] ${ctx}`, ...args); }
@@ -19,6 +21,12 @@ if (!JWT_SECRET) {
   console.error('FATAL: JWT_SECRET is not set. Socket authentication cannot work securely.');
   process.exit(1);
 }
+// Pin the signing algorithm. Tokens are issued with HS256 (string secret); without this,
+// a forged token claiming a different alg could bypass verification (alg-confusion).
+function verifyToken(token) {
+  return jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
+}
+
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 const QUEUE_TTL = 120_000; // 2 minutes
 const IN_GAME_TTL_MS = 3600_000; // 60 minutes
@@ -29,7 +37,7 @@ const REMATCH_TTL = 30_000; // 30s to respond (tweak as you like)
 const ROOMS_CONFIG = {
   1: {
     name: "Room 1 - Beginner",
-    betRange: [10, 25, 50, 100], // Valid bet amounts for this room
+    betRange: [10, 25, 50, 99], // Valid bet amounts for this room
     houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
     description: "Small bets - 10-100 ETB - 30s timer"
@@ -90,7 +98,7 @@ function calculatePrize(betAmount) {
   const pct = roomConfig.houseCutPercent;
   const prize = Math.floor(totalPot * (1 - pct / 100));
 
-  console.log(`[FINANCE] calculatePrize: room=${roomNumber} bet=${betAmount} pot=${totalPot} pct=${pct} prize=${prize}`);
+  if (DEBUG_MATCH) console.log(`[FINANCE] calculatePrize: room=${roomNumber} bet=${betAmount} pot=${totalPot} pct=${pct} prize=${prize}`);
 
   return {
     prize,
@@ -168,38 +176,50 @@ function removeUserSocket(userId, socketId) {
 }
 
 function findSocketByUser(io, userId) {
+  // Fast path: O(user's sockets) via the userSockets index instead of scanning all online sockets.
+  const ids = userSockets.get(String(userId)) || userSockets.get(userId);
+  if (ids) {
+    for (const sid of ids) {
+      const s = io.sockets.sockets.get(sid);
+      if (s && !s.disconnected) return s;
+    }
+  }
+  // Fallback: index miss (e.g. socket registered without userSockets) — rare.
   for (const s of io.sockets.sockets.values()) {
     if (s?.data?.userId && String(s.data.userId) === String(userId)) return s;
   }
   return null;
 }
+
+function resolveActiveSocket(io, userId, socketId) {
+  let s = io.sockets.sockets.get(socketId);
+  if (!s || s.disconnected) {
+    s = findSocketByUser(io, userId);
+  }
+  return s;
+}
 function emitToUser(io, userId, event, payload) {
   const roomName = userRoom(userId);
   const uid = String(userId);
-  let delivered = 0;
 
-  // PRIMARY: Scan ALL connected sockets and emit directly to every socket belonging to this user
-  // This is the most reliable method — doesn't depend on room join working correctly
-  for (const [socketId, socket] of io.sockets.sockets) {
-    const sockUserId = socket.data?.userId;
-    if (sockUserId && String(sockUserId) === uid) {
-      socket.emit(event, payload);
-      delivered++;
-      // Also ensure they're in their room for future emits
-      try { socket.join(roomName); } catch { }
+  // Repair room membership for this user's *known local sockets only* — O(user's sockets),
+  // NOT O(all online sockets). The previous implementation scanned io.sockets.sockets on
+  // every emit, which scaled with total concurrency and dominated CPU under load.
+  const localIds = userSockets.get(uid) || userSockets.get(userId);
+  if (localIds) {
+    for (const sid of localIds) {
+      const s = io.sockets.sockets.get(sid);
+      if (s) { try { s.join(roomName); } catch { } }
     }
   }
 
-  // SECONDARY: Also emit to the room in case we missed any (e.g. Redis adapter cross-node)
-  const room = io.sockets.adapter.rooms.get(roomName);
-  const roomSize = room ? room.size : 0;
-  if (roomSize > 0) {
-    io.to(roomName).emit(event, payload);
-  }
+  // Single dispatch: with the Redis adapter, this delivers to every socket in the room
+  // across all nodes exactly once (no local double-delivery).
+  io.to(roomName).emit(event, payload);
 
-  console.log(`[EMIT] '${event}' → user ${userId} | direct_sockets=${delivered} | room_size=${roomSize}`);
-  if (delivered === 0 && roomSize === 0) {
-    console.log(`[EMIT] ❌ No socket found for user ${userId} — they may be offline`);
+  if (DEBUG_MATCH) {
+    const room = io.sockets.adapter.rooms.get(roomName);
+    dbg("emitToUser", { event, user: uid, localRoomSize: room ? room.size : 0 });
   }
 }
 
@@ -212,14 +232,11 @@ function pairKey(u1, u2) {
 
 async function getRematchOffer(u1, u2) {
   const key = pairKey(u1, u2);
-  console.log(key);
   const raw = await redis.get(key);
   return raw ? JSON.parse(raw) : null;
 }
 async function putRematchOffer(u1, u2, offer) {
-  console.log("putRematchOffer called for u1:", u1, " u2:", u2, " offer:", offer);
   const key = pairKey(u1, u2);
-  console.log(key);
   await redis.set(key, JSON.stringify(offer), "PX", REMATCH_TTL);
   return key;
 }
@@ -602,7 +619,8 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
     gameObj.finished = true;
   }
 
-  return tx(async (client) => {
+  // Fire-and-forget background transaction
+  tx(async (client) => {
     // Get game details to determine room and bonus used, with row lock
     const gameRes = await client.query(`SELECT status, bet_amount, player_x, player_o, bonus_used_x, bonus_used_o FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
     const game = gameRes.rows[0];
@@ -654,27 +672,36 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       `, [winnerUserId, prizeAmount, 'game-' + gameId + '-' + Date.now(), JSON.stringify({ gameId })]
       ).catch(err => console.error('[finishAndPayout] ledger insert failed (non-fatal):', err));
 
-      // Update global wins for winner and losses for opponent - REMOVED since wins/losses are dynamically calculated
-      const loserUserId = (winnerUserId === game.player_x) ? game.player_o : game.player_x;
-
-      // Track room_1_wins for the winner (Room 1 bets: 10, 25, 50, 99 ETB)
+      // Track tier wins for the winner
       const betBirr = game ? Math.round(Number(game.bet_amount)) : 0;
-      if (game && ROOMS_CONFIG[1].betRange.includes(betBirr)) {
-        let tierCol = "";
-        if (betBirr === 10) tierCol = "r1_10_wins";
-        else if (betBirr === 25) tierCol = "r1_25_wins";
-        else if (betBirr === 50) tierCol = "r1_50_wins";
-        else if (betBirr === 99 || betBirr === 90) tierCol = "r1_99_wins";
+      const roomNumber = determineRoomByBetAmount(betBirr) || 1;
 
-        await client.query(
-          `UPDATE users SET room_1_wins = room_1_wins + 1${tierCol ? `, ${tierCol} = ${tierCol} + 1` : ''} WHERE id = $1`,
-          [winnerUserId]
-        ).catch(err => console.error('[game] room_1_wins increment error:', err));
+      // Increment the total room wins and specific tier wins to enforce caps
+      const roomCol = roomNumber === 1 ? 'room_1_wins' : (roomNumber === 2 ? 'room_2_wins' : 'room_3_wins');
+      
+      let tierCol = null;
+      if (betBirr === 10) tierCol = 'r1_10_wins';
+      else if (betBirr === 25) tierCol = 'r1_25_wins';
+      else if (betBirr === 50) tierCol = 'r1_50_wins';
+      else if (betBirr === 99) tierCol = 'r1_99_wins';
+      else if (betBirr === 100) tierCol = 'r2_100_wins';
+      else if (betBirr === 1000) tierCol = 'r3_1000_wins';
 
-        console.log(`[ACHIEVEMENT] Room 1 win recorded: User=${winnerUserId} Bet=${game.bet_amount} Birr=${betBirr} Tier=${tierCol}`);
+      let tierUpdateSql = '';
+      if (tierCol) {
+        tierUpdateSql = `, ${tierCol} = COALESCE(${tierCol}, 0) + 1`;
+      }
+
+      await client.query(
+        `UPDATE users SET ${roomCol} = COALESCE(${roomCol}, 0) + 1${tierUpdateSql} WHERE id = $1`,
+        [winnerUserId]
+      ).catch(err => console.error('[game] wins increment error:', err));
+
+      console.log(`[ACHIEVEMENT] Win recorded: User=${winnerUserId} Bet=${game.bet_amount} Birr=${betBirr} Room=${roomNumber}`);
 
         // Determine the rangeKey for winner and loser
         // We read it from the in-memory activeGames map first, with a fallback
+        const loserUserId = (winnerUserId === game.player_x) ? game.player_o : game.player_x;
         const activeGameObj = activeGames.get(gameId);
         const rangeKeyWinner = activeGameObj 
           ? (winnerUserId === activeGameObj.players.X ? activeGameObj.rangeX : activeGameObj.rangeO)
@@ -705,7 +732,6 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         // Reset loser's consecutive win counter for their range
         const loserConsKey = `cooldown:wins:${loserUserId}:${finalLoserRangeKey}`;
         await redis.del(loserConsKey).catch(() => { });
-      }
     } else {
       // Option A: Refund both players fully
       const betCents = Number(game.bet_amount || 0);
@@ -750,7 +776,7 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         ).catch(err => console.error('[finishAndPayout] O refund ledger failed:', err));
       }
     }
-  });
+  }).catch(err => console.error('[finishAndPayout] Background transaction failed:', err));
 }
 
 // ---------------- Game helpers ----------------
@@ -872,9 +898,14 @@ function startTimer(io, matchId) {
   const game = activeGames.get(matchId);
   if (!game) return;
 
-  // Refresh Redis in_game locks (60-minute TTL = 3600 seconds)
-  if (game.players && game.players.X) redis.expire(`in_game:${game.players.X}`, 3600).catch(() => {});
-  if (game.players && game.players.O) redis.expire(`in_game:${game.players.O}`, 3600).catch(() => {});
+  // Refresh Redis in_game locks (60-min TTL). startTimer runs on every move/round, so
+  // throttle to at most once per 60s per game — the TTL is far longer than any refresh gap.
+  const now = Date.now();
+  if (!game._lastLockRefresh || now - game._lastLockRefresh > 60_000) {
+    game._lastLockRefresh = now;
+    if (game.players && game.players.X) redis.expire(`in_game:${game.players.X}`, 3600).catch(() => {});
+    if (game.players && game.players.O) redis.expire(`in_game:${game.players.O}`, 3600).catch(() => {});
+  }
 
   if (game.timerInterval) clearInterval(game.timerInterval);
   game.timerInterval = setInterval(() => {
@@ -929,9 +960,8 @@ function setupGameSocket(io) {
   // Background interval for simulated/fake wins ticker (runs once globally)
   setInterval(async () => {
     try {
-      const settingsRes = await pool.query("SELECT value FROM global_settings WHERE key = 'fake_ticker_enabled'");
-      const enabled = settingsRes.rows.length > 0 && (settingsRes.rows[0].value === true || settingsRes.rows[0].value === 'true');
-      if (!enabled) return;
+      const enabled = await getGlobalSetting('fake_ticker_enabled', false);
+      if (!enabled || enabled === 'false') return;
 
       const fakeRes = await pool.query("SELECT username, amount FROM fake_ticker_entries WHERE active = true ORDER BY RANDOM() LIMIT 1");
       if (fakeRes.rows.length === 0) return;
@@ -960,12 +990,12 @@ function setupGameSocket(io) {
     try {
       const tkn = socket.handshake.auth?.token;
       if (tkn) {
-        const decoded = jwt.verify(tkn, JWT_SECRET);
+        const decoded = verifyToken(tkn);
         if (decoded?.sub) {
           const uid = decoded.sub || decoded.id;
           rememberUser(uid);
           rememberUserSocket(socket, uid);
-          console.log(`[CONNECT] User ${uid} auto-registered on socket connect`);
+          if (DEBUG_MATCH) console.log(`[CONNECT] User ${uid} auto-registered on socket connect`);
         }
       }
     } catch (e) {
@@ -992,9 +1022,10 @@ function setupGameSocket(io) {
       console.log("find_match called with token:", token ? token.substring(0, 20) + "..." : "NO_TOKEN", "betMin:", safeBetMin, "betMax:", safeBetMax, "platform:", platform);
       logAlways(`ENTER find_match rid=${rid} sid=${socket.id} min=${safeBetMin} max=${safeBetMax} platform=${platform}`);
       try {
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const decoded = verifyToken(token);
         userId = decoded.sub || decoded.id;
-        console.log(`[MM] Token verified for user: ${userId}`);
+        if (DEBUG_MATCH) console.log(`[MM] Token verified for user: ${userId}`);
+        await purgeUserFromAllQueues(userId);
 
         // --- STRICT PAYLOAD SANITIZATION (Security Pen Test Patch) ---
         if (!Number.isFinite(safeBetMin) || safeBetMin <= 0 || !Number.isFinite(safeBetMax) || safeBetMax < safeBetMin) {
@@ -1009,13 +1040,27 @@ function setupGameSocket(io) {
         const username = decoded.username || "";
 
         // Determine starting search amount (use max if user has enough balance, otherwise min)
-        const balRes = await pool.query(`SELECT available_balance, COALESCE(bonus_balance, 0) AS bonus_balance FROM wallets WHERE user_id = $1`, [userId]);
-        const avail = Number(balRes.rows?.[0]?.available_balance ?? 0);
-        const bonus = Number(balRes.rows?.[0]?.bonus_balance ?? 0);
+        const userRes = await pool.query(
+          `SELECT u.r1_10_wins, u.room_1_wins, u.room_2_wins, u.room_3_wins,
+                  w.available_balance, COALESCE(w.bonus_balance, 0) AS bonus_balance 
+           FROM users u
+           LEFT JOIN wallets w ON u.id = w.user_id 
+           WHERE u.id = $1`,
+          [userId]
+        );
+        if (!userRes.rows.length) {
+          if (typeof ack === "function") ack({ ok: true, data: { state: "INSUFFICIENT_BALANCE" } });
+          socket.emit("error", { code: "INSUFFICIENT_BALANCE", message: "User not found" });
+          return;
+        }
+
+        const user = userRes.rows[0];
+        const avail = Number(user.available_balance ?? 0);
+        const bonus = Number(user.bonus_balance ?? 0);
         const effectiveBalance = avail + bonus;
         dbg(`rid=${rid} sid=${socket.id}`, "prequeue balance", { avail, bonus, effectiveBalance, min: safeBetMin, max: safeBetMax });
 
-        if (!balRes.rows.length || effectiveBalance < safeBetMin) {
+        if (effectiveBalance < safeBetMin) {
           if (typeof ack === "function") ack({ ok: true, data: { state: "INSUFFICIENT_BALANCE" } });
           socket.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance" });
           return;
@@ -1032,6 +1077,19 @@ function setupGameSocket(io) {
           socket.emit("error", {
             code: "INVALID_BET_AMOUNT",
             message: `Invalid bet amount.`
+          });
+          return;
+        }
+
+        // Win Lock Constraint check: 15-win cap specifically for 10 Birr price tier
+        let hasMaxWins = false;
+        if (searchAmount === 10 && Number(user.r1_10_wins || 0) >= 15) hasMaxWins = true;
+
+        if (hasMaxWins) {
+          if (typeof ack === "function") ack({ ok: true, data: { state: "TIER_LOCKED" } });
+          socket.emit("error", {
+            code: "TIER_LOCKED",
+            message: `10 Birr games are locked because you have reached the 15-win cap for this price.`
           });
           return;
         }
@@ -1189,9 +1247,8 @@ function setupGameSocket(io) {
         }
 
         // matcher (with lock)
-        console.log(`[MM] Checking queue for searchAmount: ${searchAmount}, queueKey: ${queueKey}`);
         const queueLen = await redis.llen(queueKey).catch(() => 0);
-        console.log(`[MM] Current queue length: ${queueLen}`);
+        if (DEBUG_MATCH) console.log(`[MM] queue ${queueKey} searchAmount=${searchAmount} len=${queueLen}`);
 
         dbg(ctx, "matcher: try lock", { lock: `lock:matcher:${searchAmount}` });
         const locked = await withRedisLock(redis, `lock:matcher:${searchAmount}`, 2000, async () => {
@@ -1230,15 +1287,23 @@ function setupGameSocket(io) {
               p2 = JSON.parse(nextRaw);
             }
 
-            const s1 = io.sockets.sockets.get(p1.socketId);
-            const s2 = io.sockets.sockets.get(p2.socketId);
+            let s1 = resolveActiveSocket(io, p1.userId, p1.socketId);
+            let s2 = resolveActiveSocket(io, p2.userId, p2.socketId);
 
             if (!s1 || !s2) {
               dbg(ctx, "One or both sockets missing, re-queuing survivors", { s1: !!s1, s2: !!s2 });
-              if (s1) await redis.lpush(queueKey, JSON.stringify(p1));
-              if (s2) await redis.lpush(queueKey, JSON.stringify(p2));
+              if (s1) {
+                p1.socketId = s1.id;
+                await redis.lpush(queueKey, JSON.stringify(p1));
+              }
+              if (s2) {
+                p2.socketId = s2.id;
+                await redis.lpush(queueKey, JSON.stringify(p2));
+              }
               continue;
             }
+            p1.socketId = s1.id;
+            p2.socketId = s2.id;
 
             // Check shadow bans (3-win streak cooldown)
             const p1Banned = await isShadowBanned(p1.userId, p1.betMin, p1.betMax);
@@ -1439,14 +1504,22 @@ function setupGameSocket(io) {
                     p2 = JSON.parse(nextRaw);
                   }
 
-                  const s1 = io.sockets.sockets.get(p1.socketId);
-                  const s2 = io.sockets.sockets.get(p2.socketId);
+                  let s1 = resolveActiveSocket(io, p1.userId, p1.socketId);
+                  let s2 = resolveActiveSocket(io, p2.userId, p2.socketId);
 
                   if (!s1 || !s2) {
-                    if (s1) await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
-                    if (s2) await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                    if (s1) {
+                      p1.socketId = s1.id;
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p1));
+                    }
+                    if (s2) {
+                      p2.socketId = s2.id;
+                      await redis.lpush(fallbackQueueKey, JSON.stringify(p2));
+                    }
                     continue;
                   }
+                  p1.socketId = s1.id;
+                  p2.socketId = s2.id;
 
                   const p1Banned = await isShadowBanned(p1.userId, p1.betMin, p1.betMax);
                   const p2Banned = await isShadowBanned(p2.userId, p2.betMin, p2.betMax);
@@ -1635,8 +1708,12 @@ function setupGameSocket(io) {
                       return;
                     }
 
-                    const oppSocket = io.sockets.sockets.get(opponent.socketId);
-                    if (!oppSocket || oppSocket.disconnected) return;
+                    let oppSocket = resolveActiveSocket(io, opponent.userId, opponent.socketId);
+                    if (!oppSocket || oppSocket.disconnected) {
+                      await redis.lpush(adjQueueKey, raw);
+                      return;
+                    }
+                    opponent.socketId = oppSocket.id;
 
                     // Check shadow bans
                     const p1Banned = await isShadowBanned(userId, safeBetMin, safeBetMax);
@@ -1770,7 +1847,7 @@ function setupGameSocket(io) {
     socket.on("cancel_find_match", async ({ token }, ack) => {
       let userId = null;
       try {
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const decoded = verifyToken(token);
         userId = decoded.sub || decoded.id;
 
         // CRITICAL: If already matched/in-game, deny cancellation
@@ -1796,36 +1873,17 @@ function setupGameSocket(io) {
       }
     });
 
-    // -------------------------------------------------------
-    // AUTO-REGISTER on connect: decode auth token from handshake
-    // -------------------------------------------------------
-    try {
-      const tkn = socket.handshake.auth?.token;
-      if (tkn) {
-        const decoded = jwt.verify(tkn, JWT_SECRET);
-        const uid = decoded.sub || decoded.userId || decoded.id;
-        if (uid) {
-          rememberUser(uid);
-          rememberUserSocket(socket, uid);
-          console.log(`[CONNECT] User ${uid} auto-registered on socket connect`);
-        }
-      }
-    } catch { /* token invalid/expired — will be caught later on actual events */ }
-
-    // Cleanup on disconnect
-    socket.on("disconnect", () => {
-      const uid = socket.data?.userId;
-      if (uid) {
-        removeUserSocket(uid, socket.id);
-      }
-    });
+    // NOTE: auto-register + light disconnect cleanup were duplicated here previously.
+    // Auto-register runs once at the top of the connection handler; the main
+    // disconnect handler below already calls removeUserSocket(). Both removed to
+    // avoid a redundant per-connection jwt.verify and a second disconnect listener.
 
     // -------------------------------------------------------
     // FRIEND INVITE (lookup + send)
     // -------------------------------------------------------
     socket.on("friend_invite", async ({ token: tkn, targetUsername, betAmount: rawBet }) => {
       try {
-        const decoded = jwt.verify(tkn, JWT_SECRET);
+        const decoded = verifyToken(tkn);
         const senderId = decoded.sub || decoded.id;
         rememberUser(senderId);
         rememberUserSocket(socket, senderId);
@@ -1917,7 +1975,7 @@ function setupGameSocket(io) {
     // -------------------------------------------------------
     socket.on("friend_invite_response", async ({ token: tkn, senderId, accept, betAmount }) => {
       try {
-        const decoded = jwt.verify(tkn, JWT_SECRET);
+        const decoded = verifyToken(tkn);
         const responderId = decoded.sub || decoded.id;
         rememberUser(responderId);
         const pairKey = [senderId, responderId].sort().join(":");
@@ -1954,7 +2012,13 @@ function setupGameSocket(io) {
       game.turn = opposite(symbol);
       game.lastMoveTime = Date.now();
 
-      const moveObj = { index, symbol, user: userId, ts: new Date().toISOString() };
+      const moveObj = {
+        index,
+        symbol,
+        user: userId,
+        ts: new Date().toISOString(),
+        timers: { X: game.timers.X, O: game.timers.O }
+      };
       saveMove(matchId, moveObj).catch(e => console.error("saveMove error:", e));
 
       io.to(matchId).emit("move_made", {
@@ -2031,7 +2095,7 @@ function setupGameSocket(io) {
     // ---------------- Leave / Forfeit ----------------
     socket.on("leave_match", async ({ token, matchId }, ack) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const { sub: userId } = verifyToken(token);
         rememberUser(userId);
         rememberUserSocket(socket, userId);
 
@@ -2056,7 +2120,7 @@ function setupGameSocket(io) {
 
     socket.on("leave_room", async ({ token }) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const { sub: userId } = verifyToken(token);
         await redis.del(`in_game:${userId}`).catch(() => { });
       } catch (e) { }
     });
@@ -2120,7 +2184,7 @@ function setupGameSocket(io) {
     // === REMATCH: Sender requests a rematch ===========================
     socket.on("rematch_request", async ({ token, opponentId, amount }, ack) => {
       try {
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const decoded = verifyToken(token);
         const userId = decoded.sub || decoded.id;
         socket.data = { ...(socket.data || {}), userId };
 
@@ -2158,7 +2222,7 @@ function setupGameSocket(io) {
     // === REMATCH: Receiver answers (accept/decline) ===================
     socket.on("rematch_response", async ({ token, opponentId, accept, amount }, ack) => {
       try {
-        const decoded = jwt.verify(token, JWT_SECRET);
+        const decoded = verifyToken(token);
         const userId = decoded.sub || decoded.id;
         socket.data = { ...(socket.data || {}), userId };
 
@@ -2208,7 +2272,7 @@ function setupGameSocket(io) {
 
     socket.on("cancel_rematch", async ({ token, opponentId }, ack) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const { sub: userId } = verifyToken(token);
         await clearRematchOffer(userId, opponentId);
         emitToUser(io, opponentId, "rematch_cancelled", {});
         ack?.({ ok: true });
@@ -2219,7 +2283,7 @@ function setupGameSocket(io) {
 
     socket.on("reconnect_match", ({ token, matchId }) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const { sub: userId } = verifyToken(token);
         rememberUser(userId);
         rememberUserSocket(socket, userId);
 
@@ -2252,7 +2316,7 @@ function setupGameSocket(io) {
 
     socket.on("get_game_state", async ({ token, matchId }, ack) => {
       try {
-        const { sub: userId } = jwt.verify(token, JWT_SECRET);
+        const { sub: userId } = verifyToken(token);
         const game = activeGames.get(matchId);
         if (!game) {
           return ack?.({ ok: false, error: "Game not found or expired" });

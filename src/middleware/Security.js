@@ -70,7 +70,7 @@ async function systemLockdownCheck(req, res, next) {
         const token = authHeader.slice(7);
         const jwt = require('jsonwebtoken');
         const pubKey = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
-        const payload = jwt.verify(token, pubKey);
+        const payload = jwt.verify(token, pubKey, { algorithms: ["HS256"] });
 
         if (payload) {
           // Check role from JWT
@@ -145,7 +145,7 @@ async function systemLockdownCheck(req, res, next) {
           const token = authHeader.slice(7);
           const jwt = require('jsonwebtoken');
           const pubKey = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
-          const payload = jwt.verify(token, pubKey);
+          const payload = jwt.verify(token, pubKey, { algorithms: ["HS256"] });
           
           if (payload) {
             const jwtNum = payload.number ? String(payload.number).replace(/\+/g, '') : null;

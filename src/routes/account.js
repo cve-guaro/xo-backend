@@ -101,6 +101,8 @@ router.post('/history', auth, async (req, res) => {
         uo.username AS po_name,
         ux.number   AS px_num,
         uo.number   AS po_num,
+        ux.created_at AS player_x_created_at,
+        uo.created_at AS player_o_created_at,
         -- Server-side win/loss flag: avoids UUID comparison bugs in client
         CASE
           WHEN g.winner IS NULL THEN 'abandoned'

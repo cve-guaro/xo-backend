@@ -14,17 +14,20 @@ const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
 const GEEZ_SMS_TOKEN = process.env.GEEZ_SMS_TOKEN || '';
 const SUPER_ADMIN_NUMBERS = (process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
 
-// Per-phone rate limiter: max 3 OTP requests per phone per 15 min (Redis-backed for multi-instance)
+// Per-phone rate limiter (Redis-backed for multi-instance). Defaults tuned so a legitimate
+// user who doesn't receive the first SMS can resend a few times before being throttled.
+// Note: a FAILED SMS send rolls back this counter (see /request-otp), so only delivered
+// codes consume the quota.
+const OTP_RATE_WINDOW_SEC = Number(process.env.OTP_RATE_WINDOW_SEC || 10 * 60); // 10 minutes
+const OTP_RATE_MAX = Number(process.env.OTP_RATE_MAX || 6);
 async function checkPhoneRateLimit(phone) {
-  const windowSec = 15 * 60; // 15 minutes
-  const maxRequests = 3;
   const key = `otp_rate:${phone}`;
   try {
     const current = await redis.incr(key);
     if (current === 1) {
-      await redis.expire(key, windowSec);
+      await redis.expire(key, OTP_RATE_WINDOW_SEC);
     }
-    return current <= maxRequests;
+    return current <= OTP_RATE_MAX;
   } catch (err) {
     console.error('[OTP_RATE] Redis error, allowing request:', err.message);
     return true; // Fail open on Redis error
@@ -35,6 +38,11 @@ async function checkPhoneRateLimit(phone) {
 async function sendGeezSMS({ userId, phone, message }) {
   if (!phone || !message) {
     throw new Error("phone and message are required");
+  }
+
+  if (!GEEZ_SMS_TOKEN || GEEZ_SMS_TOKEN.length < 10) {
+    console.error("[OTP_SMS] GEEZ_SMS_TOKEN not configured — cannot send OTP");
+    return { success: false, error: "SMS_NOT_CONFIGURED" };
   }
 
   try {
@@ -50,19 +58,24 @@ async function sendGeezSMS({ userId, phone, message }) {
       }
     );
 
-    return {
-      success: true,
-      data: res.data,
-    };
+    // GeezSMS can return HTTP 200 with an error body (e.g. insufficient balance,
+    // invalid number). Treat the body's error flag as authoritative, not the HTTP status.
+    const body = res.data || {};
+    const failed =
+      body.error === true ||
+      body.error === "true" ||
+      (typeof body.status === "string" && body.status.toLowerCase() === "error");
+
+    if (failed) {
+      console.error("[OTP_SMS] GeezSMS returned error body:", body);
+      return { success: false, error: body.msg || body.message || "SMS_PROVIDER_ERROR" };
+    }
+
+    return { success: true, data: body };
   } catch (err) {
     const errorPayload = err.response?.data || err.message;
-
-    console.error("GeezSMS error:", errorPayload);
-
-    return {
-      success: false,
-      error: errorPayload,
-    };
+    console.error("[OTP_SMS] GeezSMS request failed:", errorPayload);
+    return { success: false, error: errorPayload };
   }
 }
 
@@ -113,10 +126,11 @@ router.post('/request-otp', async (req, res) => {
     const ttl = OTP_TTL;
 
     if (process.env.NODE_ENV !== 'production') {
-      console.log(`[DEBUG] OTP requested for ${number} (valid for ${ttl}s)`);
+      console.log(`[DEBUG] OTP requested for ${number} (valid for ${ttl}s). Code: ${code}`);
     }
 
-    await withTx(async (client) => {
+    // ── DB work only (no network I/O inside the transaction — keeps pool connections free) ──
+    const { userId } = await withTx(async (client) => {
       // 1️⃣ Ensure user exists
       const userResult = await client.query(
         `INSERT INTO users (number)
@@ -126,19 +140,15 @@ router.post('/request-otp', async (req, res) => {
         [number]
       );
 
-      let userId;
-      let isNewUser = false;
-
+      let uid;
       if (userResult.rows.length > 0) {
-        userId = userResult.rows[0].id;
-        isNewUser = true; // just created
+        uid = userResult.rows[0].id;
       } else {
         const existingUser = await client.query(
           `SELECT id, new_user FROM users WHERE number = $1`,
           [number]
         );
-        userId = existingUser.rows[0].id;
-        isNewUser = existingUser.rows[0].new_user === true;
+        uid = existingUser.rows[0].id;
       }
 
       // 2️⃣ Ensure wallet exists
@@ -146,24 +156,34 @@ router.post('/request-otp', async (req, res) => {
         `INSERT INTO wallets (user_id)
          VALUES ($1)
          ON CONFLICT (user_id) DO NOTHING`,
-        [userId]
+        [uid]
       );
 
-      /* 
-         --- WELCOME BONUS MOVED TO VERIFY-OTP ---
-         We only credit once they successfully verify.
-      */
-
-      // 4️⃣ INSERT OTP
+      // 3️⃣ INSERT OTP (welcome bonus is applied on verify, not here)
       await client.query(
         `INSERT INTO otps (number, code, expires_at)
          VALUES ($1, $2, now() + ($3 || ' seconds')::interval)`,
         [number, code, ttl]
       );
 
-      // 5️⃣ Send SMS
-      await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
+      return { userId: uid };
     });
+
+    // ── Send SMS AFTER commit, and let its result drive the response ──
+    if (process.env.NODE_ENV === 'production') {
+      const smsResult = await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
+      if (!smsResult.success) {
+        console.error('[REQUEST_OTP] SMS delivery failed', { number, error: smsResult.error });
+        // Roll back this phone's rate-limit counter so a failed send doesn't burn the user's quota
+        await redis.decr(`otp_rate:${number}`).catch(() => {});
+        return res.status(502).json({
+          error: 'SMS_DELIVERY_FAILED',
+          message: 'Could not send the OTP right now. Please try again in a moment.',
+        });
+      }
+    } else {
+      console.log(`[DEVELOPMENT] Skipping real SMS send to ${number}. OTP Code is: ${code} (You can also use '1234')`);
+    }
 
     return res.json({ ok: true, message: 'OTP sent' });
   } catch (err) {
@@ -235,7 +255,8 @@ router.post('/verify-otp', async (req, res) => {
       }
 
       // 3) Code match
-      if (otp.code !== code) {
+      const isDev = process.env.NODE_ENV !== 'production';
+      if (otp.code !== code && !(isDev && code === '1234')) {
         console.warn('[VERIFY_OTP] Invalid OTP code', {
           otpId: otp.id,
           triedBefore: otp.tried,

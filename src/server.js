@@ -36,11 +36,19 @@ const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
 const { platformDetection } = require('./middleware/Detection');
 const { systemLockdownCheck } = require('./middleware/Security');
-const { pool } = require('./db/index');
+const { pool, redis } = require('./db/index');
 
 
 const app = express();
-app.use(compression());
+app.use(compression({
+  level: 6,            // Best balance of speed vs compression ratio (~70% reduction)
+  threshold: 1024,     // Skip responses smaller than 1KB (overhead not worth it)
+  filter: (req, res) => {
+    // Don't compress server-sent events or streaming responses
+    if (req.headers['accept'] === 'text/event-stream') return false;
+    return compression.filter(req, res);
+  },
+}));
 app.set('trust proxy', 1);
 const server = http.createServer(app);
 
@@ -164,13 +172,19 @@ const paymentLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 30, // Strict: 30 auth attempts per 15 min per IP (prevents OTP brute-force)
+  // Per-IP cap. Raised from 30 → 120 because Ethiopian mobile carriers frequently NAT many
+  // users behind one shared IP; 30 locked out legitimate users sharing an IP. Per-phone OTP
+  // throttling (in routes/otp.js) is the real brute-force guard for OTP specifically.
+  max: Number(process.env.AUTH_RATE_MAX || 120),
   message: {
     error: "TOO_MANY_REQUESTS",
     message: "Too many login attempts. For security, please wait 15 minutes before trying again."
   },
   standardHeaders: true,
   legacyHeaders: false,
+  // /refresh is self-protected (requires a valid refresh token) and is polled on every boot —
+  // don't let it consume the auth budget and lock users out of login/OTP.
+  skip: (req) => req.path === '/refresh' || req.path === '/auth/refresh',
 });
 
 // Dedicated high-capacity limiter for authenticated profile polling
@@ -216,7 +230,7 @@ app.get('/players/online', async (req, res) => {
       if (token) {
         const jwt = require('jsonwebtoken');
         const pubKey = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
-        const payload = jwt.verify(token, pubKey);
+        const payload = jwt.verify(token, pubKey, { algorithms: ["HS256"] });
         
         if (payload.role === 'admin' || payload.role === 'superadmin') {
           isAdmin = true;
@@ -258,10 +272,16 @@ app.use('/notifications', require('./routes/notifications'));
 app.use('/leaderboard', require('./routes/leaderboard'));
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
+  const CACHE_KEY = 'cache:api_features';
   try {
+    const cached = await redis.get(CACHE_KEY);
+    if (cached) return res.json(JSON.parse(cached));
+
     const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist')");
     const features = {};
     rows.forEach(r => features[r.key] = r.value);
+    
+    await redis.setex(CACHE_KEY, 30, JSON.stringify(features));
     res.json(features);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch features' });
@@ -270,7 +290,11 @@ app.get('/api/features', async (req, res) => {
 
 // Public route: fetch active promotion popup (no auth needed)
 app.get('/promo-popup/active', async (req, res) => {
+  const CACHE_KEY = 'cache:promo_popup_active';
   try {
+    const cached = await redis.get(CACHE_KEY);
+    if (cached) return res.json(JSON.parse(cached));
+
     const { rows } = await pool.query(`
       SELECT id, image_url, display_duration, starts_at, expires_at, is_active
       FROM promo_popups
@@ -280,8 +304,10 @@ app.get('/promo-popup/active', async (req, res) => {
       ORDER BY created_at DESC
       LIMIT 1
     `);
-    if (rows.length === 0) return res.json({ ok: true, popup: null });
-    return res.json({ ok: true, popup: rows[0] });
+    
+    const responseData = rows.length === 0 ? { ok: true, popup: null } : { ok: true, popup: rows[0] };
+    await redis.setex(CACHE_KEY, 30, JSON.stringify(responseData));
+    return res.json(responseData);
   } catch (err) {
     console.error('[PUBLIC] GET /promo-popup/active err', err);
     return res.status(500).json({ error: 'Failed to fetch promo popup' });
@@ -299,6 +325,35 @@ initCron();
 // Awaited on startup so the database schema is guaranteed to be ready before accepting requests.
 async function runMigrations() {
   try {
+    // Unconditional schema updates & index creation for performance & gameplay features
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS room_2_wins INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS room_3_wins INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS r2_100_wins INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS r3_1000_wins INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS raw_user_meta_data JSONB DEFAULT '{}'::jsonb;`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_player_x ON games(player_x);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_player_o ON games(player_o);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_players ON games(player_x, player_o);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_winner ON games(winner);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_created_at ON games(created_at);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_id ON wallet_transactions(user_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_transactions_user ON wallet_transactions(user_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_wallet_transactions_created_at ON wallet_transactions(created_at);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_wallet_tx_status_type ON wallet_transactions(status, tx_type);`);
+
+    // Ensure welcome bonus default values are active and set to 10 Birr
+    await pool.query(`
+      INSERT INTO global_settings (key, value) 
+      VALUES ('welcome_bonus_amount', '10'::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = '10'::jsonb;
+    `);
+    await pool.query(`
+      INSERT INTO global_settings (key, value) 
+      VALUES ('welcome_bonus_active', 'true'::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb;
+    `);
+
     // Check if migrations already completed (skip on subsequent deploys)
     const guardRes = await pool.query(
       `SELECT value FROM global_settings WHERE key = 'migrations_v3_completed'`

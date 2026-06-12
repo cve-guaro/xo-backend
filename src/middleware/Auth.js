@@ -25,7 +25,7 @@ async function auth(req, res, next) {
         return res.status(401).json({ error: 'Token revoked' });
       }
 
-      const payload = jwt.verify(token, pubKey);
+      const payload = jwt.verify(token, pubKey, { algorithms: ['HS256'] });
       const userId = payload.sub || payload.userId || payload.id;
 
       // ✅ Always fetch the LIVE role from DB — JWT role may be stale after promotion
