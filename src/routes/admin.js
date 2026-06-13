@@ -788,7 +788,7 @@ router.get('/users', async (req, res) => {
 
     const query = `
       SELECT u.id, u.number, u.username, u.display_name, u.avatar,
-             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
+             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_15_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
              u.r2_100_wins, u.r3_1000_wins, u.created_at,
              COALESCE(w.available_balance, 0)    AS available_balance,
              COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
@@ -838,7 +838,7 @@ router.get('/users/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT u.id, u.number, u.username, u.display_name, u.avatar,
-             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
+             u.role, u.banned, u.room_1_wins, u.r1_10_wins, u.r1_15_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
              u.r2_100_wins, u.r3_1000_wins, u.created_at,
              COALESCE(u.raw_user_meta_data->'accomplishments', '[]'::jsonb) AS accomplishments,
              COALESCE(w.available_balance, 0)    AS available_balance,
@@ -1112,7 +1112,8 @@ router.get('/users/:id/360', async (req, res) => {
     // 1) User profile
     const userRes = await pool.query(
       `SELECT id, username, number, role, banned, created_at, display_name,
-              COALESCE(r1_10_wins, 0) as r1_10_wins, COALESCE(r1_25_wins, 0) as r1_25_wins,
+              COALESCE(r1_10_wins, 0) as r1_10_wins, COALESCE(r1_15_wins, 0) as r1_15_wins,
+              COALESCE(r1_25_wins, 0) as r1_25_wins,
               COALESCE(r1_50_wins, 0) as r1_50_wins, COALESCE(r1_99_wins, 0) as r1_99_wins,
               COALESCE(r2_100_wins, 0) as r2_100_wins, COALESCE(r3_1000_wins, 0) as r3_1000_wins
        FROM users WHERE id = $1`, [userId]

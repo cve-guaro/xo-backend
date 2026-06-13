@@ -37,7 +37,7 @@ const REMATCH_TTL = 30_000; // 30s to respond (tweak as you like)
 const ROOMS_CONFIG = {
   1: {
     name: "Room 1 - Beginner",
-    betRange: [10, 25, 50, 99], // Valid bet amounts for this room
+    betRange: [10, 15, 25, 50], // Valid bet amounts for this room
     houseCutPercent: 10, // 10% cut
     timerDuration: 30, // 30 seconds per turn
     description: "Small bets - 10-100 ETB - 30s timer"
@@ -681,6 +681,7 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       
       let tierCol = null;
       if (betBirr === 10) tierCol = 'r1_10_wins';
+      else if (betBirr === 15) tierCol = 'r1_15_wins';
       else if (betBirr === 25) tierCol = 'r1_25_wins';
       else if (betBirr === 50) tierCol = 'r1_50_wins';
       else if (betBirr === 99) tierCol = 'r1_99_wins';
@@ -1041,7 +1042,7 @@ function setupGameSocket(io) {
 
         // Determine starting search amount (use max if user has enough balance, otherwise min)
         const userRes = await pool.query(
-          `SELECT u.r1_10_wins, u.room_1_wins, u.room_2_wins, u.room_3_wins,
+          `SELECT u.r1_10_wins, u.r1_15_wins, u.room_1_wins, u.room_2_wins, u.room_3_wins,
                   w.available_balance, COALESCE(w.bonus_balance, 0) AS bonus_balance 
            FROM users u
            LEFT JOIN wallets w ON u.id = w.user_id 
@@ -1081,15 +1082,16 @@ function setupGameSocket(io) {
           return;
         }
 
-        // Win Lock Constraint check: 15-win cap specifically for 10 Birr price tier
+        // Win Lock Constraint check: 15-win cap for the 10 Birr and 15 Birr price tiers
         let hasMaxWins = false;
         if (searchAmount === 10 && Number(user.r1_10_wins || 0) >= 15) hasMaxWins = true;
+        if (searchAmount === 15 && Number(user.r1_15_wins || 0) >= 15) hasMaxWins = true;
 
         if (hasMaxWins) {
           if (typeof ack === "function") ack({ ok: true, data: { state: "TIER_LOCKED" } });
           socket.emit("error", {
             code: "TIER_LOCKED",
-            message: `10 Birr games are locked because you have reached the 15-win cap for this price.`
+            message: `${searchAmount} Birr games are locked because you have reached the 15-win cap for this price.`
           });
           return;
         }
@@ -1898,7 +1900,7 @@ function setupGameSocket(io) {
 
         // Fetch target with win caps (no balance exposed)
         const targetRes = await pool.query(
-          `SELECT u.id, u.username, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
+          `SELECT u.id, u.username, u.r1_10_wins, u.r1_15_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins,
                   COALESCE(w.available_balance,0) as balance
            FROM users u LEFT JOIN wallets w ON u.id=w.user_id
            WHERE LOWER(u.username)=LOWER($1)`, [targetUsername]
@@ -1915,7 +1917,7 @@ function setupGameSocket(io) {
         // Sender balance + caps
         const senderRes = await pool.query(
           `SELECT COALESCE(w.available_balance,0) as balance,
-                  u.username, u.r1_10_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins
+                  u.username, u.r1_10_wins, u.r1_15_wins, u.r1_25_wins, u.r1_50_wins, u.r1_99_wins
            FROM users u LEFT JOIN wallets w ON u.id=w.user_id
            WHERE u.id=$1`, [senderId]
         );
@@ -1924,8 +1926,8 @@ function setupGameSocket(io) {
         const senderBalance = Number(sender.balance || 0);
 
         // Build caps for lock checks
-        const senderCaps = { r1_10: sender.r1_10_wins || 0, r1_25: sender.r1_25_wins || 0, r1_50: sender.r1_50_wins || 0, r1_99: sender.r1_99_wins || 0 };
-        const targetCaps = { r1_10: target.r1_10_wins || 0, r1_25: target.r1_25_wins || 0, r1_50: target.r1_50_wins || 0, r1_99: target.r1_99_wins || 0 };
+        const senderCaps = { r1_10: sender.r1_10_wins || 0, r1_15: sender.r1_15_wins || 0, r1_25: sender.r1_25_wins || 0, r1_50: sender.r1_50_wins || 0, r1_99: sender.r1_99_wins || 0 };
+        const targetCaps = { r1_10: target.r1_10_wins || 0, r1_15: target.r1_15_wins || 0, r1_25: target.r1_25_wins || 0, r1_50: target.r1_50_wins || 0, r1_99: target.r1_99_wins || 0 };
         const targetBalance = Number(target.balance || 0);
 
         socket.emit("friend_invite_result", {

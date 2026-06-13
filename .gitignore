@@ -70,6 +70,7 @@ investigate_user.js
 print_functions.js
 refund_anomalous_games.js
 run_migration.js
+run_migration_*.js
 seed_fake_users.js
 seed_leaderboard.js
 src/scripts/perf_test.js
