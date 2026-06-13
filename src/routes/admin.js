@@ -2876,200 +2876,7 @@ router.delete('/leaderboard/fake-ticker/:id', async (req, res) => {
   }
 });
 
-// ── GET /admin/leaderboard/giveaway-status — Current week top-3 for Manual Console ──
-router.get('/leaderboard/giveaway-status', async (req, res) => {
-  try {
-    const { weekStart, weekEnd } = getWeekBounds();
 
-    const { rows } = await pool.query(`
-      SELECT 
-        u.id::text as id, u.username, u.number, u.avatar,
-        COUNT(*) AS wins
-      FROM games g
-      JOIN users u ON u.id = g.winner
-      WHERE g.status IN ('completed', 'finished')
-        AND g.winner IS NOT NULL
-        AND g.created_at >= $1 AND g.created_at <= $2
-      GROUP BY u.id, u.username, u.number, u.avatar
-      HAVING COUNT(*) >= 1
-      ORDER BY wins DESC
-      LIMIT 3
-    `, [weekStart.toISOString(), weekEnd.toISOString()]);
-
-    const winners = rows.map((u, i) => ({
-      id: u.id,
-      username: u.username,
-      number: u.number || '',
-      avatar: u.avatar,
-      wins: Number(u.wins),
-      rank: i + 1,
-    }));
-
-    res.json({
-      ok: true,
-      winners,
-      weekStart: weekStart.toISOString(),
-      weekEnd: weekEnd.toISOString(),
-    });
-  } catch (err) {
-    console.error('[ADMIN] /leaderboard/giveaway-status error:', err);
-    res.status(500).json({ error: 'Failed to fetch giveaway status' });
-  }
-});
-
-// ── POST /admin/leaderboard/send-giveaway — Manual prize distribution + SMS + notifications ──
-router.post('/leaderboard/send-giveaway', async (req, res) => {
-  try {
-    const { winners, message, dryRun } = req.body;
-    if (!winners || !Array.isArray(winners) || winners.length === 0) {
-      return res.status(400).json({ error: 'winners array is required' });
-    }
-
-    const smsTemplate = message || '🏆 Congratulations {username}! You ranked #{rank} on the XO ET weekly leaderboard and won {prize} ETB! Keep playing!';
-    const results = [];
-
-    // Dry run — preview what would be sent
-    if (dryRun) {
-      for (const w of winners) {
-        const smsMsg = smsTemplate
-          .replace('{username}', w.username || '')
-          .replace('{rank}', String(w.rank))
-          .replace('{prize}', String(w.prize));
-
-        results.push({
-          userId: w.userId,
-          username: w.username,
-          phone: w.phone,
-          rank: w.rank,
-          prize: Number(w.prize),
-          smsPreview: smsMsg,
-          status: 'dry_run',
-        });
-      }
-      return res.json({ ok: true, results, dryRun: true });
-    }
-
-    // Live run — create snapshot, credit wallets, send SMS & notifications
-    const { weekStart, weekEnd } = getWeekBounds();
-    const weekStartStr = weekStart.toISOString().slice(0, 10);
-    const weekEndStr = weekEnd.toISOString().slice(0, 10);
-
-    // Check if snapshot already exists for this week
-    const { rows: existing } = await pool.query(
-      `SELECT id FROM leaderboard_snapshots WHERE week_start = $1 LIMIT 1`,
-      [weekStartStr]
-    );
-    if (existing.length > 0) {
-      return res.status(400).json({ error: 'Snapshot for this week already exists. Use the Past Snapshots section to approve individual prizes.' });
-    }
-
-    for (const w of winners) {
-      const prizeAmount = Math.round(Number(w.prize) || 0);
-      const userId = w.userId;
-
-      // 1. Create snapshot entry (pending — will be marked approved after crediting)
-      await pool.query(`
-        INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved')
-      `, [weekStartStr, weekEndStr, userId, w.username, Number(w.wins || 0), w.rank, prizeAmount]);
-
-      // 2. Credit available_balance (NOT withdrawable)
-      if (prizeAmount > 0) {
-        await pool.query(
-          `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
-          [prizeAmount, userId]
-        );
-        await pool.query(
-          `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
-          [userId, prizeAmount, `Weekly Leaderboard #${w.rank} Prize`]
-        );
-        
-        try {
-          const weekStartMD = formatMonthDay(weekStartStr);
-          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${w.rank} - Awarded ${prizeAmount} ETB`;
-          await pool.query(`
-            UPDATE users
-            SET raw_user_meta_data = jsonb_set(
-              COALESCE(raw_user_meta_data, '{}'::jsonb),
-              '{accomplishments}',
-              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
-            )
-            WHERE id = $2
-          `, [accomplishmentStr, userId]);
-        } catch (err) {
-          console.error('[ADMIN SEND GIVEAWAY] accomplishment update failed:', err);
-        }
-      }
-
-      // 3. In-app notification
-      const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
-      const notifMsg = `🏆 Congratulations! You ranked #${w.rank} on this week's leaderboard and earned ${prizeAmount} ETB! The prize has been added to your balance.`;
-      await pool.query(`
-        INSERT INTO notifications (user_id, type, title, message, meta)
-        VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
-      `, [
-        userId,
-        rankLabels[w.rank - 1] || `#${w.rank} Weekly Award`,
-        notifMsg,
-        JSON.stringify({ rank: w.rank, prize: prizeAmount, weekStart: weekStartStr, weekEnd: weekEndStr })
-      ]).catch(err => console.error('[SEND-GIVEAWAY] notification insert failed (non-fatal):', err));
-
-      // Emit socket event for real-time update
-      try {
-        emitToUserEvent(userId, 'balance_update', {});
-        emitToUserEvent(userId, 'info', {
-          title: rankLabels[w.rank - 1] || `#${w.rank} Weekly Award`,
-          message: notifMsg
-        });
-      } catch (e) {
-        console.error('[SEND-GIVEAWAY] socket emit failed:', e.message);
-      }
-
-      // 4. SMS
-      const phone = w.phone;
-      let smsStatus = 'no_phone';
-      if (phone) {
-        const smsMsg = smsTemplate
-          .replace('{username}', w.username || '')
-          .replace('{rank}', String(w.rank))
-          .replace('{prize}', String(prizeAmount));
-
-        try {
-          await sendSMS(phone, smsMsg);
-          smsStatus = 'sent';
-        } catch (smsErr) {
-          console.error(`[SEND-GIVEAWAY] SMS error for ${w.username}:`, smsErr.message);
-          smsStatus = 'failed';
-        }
-      }
-
-      results.push({
-        userId,
-        username: w.username,
-        phone,
-        rank: w.rank,
-        prize: prizeAmount,
-        status: 'completed',
-        smsStatus,
-      });
-    }
-
-    await logAdminAction(req.user.id, 'manual_leaderboard_giveaway', null, {
-      weekStart: weekStartStr,
-      winnersCount: winners.length,
-      totalPrize: winners.reduce((sum, w) => sum + Math.round(Number(w.prize) || 0), 0),
-    });
-
-    res.json({
-      ok: true,
-      message: `Successfully distributed prizes to ${results.length} winners and sent notifications.`,
-      results,
-    });
-  } catch (err) {
-    console.error('[ADMIN] /leaderboard/send-giveaway error:', err);
-    res.status(500).json({ error: 'Failed to send giveaway: ' + err.message });
-  }
-});
 
 // ── Fake Leaderboard Users CRUD ──
 router.get('/leaderboard/fake-users', async (req, res) => {
@@ -3507,14 +3314,20 @@ router.get('/leaderboard/giveaway-status', async (req, res) => {
 router.post('/leaderboard/send-giveaway', async (req, res) => {
   try {
     const { winners, message, dryRun } = req.body;
-    // winners = [{ userId, username, phone, rank, prize }]
+    // winners = [{ userId, username, phone, rank, prize, wins }]
     if (!winners || !winners.length) return res.status(400).json({ error: 'No winners provided' });
 
     const defaultMsg = (w) => `🏆 Congratulations ${w.username}! You ranked #${w.rank} on the XO ET weekly leaderboard and won ${w.prize} ETB! Your prize has been credited. Keep playing!`;
     const results = [];
 
+    const { weekStart, weekEnd } = getWeekBounds();
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+
     for (const w of winners) {
-      const smsMsg = message ? message.replace('{username}', w.username).replace('{rank}', w.rank).replace('{prize}', w.prize) : defaultMsg(w);
+      const smsMsg = message 
+        ? message.replace('{username}', w.username).replace('{rank}', w.rank).replace('{prize}', w.prize) 
+        : defaultMsg(w);
       
       if (dryRun) {
         results.push({ userId: w.userId, phone: w.phone, status: 'dry_run', message: smsMsg });
@@ -3523,6 +3336,17 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
           const prizeAmount = Math.round(Number(w.prize));
           
           if (prizeAmount > 0) {
+            // Check if snapshot already exists and is already approved
+            const { rows: snapRes } = await pool.query(
+              `SELECT id, prize_status FROM leaderboard_snapshots WHERE user_id = $1 AND week_start = $2`,
+              [w.userId, weekStartStr]
+            );
+
+            if (snapRes.length > 0 && snapRes[0].prize_status === 'approved') {
+              results.push({ userId: w.userId, phone: w.phone, status: 'already_approved', message: smsMsg });
+              continue;
+            }
+
             // 1. Credit wallet (bonus_balance and available_balance)
             await pool.query(
               `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
@@ -3535,21 +3359,30 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
               [w.userId, prizeAmount, `Weekly Leaderboard #${w.rank} Prize (Manual)`]
             );
 
-            // 3. Send SMS
+            // 3. Record accomplishment
+            try {
+              const weekStartMD = formatMonthDay(weekStartStr);
+              const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${w.rank} - Awarded ${prizeAmount} ETB`;
+              await pool.query(`
+                UPDATE users
+                SET raw_user_meta_data = jsonb_set(
+                  COALESCE(raw_user_meta_data, '{}'::jsonb),
+                  '{accomplishments}',
+                  (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+                )
+                WHERE id = $2
+              `, [accomplishmentStr, w.userId]);
+            } catch (err) {
+              console.error('[ADMIN GIVEAWAY] accomplishment update failed:', err);
+            }
+
+            // 4. Send SMS
             const success = await sendSMS(w.phone, smsMsg).catch(() => false);
             results.push({ userId: w.userId, phone: w.phone, status: success ? 'sent' : 'failed', message: smsMsg });
 
-            // 4. Send in-app leaderboard award notification
+            // 5. Send in-app leaderboard award notification
             const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
-            // Fetch week range and wins from the latest pending snapshot for this user
-            const { rows: snapRes } = await pool.query(
-              `SELECT id, week_start, week_end, wins FROM leaderboard_snapshots WHERE user_id = $1 AND prize_status = 'pending' ORDER BY id DESC LIMIT 1`,
-              [w.userId]
-            );
-            const weekStart = snapRes.length > 0 ? snapRes[0].week_start : new Date().toISOString();
-            const weekEnd = snapRes.length > 0 ? snapRes[0].week_end : new Date().toISOString();
-            const winsCount = snapRes.length > 0 ? Number(snapRes[0].wins || 0) : 0;
-            const snapshotId = snapRes.length > 0 ? snapRes[0].id : null;
+            const winsCount = Number(w.wins || 0);
 
             await pool.query(`
               INSERT INTO notifications (user_id, type, title, message, meta)
@@ -3562,18 +3395,37 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
                 rank: w.rank,
                 prize: prizeAmount,
                 wins: winsCount,
-                weekStart,
-                weekEnd
+                weekStart: weekStartStr,
+                weekEnd: weekEndStr
               })
             ]).catch(err => console.error('[ADMIN GIVEAWAY] notification insert failed:', err));
 
-            // 5. Update the snapshot status in DB from pending to approved and save the custom prize amount!
-            if (snapshotId) {
+            // 6. Update or Create Snapshot
+            if (snapRes.length > 0) {
+              // Update snapshot status in DB to approved and save the custom prize amount
               await pool.query(
-                `UPDATE leaderboard_snapshots SET prize_status = 'approved', prize_amount = $1 WHERE id = $2`,
-                [prizeAmount, snapshotId]
+                `UPDATE leaderboard_snapshots SET prize_status = 'approved', prize_amount = $1, wins = $2 WHERE id = $3`,
+                [prizeAmount, winsCount, snapRes[0].id]
               );
+            } else {
+              // Create a new approved snapshot
+              await pool.query(`
+                INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved')
+              `, [weekStartStr, weekEndStr, w.userId, w.username, winsCount, w.rank, prizeAmount]);
             }
+
+            // Emit socket event for balance update
+            try {
+              emitToUserEvent(w.userId, 'balance_update', {});
+              emitToUserEvent(w.userId, 'info', {
+                title: rankLabels[w.rank - 1] || `#${w.rank} Weekly Award`,
+                message: `🏆 Congratulations! You ranked #${w.rank} on this week's leaderboard with ${winsCount} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`
+              });
+            } catch (e) {
+              console.error('[ADMIN GIVEAWAY] socket emit failed:', e.message);
+            }
+
           } else {
             results.push({ userId: w.userId, phone: w.phone, status: 'skipped_zero_prize', message: smsMsg });
           }
@@ -3583,21 +3435,23 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
       }
     }
 
-    // Log to bulk_sms_history
-    await pool.query(`
-      INSERT INTO bulk_sms_history (admin_id, message, filters, target_count, success_count)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [
-      req.user.id,
-      `Weekly Leaderboard Giveaway SMS${dryRun ? ' (DRY RUN)' : ''}`,
-      JSON.stringify({ type: 'leaderboard_giveaway', winners: winners.map(w => w.username), dryRun }),
-      winners.length,
-      results.filter(r => r.status === 'sent').length
-    ]);
+    if (!dryRun) {
+      // Log to bulk_sms_history
+      await pool.query(`
+        INSERT INTO bulk_sms_history (admin_id, message, filters, target_count, success_count)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [
+        req.user.id,
+        `Weekly Leaderboard Giveaway SMS`,
+        JSON.stringify({ type: 'leaderboard_giveaway', winners: winners.map(w => w.username), dryRun: false }),
+        winners.length,
+        results.filter(r => r.status === 'sent').length
+      ]);
 
-    await logAdminAction(req.user.id, 'sent_leaderboard_giveaway', null, { 
-      winnerCount: winners.length, dryRun, results 
-    });
+      await logAdminAction(req.user.id, 'sent_leaderboard_giveaway', null, { 
+        winnerCount: winners.length, dryRun: false, results 
+      });
+    }
 
     return res.json({ ok: true, results, dryRun: !!dryRun });
   } catch (err) {

@@ -110,8 +110,44 @@ async function verifyPendingPayouts() {
             client.release();
           }
         } else {
-          // Still pending or processing — leave it and check again next cycle
-          console.log(`[CRON] ⏳ TX ${tx.id} still pending in Chapa (status: ${status || 'unknown'})`);
+          // Still pending or processing — check if it's stuck (older than 30 minutes)
+          const ageMinutes = (Date.now() - new Date(tx.created_at).getTime()) / 1000 / 60;
+          if (ageMinutes > 30) {
+            console.log(`[CRON] ⛔ TX ${tx.id} stuck in ${status || 'pending'} status for ${Math.round(ageMinutes)} mins. Marking FAILED and refunding.`);
+            const client = await pool.connect();
+            try {
+              await client.query('BEGIN');
+              await client.query(
+                `UPDATE wallet_transactions SET status = 'FAILED', updated_at = now(),
+                 meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb
+                 WHERE id = $1`,
+                [tx.id, JSON.stringify({ failed_reason: `Stuck in Chapa ${status || 'pending'} status for too long`, stuck_status: status })]
+              );
+              await client.query(
+                `UPDATE withdraw_requests SET status = 'REJECTED', updated_at = now() WHERE reserve_tx_id = $1`,
+                [tx.id]
+              );
+              const refundAmount = Number(tx.amount);
+              await client.query(
+                `UPDATE wallets SET available_balance = available_balance + $1, withdrawable_balance = withdrawable_balance + $1, updated_at = now() WHERE user_id = $2`,
+                [refundAmount, tx.user_id]
+              );
+              await client.query(
+                `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, idempotency_key, provider, meta)
+                 VALUES ($1, 'REFUND', $2, 'COMPLETED', $3, 'SYSTEM_AUTO_REFUND', $4)`,
+                [tx.user_id, refundAmount, `AUTO_REFUND_STUCK:${tx.id}`, JSON.stringify({ reason: `Stuck in Chapa ${status || 'pending'} status`, originalTxId: tx.id })]
+              );
+              await client.query('COMMIT');
+              console.log(`[CRON] ✅ Refunded ${refundAmount} ETB to user ${tx.user_id} (TX ${tx.id} — Chapa stuck)`);
+            } catch (err) {
+              await client.query('ROLLBACK');
+              console.error(`[CRON] Refund failed for stuck TX ${tx.id}:`, err.message);
+            } finally {
+              client.release();
+            }
+          } else {
+            console.log(`[CRON] ⏳ TX ${tx.id} still pending in Chapa (status: ${status || 'unknown'}, age: ${Math.round(ageMinutes)} mins)`);
+          }
         }
 
         // Small delay between Chapa API calls to avoid rate limiting
