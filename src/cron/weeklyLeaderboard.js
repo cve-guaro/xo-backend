@@ -98,6 +98,23 @@ async function runWeeklyLeaderboardSnapshot() {
         [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]
       );
       
+      // 2a) Log wallet transaction
+      try {
+        await pool.query(
+          `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+           VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+           ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+          [
+            user.id,
+            prizeAmount,
+            JSON.stringify({ rank: i + 1, weekStart: weekStartStr }),
+            `LEADERBOARD_PRIZE_${weekStartStr}_${i + 1}`
+          ]
+        );
+      } catch (txErr) {
+        console.error('[LEADERBOARD CRON] wallet_transactions insert failed:', txErr);
+      }
+      
       // 2b) Record accomplishment
       try {
         const weekStartMD = formatMonthDay(weekStartStr);

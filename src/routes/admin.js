@@ -5,8 +5,7 @@
 const express = require('express');
 const axios = require("axios");
 const crypto = require("crypto");
-const Redis = require('ioredis');
-const { pool, withTx } = require('../db/index');
+const { pool, withTx, redis } = require('../db/index');
 const { adminAuth, superAdminAuth } = require('../middleware/Auth');
 const { getChapaBalance } = require('../models/Chapa');
 const { CHAPA } = require('../env');
@@ -16,7 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const { emitToUserEvent } = require('../socket/game');
 
-const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+
 const router = express.Router();
 
 // Apply adminAuth to ALL routes in this file
@@ -2462,6 +2461,23 @@ function getWeekBounds() {
   return { weekStart: sunday, weekEnd: saturday };
 }
 
+// Helper: Get previous week boundaries (Sunday 00:00 → Saturday 23:59)
+function getPrevWeekBounds() {
+  const now = new Date();
+  const prev = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const day = prev.getUTCDay(); // 0=Sun, 1=Mon, ...
+  
+  const sunday = new Date(prev);
+  sunday.setUTCDate(prev.getUTCDate() - day);
+  sunday.setUTCHours(0, 0, 0, 0);
+  
+  const saturday = new Date(sunday);
+  saturday.setUTCDate(sunday.getUTCDate() + 6);
+  saturday.setUTCHours(23, 59, 59, 999);
+  
+  return { weekStart: sunday, weekEnd: saturday };
+}
+
 // GET /admin/leaderboard/current — Current week standings
 router.get('/leaderboard/current', async (req, res) => {
   try {
@@ -2593,6 +2609,23 @@ router.post('/leaderboard/snapshot', async (req, res) => {
         await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
         await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
         
+        // Log transaction in wallet_transactions
+        try {
+          await pool.query(
+            `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+             VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+             ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+            [
+              user.id,
+              prizeAmount,
+              JSON.stringify({ rank: i + 1, weekStart: weekStartStr }),
+              `LEADERBOARD_PRIZE_${weekStartStr}_${i + 1}`
+            ]
+          );
+        } catch (txErr) {
+          console.error('[ADMIN SNAPSHOT] wallet_transactions insert failed:', txErr);
+        }
+        
         try {
           const weekStartMD = formatMonthDay(weekStartStr);
           const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
@@ -2672,6 +2705,23 @@ router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
     if (prizeAmount > 0) {
       await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
       await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
+      
+      // Log transaction in wallet_transactions
+      try {
+        await pool.query(
+          `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+           VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+           ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+          [
+            snap.user_id,
+            prizeAmount,
+            JSON.stringify({ rank: snap.rank, weekStart: snap.week_start }),
+            `LEADERBOARD_PRIZE_${snap.id}`
+          ]
+        );
+      } catch (txErr) {
+        console.error('[ADMIN APPROVE] wallet_transactions insert failed:', txErr);
+      }
       
       try {
         const weekStartMD = formatMonthDay(snap.week_start);
@@ -2770,6 +2820,23 @@ router.post('/leaderboard/approve-all', async (req, res) => {
         await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
         // Insert bonus log
         await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
+        
+        // Log transaction in wallet_transactions
+        try {
+          await pool.query(
+            `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+             VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+             ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+            [
+              snap.user_id,
+              prizeAmount,
+              JSON.stringify({ rank: snap.rank, weekStart: snap.week_start }),
+              `LEADERBOARD_PRIZE_${snap.id}`
+            ]
+          );
+        } catch (txErr) {
+          console.error('[ADMIN APPROVE ALL] wallet_transactions insert failed:', txErr);
+        }
         
         try {
           const weekStartMD = formatMonthDay(snap.week_start);
@@ -3270,10 +3337,10 @@ router.get('/financial-dashboard/drill-down', async (req, res) => {
 
 router.get('/leaderboard/giveaway-status', async (req, res) => {
   try {
-    const { weekStart, weekEnd } = getWeekBounds();
+    const { weekStart, weekEnd } = getPrevWeekBounds();
     const weekStartStr = weekStart.toISOString().slice(0, 10);
 
-    // Current week top winners
+    // Previous week top winners
     const { rows: winners } = await pool.query(`
       SELECT u.id, u.username, u.number, u.avatar, COUNT(*) AS wins
       FROM games g JOIN users u ON u.id = g.winner
@@ -3320,11 +3387,15 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
     const defaultMsg = (w) => `🏆 Congratulations ${w.username}! You ranked #${w.rank} on the XO ET weekly leaderboard and won ${w.prize} ETB! Your prize has been credited. Keep playing!`;
     const results = [];
 
-    const { weekStart, weekEnd } = getWeekBounds();
+    const { weekStart, weekEnd } = getPrevWeekBounds();
     const weekStartStr = weekStart.toISOString().slice(0, 10);
     const weekEndStr = weekEnd.toISOString().slice(0, 10);
 
     for (const w of winners) {
+      const isDisqualified = !w.userId || w.userId === 'none' || w.userId === 'null';
+      const prizeAmount = isDisqualified ? 0 : Math.round(Number(w.prize));
+      const winsCount = isDisqualified ? 0 : Number(w.wins || 0);
+
       const smsMsg = message 
         ? message.replace('{username}', w.username).replace('{rank}', w.rank).replace('{prize}', w.prize) 
         : defaultMsg(w);
@@ -3333,20 +3404,37 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
         results.push({ userId: w.userId, phone: w.phone, status: 'dry_run', message: smsMsg });
       } else {
         try {
-          const prizeAmount = Math.round(Number(w.prize));
-          
-          if (prizeAmount > 0) {
-            // Check if snapshot already exists and is already approved
-            const { rows: snapRes } = await pool.query(
-              `SELECT id, prize_status FROM leaderboard_snapshots WHERE user_id = $1 AND week_start = $2`,
-              [w.userId, weekStartStr]
-            );
+          // Check if snapshot already exists and is already approved
+          const { rows: snapRes } = await pool.query(
+            `SELECT id, prize_status FROM leaderboard_snapshots WHERE week_start = $1 AND rank = $2`,
+            [weekStartStr, w.rank]
+          );
 
-            if (snapRes.length > 0 && snapRes[0].prize_status === 'approved') {
-              results.push({ userId: w.userId, phone: w.phone, status: 'already_approved', message: smsMsg });
-              continue;
+          if (snapRes.length > 0 && snapRes[0].prize_status === 'approved') {
+            results.push({ userId: w.userId, phone: w.phone, status: 'already_approved', message: smsMsg });
+            continue;
+          }
+
+          if (isDisqualified) {
+            // Update or Create Snapshot as disqualified
+            if (snapRes.length > 0) {
+              await pool.query(
+                `UPDATE leaderboard_snapshots 
+                 SET user_id = null, username = 'Disqualified', wins = 0, prize_amount = 0, prize_status = 'disqualified' 
+                 WHERE id = $1`,
+                [snapRes[0].id]
+              );
+            } else {
+              await pool.query(`
+                INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
+                VALUES ($1, $2, null, 'Disqualified', 0, $3, 0, 'disqualified')
+              `, [weekStartStr, weekEndStr, w.rank]);
             }
+            results.push({ userId: w.userId, status: 'disqualified', message: 'User marked as Disqualified (None)' });
+            continue;
+          }
 
+          if (prizeAmount > 0) {
             // 1. Credit wallet (bonus_balance and available_balance)
             await pool.query(
               `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
@@ -3382,7 +3470,6 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
 
             // 5. Send in-app leaderboard award notification
             const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
-            const winsCount = Number(w.wins || 0);
 
             await pool.query(`
               INSERT INTO notifications (user_id, type, title, message, meta)
@@ -3401,18 +3488,39 @@ router.post('/leaderboard/send-giveaway', async (req, res) => {
             ]).catch(err => console.error('[ADMIN GIVEAWAY] notification insert failed:', err));
 
             // 6. Update or Create Snapshot
+            let snapId;
             if (snapRes.length > 0) {
+              snapId = snapRes[0].id;
               // Update snapshot status in DB to approved and save the custom prize amount
               await pool.query(
-                `UPDATE leaderboard_snapshots SET prize_status = 'approved', prize_amount = $1, wins = $2 WHERE id = $3`,
-                [prizeAmount, winsCount, snapRes[0].id]
+                `UPDATE leaderboard_snapshots SET user_id = $1, username = $2, prize_status = 'approved', prize_amount = $3, wins = $4 WHERE id = $5`,
+                [w.userId, w.username, prizeAmount, winsCount, snapId]
               );
             } else {
               // Create a new approved snapshot
-              await pool.query(`
+              const insertRes = await pool.query(`
                 INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved')
+                RETURNING id
               `, [weekStartStr, weekEndStr, w.userId, w.username, winsCount, w.rank, prizeAmount]);
+              snapId = insertRes.rows[0].id;
+            }
+
+            // 7. Log transaction in wallet_transactions
+            try {
+              await pool.query(
+                `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+                 VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+                 ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+                [
+                  w.userId,
+                  prizeAmount,
+                  JSON.stringify({ rank: w.rank, weekStart: weekStartStr }),
+                  `LEADERBOARD_PRIZE_${snapId}`
+                ]
+              );
+            } catch (txErr) {
+              console.error('[ADMIN GIVEAWAY] wallet_transactions insert failed:', txErr);
             }
 
             // Emit socket event for balance update

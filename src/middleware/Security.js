@@ -1,6 +1,4 @@
-const { pool } = require('../db/index');
-const Redis = require('ioredis');
-const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+const { pool, redis } = require('../db/index');
 
 // Admin phone numbers (both local and 251-prefixed formats)
 const ADMIN_PHONES = [

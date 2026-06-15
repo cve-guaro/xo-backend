@@ -1,9 +1,8 @@
 const jwt = require('jsonwebtoken');
-const Redis = require('ioredis');
-const { pool } = require('../db/index');
+const { pool, redis } = require('../db/index');
 const { logAnomaly } = require('./AnomalyMonitor');
 
-const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+
 
 const JWT_SECRET = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
 

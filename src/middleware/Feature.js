@@ -1,6 +1,4 @@
-const { pool } = require('../db/index');
-const Redis = require('ioredis');
-const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+const { pool, redis } = require('../db/index');
 
 /**
  * Middleware factory to check if a specific feature is enabled.

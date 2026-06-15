@@ -213,11 +213,12 @@ router.get('/weekly', auth, async (req, res) => {
 
     // Check if the current user has an unacknowledged win (top 3) from last week's snapshot
     let previousWeekWin = null;
+    let payoutPending = false;
     try {
       const lastSnapshotRes = await pool.query(`
         SELECT id, rank, prize_amount, week_start, week_end 
         FROM leaderboard_snapshots 
-        WHERE user_id = $1 AND prize_status IN ('pending', 'approved') AND rank <= 3
+        WHERE user_id = $1 AND prize_status = 'approved' AND rank <= 3
         ORDER BY week_start DESC 
         LIMIT 1
       `, [userId]);
@@ -232,6 +233,14 @@ router.get('/weekly', auth, async (req, res) => {
           weekEnd: snap.week_end
         };
       }
+
+      // Check if there are any pending snapshots (i.e. manual review is in progress)
+      const pendingRes = await pool.query(`
+        SELECT 1 FROM leaderboard_snapshots 
+        WHERE prize_status = 'pending' 
+        LIMIT 1
+      `);
+      payoutPending = pendingRes.rows.length > 0;
     } catch (e) {
       console.warn('[LEADERBOARD] Error fetching last week win snapshot:', e.message);
     }
@@ -244,6 +253,7 @@ router.get('/weekly', auth, async (req, res) => {
       weekEnd: weekEnd.toISOString(),
       secondsRemaining,
       previousWeekWin,
+      payoutPending,
       top3,
       total,
       page,
@@ -432,7 +442,7 @@ router.post('/claim', auth, async (req, res) => {
     const { rowCount } = await pool.query(`
       UPDATE leaderboard_snapshots 
       SET prize_status = 'claimed' 
-      WHERE id::text = $1::text AND user_id = $2 AND prize_status IN ('pending', 'approved')
+      WHERE id::text = $1::text AND user_id = $2 AND prize_status = 'approved'
     `, [snapshotId, userId]);
 
     return res.json({ ok: true, claimed: rowCount > 0 });
