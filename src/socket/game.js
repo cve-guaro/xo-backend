@@ -1,8 +1,7 @@
 // gameSocket.js
 const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
-const { pool, getGlobalSetting } = require("../db/index");
-const Redis = require("ioredis");
+const { pool, getGlobalSetting, redis } = require("../db/index");
 require('dotenv').config();
 const { creditPrize } = require('../models/payments.service')
 
@@ -27,7 +26,7 @@ function verifyToken(token) {
   return jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
 }
 
-const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+
 const QUEUE_TTL = 120_000; // 2 minutes
 const IN_GAME_TTL_MS = 3600_000; // 60 minutes
 
@@ -551,15 +550,19 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
   return tx(async (client) => {
     const ids = [playerXId, playerOId];
 
-    // Lock both wallet rows
+    // Lock both wallet rows and fetch wins defensively
     const walletRes = await client.query(
-      `SELECT user_id, available_balance, bonus_balance FROM wallets WHERE user_id = ANY($1::uuid[]) FOR UPDATE`,
+      `SELECT w.user_id, w.available_balance, w.bonus_balance,
+              u.r1_10_wins, u.r1_15_wins
+       FROM wallets w
+       JOIN users u ON w.user_id = u.id
+       WHERE w.user_id = ANY($1::uuid[]) FOR UPDATE`,
       [ids]
     );
 
     if (walletRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
 
-    // For each player, apply bonus-first deduction
+    // For each player, apply bonus-first deduction and enforce win locks
     const playerBonusUsed = {};
     for (const wallet of walletRes.rows) {
       const avail = Number(wallet.available_balance);
@@ -571,6 +574,14 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
 
       // Check TOTAL effective balance (available + bonus), not just available
       if ((avail + bonus) < betAmount) throw new Error("INSUFFICIENT_BALANCE");
+
+      // Validate win locks (15-win cap for 10 and 15 Birr)
+      if (betAmount === 10 && Number(wallet.r1_10_wins || 0) >= 15) {
+        throw new Error("TIER_LOCKED");
+      }
+      if (betAmount === 15 && Number(wallet.r1_15_wins || 0) >= 15) {
+        throw new Error("TIER_LOCKED");
+      }
 
       // Store pre-deduction bonus used amount for this player
       playerBonusUsed[userId] = bonusToUse;
@@ -639,8 +650,10 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       const isX = (winnerUserId === game.player_x);
       const bonusUsed = isX ? Number(game.bonus_used_x || 0) : Number(game.bonus_used_o || 0);
 
+      const prizeWithdrawable = Math.max(0, Number(prizeAmount) - bonusUsed);
+
       // Direct wallet update — MUST succeed before ledger
-      // ✅ Victory payout flow: Add prize amount to available_balance and withdrawable_balance
+      // ✅ Victory payout flow: Add prize amount to available_balance, return bonusUsed to bonus_balance, and add remainder to withdrawable_balance
       await client.query(`
         UPDATE wallets 
         SET available_balance = available_balance + $1,
@@ -648,7 +661,7 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
             withdrawable_balance = withdrawable_balance + $3,
             updated_at = NOW()
         WHERE user_id = $4
-      `, [prizeAmount, 0, prizeAmount, winnerUserId]);
+      `, [prizeAmount, bonusUsed, prizeWithdrawable, winnerUserId]);
 
       // Fetch winner username and emit global win event
       const userRes = await client.query(`SELECT username FROM users WHERE id = $1`, [winnerUserId]);
@@ -1929,6 +1942,19 @@ function setupGameSocket(io) {
         const senderCaps = { r1_10: sender.r1_10_wins || 0, r1_15: sender.r1_15_wins || 0, r1_25: sender.r1_25_wins || 0, r1_50: sender.r1_50_wins || 0, r1_99: sender.r1_99_wins || 0 };
         const targetCaps = { r1_10: target.r1_10_wins || 0, r1_15: target.r1_15_wins || 0, r1_25: target.r1_25_wins || 0, r1_50: target.r1_50_wins || 0, r1_99: target.r1_99_wins || 0 };
         const targetBalance = Number(target.balance || 0);
+
+        // Validate balances & win caps (15 wins cap for 10 & 15 Birr) before allowing sending the invite
+        if (!isLookupOnly) {
+          if (senderBalance < safeBet || targetBalance < safeBet) {
+            return socket.emit("friend_invite_result", { ok: false, reason: "insufficient_balance" });
+          }
+          if (safeBet === 10 && ((sender.r1_10_wins || 0) >= 15 || (target.r1_10_wins || 0) >= 15)) {
+            return socket.emit("friend_invite_result", { ok: false, reason: "tier_locked" });
+          }
+          if (safeBet === 15 && ((sender.r1_15_wins || 0) >= 15 || (target.r1_15_wins || 0) >= 15)) {
+            return socket.emit("friend_invite_result", { ok: false, reason: "tier_locked" });
+          }
+        }
 
         socket.emit("friend_invite_result", {
           ok: true,

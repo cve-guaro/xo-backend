@@ -125,7 +125,15 @@ const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (mobile apps, server-to-server)
     if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) {
+
+    // In development/local environments, dynamically allow any localhost or local network IP
+    const isLocal = origin.startsWith('http://localhost:') || 
+                    origin.startsWith('http://127.0.0.1:') || 
+                    origin.startsWith('http://192.168.') || 
+                    origin.startsWith('http://10.') || 
+                    origin.startsWith('http://172.');
+
+    if (ALLOWED_ORIGINS.includes(origin) || (process.env.NODE_ENV !== 'production' && isLocal)) {
       return callback(null, true);
     }
     return callback(new Error('CORS: Origin not allowed'));

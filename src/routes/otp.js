@@ -3,7 +3,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const axios = require("axios");
 const crypto = require("crypto");
-const { pool, withTx, getGlobalSetting } = require('../db/index');
+const { pool, withTx, getGlobalSetting, redis } = require('../db/index');
 const { applyNewUserGiveaways } = require('../models/payments.service');
 
 const router = express.Router();
@@ -87,8 +87,7 @@ function genOtp(phoneNumber) {
 }
 
 // ✅ Redis connection for Refresh Tokens & Blacklisting
-const Redis = require('ioredis');
-const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
+
 
 
 function normalizeNumber(n) {
@@ -126,7 +125,11 @@ router.post('/request-otp', async (req, res) => {
     const ttl = OTP_TTL;
 
     if (process.env.NODE_ENV !== 'production') {
-      console.log(`[DEBUG] OTP requested for ${number} (valid for ${ttl}s). Code: ${code}`);
+      console.log(`\n==================================================`);
+      console.log(`[DEVELOPMENT] OTP Code requested for ${number}`);
+      console.log(`👉 CODE: ${code}`);
+      console.log(`👉 BYPASS CODE: 1234`);
+      console.log(`==================================================\n`);
     }
 
     // ── DB work only (no network I/O inside the transaction — keeps pool connections free) ──
@@ -224,6 +227,7 @@ router.post('/verify-otp', async (req, res) => {
 
   try {
     const result = await withTx(async (client) => {
+      const isDev = process.env.NODE_ENV !== 'production';
 
       // 1) Find latest active OTP
       const { rows } = await client.query(
@@ -234,46 +238,50 @@ router.post('/verify-otp', async (req, res) => {
         [number]
       );
 
-      if (!rows.length) {
-        console.warn('[VERIFY_OTP] No active OTP found', { number });
-        return { ok: false, reason: 'no_active_otp' };
-      }
-
       const otp = rows[0];
 
-      // Lock row
-      await client.query(`SELECT id FROM otps WHERE id=$1 FOR UPDATE`, [otp.id]);
+      if (!otp) {
+        // In local development, bypass missing or expired OTPs if they use 1234
+        if (isDev && code === '1234') {
+          console.log('[VERIFY_OTP] Dev bypass: no active OTP found in DB, but code is 1234. Proceeding to resolve user.');
+        } else {
+          console.warn('[VERIFY_OTP] No active OTP found', { number });
+          return { ok: false, reason: 'no_active_otp' };
+        }
+      } else {
+        // Lock row
+        await client.query(`SELECT id FROM otps WHERE id=$1 FOR UPDATE`, [otp.id]);
 
-      // 2) Tries limit
-      const maxTries = Number(process.env.MAX_OTP_TRIES || 5);
-      if (Number(otp.tried) >= maxTries) {
-        console.warn('[VERIFY_OTP] Too many attempts', {
-          otpId: otp.id,
-          tried: otp.tried,
-        });
-        return { ok: false, reason: 'too_many_attempts' };
+        // 2) Tries limit
+        const maxTries = Number(process.env.MAX_OTP_TRIES || 5);
+        if (Number(otp.tried) >= maxTries) {
+          console.warn('[VERIFY_OTP] Too many attempts', {
+            otpId: otp.id,
+            tried: otp.tried,
+          });
+          return { ok: false, reason: 'too_many_attempts' };
+        }
+
+        // 3) Code match
+        if (otp.code !== code && !(isDev && code === '1234')) {
+          console.warn('[VERIFY_OTP] Invalid OTP code', {
+            otpId: otp.id,
+            triedBefore: otp.tried,
+          });
+
+          await client.query(
+            `UPDATE otps SET tried = tried + 1 WHERE id = $1`,
+            [otp.id]
+          );
+
+          return { ok: false, reason: 'invalid_code' };
+        }
+
+        console.log('[VERIFY_OTP] OTP verified successfully');
+
+        // 4) Success
+        await client.query(`UPDATE otps SET used = TRUE WHERE id = $1`, [otp.id]);
       }
-
-      // 3) Code match
-      const isDev = process.env.NODE_ENV !== 'production';
-      if (otp.code !== code && !(isDev && code === '1234')) {
-        console.warn('[VERIFY_OTP] Invalid OTP code', {
-          otpId: otp.id,
-          triedBefore: otp.tried,
-        });
-
-        await client.query(
-          `UPDATE otps SET tried = tried + 1 WHERE id = $1`,
-          [otp.id]
-        );
-
-        return { ok: false, reason: 'invalid_code' };
-      }
-
-      console.log('[VERIFY_OTP] OTP verified successfully');
-
-      // 4) Success
-      await client.query(`UPDATE otps SET used = TRUE WHERE id = $1`, [otp.id]);
 
       const { rows: userRows } = await client.query(
         `INSERT INTO users (number)
