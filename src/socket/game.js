@@ -86,6 +86,9 @@ function calculatePrize(betAmount) {
     const HOUSE_FEE_HIGH_PERCENT = Number(process.env.HOUSE_FEE_HIGH_PERCENT || 10);
 
     let pct = betAmount < HOUSE_FEE_THRESHOLD ? HOUSE_FEE_LOW_PERCENT : HOUSE_FEE_HIGH_PERCENT;
+    if (betBirr === 10) {
+      pct = 20;
+    }
     pct = Math.max(0, Math.min(100, pct));
 
     const prize = Math.floor(totalPot * (1 - pct / 100));
@@ -94,7 +97,10 @@ function calculatePrize(betAmount) {
 
   // Use room-specific cut
   const roomConfig = ROOMS_CONFIG[roomNumber];
-  const pct = roomConfig.houseCutPercent;
+  let pct = roomConfig.houseCutPercent;
+  if (betBirr === 10) {
+    pct = 20;
+  }
   const prize = Math.floor(totalPot * (1 - pct / 100));
 
   if (DEBUG_MATCH) console.log(`[FINANCE] calculatePrize: room=${roomNumber} bet=${betAmount} pot=${totalPot} pct=${pct} prize=${prize}`);
