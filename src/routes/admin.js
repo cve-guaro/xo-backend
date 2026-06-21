@@ -481,9 +481,9 @@ router.get('/dashboard-data', async (req, res) => {
         GROUP BY points.date
         ORDER BY points.date ASC
       `),
-      // [6] Platform earnings from game commissions (10% of each completed bet)
+      // [6] Platform earnings from game commissions (10% default, 20% for 10 Birr)
       pool.query(`
-        SELECT COALESCE(SUM(bet_amount * 0.1), 0) AS platform_commission
+        SELECT COALESCE(SUM(bet_amount * CASE WHEN bet_amount = 10 THEN 0.2 ELSE 0.1 END), 0) AS platform_commission
         FROM games
         WHERE status = 'finished' AND winner IS NOT NULL
       `),
@@ -2392,9 +2392,9 @@ router.get('/metrics/live', async (req, res) => {
         JOIN users u ON u.id = g.player_x OR u.id = g.player_o
         WHERE g.created_at >= CURRENT_DATE
       `),
-      // [5] Gross Gaming Revenue today (10% commission on completed games)
+      // [5] Gross Gaming Revenue today (10% default, 20% for 10 Birr)
       pool.query(`
-        SELECT COALESCE(SUM(bet_amount * 0.1), 0) as ggr
+        SELECT COALESCE(SUM(bet_amount * CASE WHEN bet_amount = 10 THEN 0.2 ELSE 0.1 END), 0) as ggr
         FROM games
         WHERE status IN ('completed', 'X', 'O') AND winner IS NOT NULL
         AND created_at >= CURRENT_DATE
@@ -3138,9 +3138,9 @@ router.get('/financial-dashboard', async (req, res) => {
         COALESCE(SUM(withdrawable_balance), 0) AS total_withdrawable,
         COALESCE(SUM(bonus_balance), 0) AS total_bonus
       FROM wallets`),
-      // [1] Total platform commissions (10% of each finished game)
+      // [1] Total platform commissions (10% default, 20% for 10 Birr games)
       pool.query(`SELECT 
-        COALESCE(SUM(bet_amount * 2 * 0.1), 0) AS total_commissions,
+        COALESCE(SUM(bet_amount * 2 * CASE WHEN bet_amount = 10 THEN 0.2 ELSE 0.1 END), 0) AS total_commissions,
         COUNT(*) AS total_games_finished
       FROM games WHERE status IN ('completed', 'finished', 'X', 'O') AND winner IS NOT NULL`),
       // [2] Total deposits
