@@ -148,20 +148,60 @@ app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests gl
 // Serve uploaded static files
 app.use('/uploads', express.static(path.join(__dirname, '../public/uploads')));
 
-// ─── SOCKET.IO & REDIS ADAPTER ─────────────────────────────────────────────────
+// ─── SOCKET.IO & REDIS ADAPTER (RESILIENT) ─────────────────────────────────────
 const io = new Server(server, {
   cors: { origin: corsOptions.origin, methods: ["GET", "POST", "OPTIONS"], credentials: true }
 });
 
+// Resilient Redis adapter — falls back to in-memory if Redis is rate-limited/down
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-const pubClient = new Redis(REDIS_URL);
-const subClient = pubClient.duplicate();
+let redisAdapterReady = false;
 
-pubClient.on('error', (err) => console.error('[REDIS PUB] Adapter connection error:', err));
-subClient.on('error', (err) => console.error('[REDIS SUB] Adapter connection error:', err));
+async function connectRedisAdapter(retryCount = 0) {
+  const MAX_RETRIES = 5;
+  const BASE_DELAY_MS = 5000; // 5s, 10s, 20s, 40s, 80s
+  try {
+    const pubClient = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      retryStrategy(times) {
+        if (times > 5) return null; // Stop retrying after 5 attempts
+        return Math.min(times * 2000, 30000);
+      },
+      lazyConnect: true, // Don't auto-connect — we'll do it manually
+    });
+    const subClient = pubClient.duplicate();
 
-io.adapter(createAdapter(pubClient, subClient));
-console.log('[SOCKET.IO] Redis adapter connected and attached for scalable matchmaking.');
+    // Swallow errors to prevent process crash
+    pubClient.on('error', (err) => {
+      console.error('[REDIS PUB] Error (non-fatal):', err.message);
+    });
+    subClient.on('error', (err) => {
+      console.error('[REDIS SUB] Error (non-fatal):', err.message);
+    });
+
+    // Manually connect and test before attaching
+    await pubClient.connect();
+    await subClient.connect();
+    await pubClient.ping(); // Verify connection works
+
+    io.adapter(createAdapter(pubClient, subClient));
+    redisAdapterReady = true;
+    console.log('[SOCKET.IO] Redis adapter connected and attached for scalable matchmaking.');
+  } catch (err) {
+    console.error(`[SOCKET.IO] Redis adapter failed (attempt ${retryCount + 1}/${MAX_RETRIES}):`, err.message);
+
+    if (retryCount < MAX_RETRIES - 1) {
+      const delay = BASE_DELAY_MS * Math.pow(2, retryCount);
+      console.warn(`[SOCKET.IO] Retrying Redis adapter in ${delay / 1000}s...`);
+      setTimeout(() => connectRedisAdapter(retryCount + 1), delay);
+    } else {
+      console.warn('[SOCKET.IO] ⚠️ All Redis adapter retries exhausted. Running Socket.IO in-memory mode (single-instance only).');
+    }
+  }
+}
+
+// Start adapter connection in background — don't block server startup
+connectRedisAdapter();
 
 
 // ─── RATE LIMITING (FIREWALL) ──────────────────────────────────────────────────
@@ -282,16 +322,27 @@ app.use('/leaderboard', require('./routes/leaderboard'));
 app.get('/api/features', async (req, res) => {
   const CACHE_KEY = 'cache:api_features';
   try {
-    const cached = await redis.get(CACHE_KEY);
-    if (cached) return res.json(JSON.parse(cached));
+    // Try Redis cache first, but don't fail if Redis is down
+    try {
+      const cached = await redis.get(CACHE_KEY);
+      if (cached) return res.json(JSON.parse(cached));
+    } catch (cacheErr) {
+      console.warn('[FEATURES] Redis cache read failed (falling through to DB):', cacheErr.message);
+    }
 
     const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist')");
     const features = {};
     rows.forEach(r => features[r.key] = r.value);
     
-    await redis.setex(CACHE_KEY, 30, JSON.stringify(features));
+    // Try to cache, but don't fail if Redis is down
+    try {
+      await redis.setex(CACHE_KEY, 30, JSON.stringify(features));
+    } catch (cacheErr) {
+      console.warn('[FEATURES] Redis cache write failed (non-fatal):', cacheErr.message);
+    }
     res.json(features);
   } catch (err) {
+    console.error('[FEATURES] Failed to fetch features:', err.message);
     res.status(500).json({ error: 'Failed to fetch features' });
   }
 });
@@ -300,8 +351,12 @@ app.get('/api/features', async (req, res) => {
 app.get('/promo-popup/active', async (req, res) => {
   const CACHE_KEY = 'cache:promo_popup_active';
   try {
-    const cached = await redis.get(CACHE_KEY);
-    if (cached) return res.json(JSON.parse(cached));
+    try {
+      const cached = await redis.get(CACHE_KEY);
+      if (cached) return res.json(JSON.parse(cached));
+    } catch (cacheErr) {
+      console.warn('[PROMO] Redis cache read failed (falling through to DB):', cacheErr.message);
+    }
 
     const { rows } = await pool.query(`
       SELECT id, image_url, display_duration, starts_at, expires_at, is_active
@@ -314,7 +369,11 @@ app.get('/promo-popup/active', async (req, res) => {
     `);
     
     const responseData = rows.length === 0 ? { ok: true, popup: null } : { ok: true, popup: rows[0] };
-    await redis.setex(CACHE_KEY, 30, JSON.stringify(responseData));
+    try {
+      await redis.setex(CACHE_KEY, 30, JSON.stringify(responseData));
+    } catch (cacheErr) {
+      console.warn('[PROMO] Redis cache write failed (non-fatal):', cacheErr.message);
+    }
     return res.json(responseData);
   } catch (err) {
     console.error('[PUBLIC] GET /promo-popup/active err', err);
@@ -564,6 +623,24 @@ app.use((err, req, res, next) => {
     error: statusCode >= 500 ? 'Internal Server Error' : err.message,
     incident_id: require('crypto').randomUUID()
   });
+});
+
+// ─── PROCESS-LEVEL SAFETY NETS ─────────────────────────────────────────────────
+// Prevent Redis/ioredis errors from crashing the whole server
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err.message);
+  console.error(err.stack);
+  // Only exit for truly fatal non-Redis errors
+  if (!err.message?.includes('rate-limited') && !err.message?.includes('ECONNREFUSED') && !err.message?.includes('psubscribe')) {
+    console.error('[FATAL] Non-recoverable error. Exiting in 3s...');
+    setTimeout(() => process.exit(1), 3000);
+  } else {
+    console.warn('[RECOVERED] Redis-related error caught. Server continues running.');
+  }
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
 });
 
 async function startServer() {
