@@ -18,6 +18,21 @@ const { emitToUserEvent } = require('../socket/game');
 
 const router = express.Router();
 
+// ─── IN-MEMORY FALLBACK for admin 2FA when Redis is down ────────────────────
+// This Map stores 2FA codes and unlock sessions with auto-expiry.
+// Only used when Redis circuit breaker is open.
+const _memStore = new Map();
+function memSet(key, value, ttlSeconds) {
+  _memStore.set(key, value);
+  setTimeout(() => _memStore.delete(key), ttlSeconds * 1000);
+}
+function memGet(key) {
+  return _memStore.get(key) || null;
+}
+function memDel(key) {
+  _memStore.delete(key);
+}
+
 // Apply adminAuth to ALL routes in this file
 router.use(adminAuth);
 
@@ -32,8 +47,11 @@ router.post('/auth/send-2fa', async (req, res) => {
     // Generate 4-digit OTP
     const code = String(crypto.randomInt(0, 10000)).padStart(4, "0");
     
-    // Store in Redis (expires in 5 minutes)
-    await redis.setex(`admin_2fa:${req.user.id}`, 300, code);
+    // Store in Redis (expires in 5 minutes), with in-memory fallback
+    const storeKey = `admin_2fa:${req.user.id}`;
+    await redis.setex(storeKey, 300, code);
+    // Always also store in memory as backup
+    memSet(storeKey, code, 300);
 
     // Send SMS via GeezSMS
     const GEEZ_SMS_URL = "https://api.geezsms.com/api/v1/sms/send";
@@ -65,18 +83,25 @@ router.post('/auth/verify-2fa', async (req, res) => {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'Verification code is required' });
 
-    const storedCode = await redis.get(`admin_2fa:${req.user.id}`);
+    const storeKey = `admin_2fa:${req.user.id}`;
+    // Try Redis first, then fall back to in-memory
+    let storedCode = await redis.get(storeKey);
+    if (!storedCode) storedCode = memGet(storeKey);
+    
     if (!storedCode) return res.status(400).json({ error: 'OTP expired or not requested' });
     
     if (String(code) !== storedCode) {
       return res.status(400).json({ error: 'Invalid verification code' });
     }
 
-    // Clear OTP
-    await redis.del(`admin_2fa:${req.user.id}`);
+    // Clear OTP from both stores
+    await redis.del(storeKey);
+    memDel(storeKey);
 
-    // Set unlocking state in Redis (valid for 2 hours)
-    await redis.setex(`admin_unlocked:${req.user.id}`, 7200, "true");
+    // Set unlocking state (valid for 2 hours)
+    const unlockKey = `admin_unlocked:${req.user.id}`;
+    await redis.setex(unlockKey, 7200, "true");
+    memSet(unlockKey, "true", 7200);
     
     await logAdminAction(req.user.id, 'admin_panel_unlocked', req.user.id, { ip: req.ip });
 
