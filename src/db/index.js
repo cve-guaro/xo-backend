@@ -61,42 +61,171 @@ const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
   },
 });
 
+// ─── REDIS CIRCUIT BREAKER ─────────────────────────────────────────────────────
+// When Redis is rate-limited, skip ALL Redis calls for a cooldown period.
+// This prevents log spam AND stops hammering the rate-limited Upstash (which would
+// extend the rate limit duration).
+let _redisCircuitOpen = false;
+let _redisCircuitOpenedAt = 0;
+const CIRCUIT_COOLDOWN_MS = 60_000; // Skip Redis for 60s after failure
+
+function isRedisAvailable() {
+  if (!_redisCircuitOpen) return true;
+  // Check if cooldown has passed
+  if (Date.now() - _redisCircuitOpenedAt > CIRCUIT_COOLDOWN_MS) {
+    _redisCircuitOpen = false;
+    console.log('[REDIS] Circuit breaker reset — will probe Redis on next call.');
+    return true;
+  }
+  return false;
+}
+
+function tripCircuitBreaker(err) {
+  if (!_redisCircuitOpen) {
+    _redisCircuitOpen = true;
+    _redisCircuitOpenedAt = Date.now();
+    console.warn(`[REDIS] ⚡ Circuit breaker OPEN — skipping Redis for ${CIRCUIT_COOLDOWN_MS / 1000}s. Reason: ${err.message}`);
+  }
+}
+
 redis.on('error', (err) => {
-  console.error('[REDIS] Connection error (non-fatal):', err.message);
+  // Only log once via circuit breaker, not on every single error
+  tripCircuitBreaker(err);
 });
 
 redis.on('reconnecting', (delay) => {
-  console.warn(`[REDIS] Reconnecting in ${delay}ms...`);
+  if (!_redisCircuitOpen) {
+    console.warn(`[REDIS] Reconnecting in ${delay}ms...`);
+  }
 });
+
+// ─── SAFE REDIS WRAPPERS ───────────────────────────────────────────────────────
+// These wrappers check the circuit breaker before making any Redis call.
+// All callers should use these instead of calling redis.get/set/etc. directly
+// for non-critical operations (caching, settings, etc.)
+const safeRedis = {
+  async get(key) {
+    if (!isRedisAvailable()) return null;
+    try {
+      return await redis.get(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return null;
+    }
+  },
+  async setex(key, ttl, value) {
+    if (!isRedisAvailable()) return;
+    try {
+      await redis.setex(key, ttl, value);
+    } catch (err) {
+      tripCircuitBreaker(err);
+    }
+  },
+  async set(...args) {
+    if (!isRedisAvailable()) return;
+    try {
+      await redis.set(...args);
+    } catch (err) {
+      tripCircuitBreaker(err);
+    }
+  },
+  async del(key) {
+    if (!isRedisAvailable()) return;
+    try {
+      await redis.del(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+    }
+  },
+  async incr(key) {
+    if (!isRedisAvailable()) return null;
+    try {
+      return await redis.incr(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return null;
+    }
+  },
+  async expire(key, seconds) {
+    if (!isRedisAvailable()) return;
+    try {
+      await redis.expire(key, seconds);
+    } catch (err) {
+      tripCircuitBreaker(err);
+    }
+  },
+  async decr(key) {
+    if (!isRedisAvailable()) return null;
+    try {
+      return await redis.decr(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return null;
+    }
+  },
+  async smembers(key) {
+    if (!isRedisAvailable()) return [];
+    try {
+      return await redis.smembers(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return [];
+    }
+  },
+  async llen(key) {
+    if (!isRedisAvailable()) return 0;
+    try {
+      return await redis.llen(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return 0;
+    }
+  },
+  async keys(pattern) {
+    if (!isRedisAvailable()) return [];
+    try {
+      return await redis.keys(pattern);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return [];
+    }
+  },
+  async ttl(key) {
+    if (!isRedisAvailable()) return 0;
+    try {
+      return await redis.ttl(key);
+    } catch (err) {
+      tripCircuitBreaker(err);
+      return 0;
+    }
+  },
+  // Expose the raw client for Socket.IO adapter (which needs its own connection)
+  raw: redis,
+  isAvailable: isRedisAvailable,
+};
 
 // Cache global settings query in Redis with a 30-second TTL
 async function getGlobalSetting(key, defaultValue = null) {
   const cacheKey = `global_setting:${key}`;
   try {
-    const cached = await redis.get(cacheKey);
+    const cached = await safeRedis.get(cacheKey);
     if (cached !== null) {
       return JSON.parse(cached);
     }
     const { rows } = await pool.query('SELECT value FROM global_settings WHERE key = $1', [key]);
     const val = rows.length ? rows[0].value : defaultValue;
-    // Try to cache, but don't fail if Redis is down
-    try {
-      await redis.setex(cacheKey, 30, JSON.stringify(val));
-    } catch (cacheErr) {
-      console.warn(`[REDIS] Cache write failed for ${key} (non-fatal):`, cacheErr.message);
-    }
+    await safeRedis.setex(cacheKey, 30, JSON.stringify(val));
     return val;
   } catch (err) {
-    console.error(`[DB] Error fetching global setting ${key}:`, err.message);
-    // If Redis fails, fall through to DB-only
+    // If even DB fails, return default
     try {
       const { rows } = await pool.query('SELECT value FROM global_settings WHERE key = $1', [key]);
       return rows.length ? rows[0].value : defaultValue;
     } catch (dbErr) {
-      console.error(`[DB] DB fallback also failed for ${key}:`, dbErr.message);
+      console.error(`[DB] DB fallback failed for ${key}:`, dbErr.message);
       return defaultValue;
     }
   }
 }
 
-module.exports = { pool, withTx, getGlobalSetting, redis };
+module.exports = { pool, withTx, getGlobalSetting, redis: safeRedis, rawRedis: redis };
