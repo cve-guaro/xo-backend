@@ -99,110 +99,63 @@ redis.on('reconnecting', (delay) => {
   }
 });
 
-// ─── SAFE REDIS WRAPPERS ───────────────────────────────────────────────────────
-// These wrappers check the circuit breaker before making any Redis call.
-// All callers should use these instead of calling redis.get/set/etc. directly
-// for non-critical operations (caching, settings, etc.)
-const safeRedis = {
-  async get(key) {
-    if (!isRedisAvailable()) return null;
-    try {
-      return await redis.get(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return null;
-    }
-  },
-  async setex(key, ttl, value) {
-    if (!isRedisAvailable()) return;
-    try {
-      await redis.setex(key, ttl, value);
-    } catch (err) {
-      tripCircuitBreaker(err);
-    }
-  },
-  async set(...args) {
-    if (!isRedisAvailable()) return;
-    try {
-      await redis.set(...args);
-    } catch (err) {
-      tripCircuitBreaker(err);
-    }
-  },
-  async del(key) {
-    if (!isRedisAvailable()) return;
-    try {
-      await redis.del(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-    }
-  },
-  async incr(key) {
-    if (!isRedisAvailable()) return null;
-    try {
-      return await redis.incr(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return null;
-    }
-  },
-  async expire(key, seconds) {
-    if (!isRedisAvailable()) return;
-    try {
-      await redis.expire(key, seconds);
-    } catch (err) {
-      tripCircuitBreaker(err);
-    }
-  },
-  async decr(key) {
-    if (!isRedisAvailable()) return null;
-    try {
-      return await redis.decr(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return null;
-    }
-  },
-  async smembers(key) {
-    if (!isRedisAvailable()) return [];
-    try {
-      return await redis.smembers(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return [];
-    }
-  },
-  async llen(key) {
-    if (!isRedisAvailable()) return 0;
-    try {
-      return await redis.llen(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return 0;
-    }
-  },
-  async keys(pattern) {
-    if (!isRedisAvailable()) return [];
-    try {
-      return await redis.keys(pattern);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return [];
-    }
-  },
-  async ttl(key) {
-    if (!isRedisAvailable()) return 0;
-    try {
-      return await redis.ttl(key);
-    } catch (err) {
-      tripCircuitBreaker(err);
-      return 0;
-    }
-  },
-  // Expose the raw client for Socket.IO adapter (which needs its own connection)
-  raw: redis,
-  isAvailable: isRedisAvailable,
+// ─── SAFE REDIS PROXY WRAPPER ──────────────────────────────────────────────────
+// Instead of hardcoding wrappers for every command, we use a JS Proxy to wrap
+// all method calls dynamically. This checks the circuit breaker first and catches
+// rate-limit errors safely.
+const FALLBACKS = {
+  // Returns integer/number
+  scard: 0,
+  llen: 0,
+  incr: null,
+  decr: null,
+  exists: 0,
+  del: 0,
+  sadd: 0,
+  srem: 0,
+  lpush: 0,
+  rpush: 0,
+  lrem: 0,
+  ttl: 0,
+  // Returns arrays
+  smembers: [],
+  lrange: [],
+  keys: [],
+  // Returns string / other
+  get: null,
+  set: 'OK',
+  setex: 'OK',
+  expire: 0,
+  eval: null,
 };
+
+const safeRedis = new Proxy(redis, {
+  get(target, prop, receiver) {
+    if (prop === 'raw') return redis;
+    if (prop === 'isAvailable') return isRedisAvailable;
+    if (typeof prop === 'symbol') return target[prop];
+
+    const originalValue = target[prop];
+    if (typeof originalValue !== 'function') {
+      return originalValue;
+    }
+
+    return async function (...args) {
+      const fallbackValue = FALLBACKS[prop] !== undefined ? FALLBACKS[prop] : null;
+
+      if (!isRedisAvailable()) {
+        return fallbackValue;
+      }
+
+      try {
+        return await originalValue.apply(target, args);
+      } catch (err) {
+        tripCircuitBreaker(err);
+        return fallbackValue;
+      }
+    };
+  }
+});
 
 // Cache global settings query in Redis with a 30-second TTL
 async function getGlobalSetting(key, defaultValue = null) {
