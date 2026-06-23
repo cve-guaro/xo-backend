@@ -361,8 +361,13 @@ router.get('/podium', auth, async (req, res) => {
 router.get('/ticker', async (req, res) => {
   const CACHE_KEY = 'cache:leaderboard_ticker';
   try {
-    const cached = await redis.get(CACHE_KEY);
-    if (cached) return res.json(JSON.parse(cached));
+    // Try Redis cache first, but don't fail if Redis is down
+    try {
+      const cached = await redis.get(CACHE_KEY);
+      if (cached) return res.json(JSON.parse(cached));
+    } catch (cacheErr) {
+      console.warn('[TICKER] Redis cache read failed (falling through to DB):', cacheErr.message);
+    }
 
     // Fetch config switches
     const config = await getSettings(['fake_ticker_enabled', 'real_ticker_enabled']);
@@ -422,7 +427,12 @@ router.get('/ticker', async (req, res) => {
     }
 
     const responsePayload = { ticker: tickerData.slice(0, 30) };
-    await redis.setex(CACHE_KEY, 30, JSON.stringify(responsePayload));
+    // Try to cache, but don't fail if Redis is down
+    try {
+      await redis.setex(CACHE_KEY, 30, JSON.stringify(responsePayload));
+    } catch (cacheErr) {
+      console.warn('[TICKER] Redis cache write failed (non-fatal):', cacheErr.message);
+    }
     // Limit to 30 entries
     res.json(responsePayload);
   } catch (err) {
