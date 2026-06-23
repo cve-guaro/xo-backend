@@ -353,7 +353,12 @@ router.post('/verify-otp', async (req, res) => {
     );
 
     const refreshToken = crypto.randomBytes(40).toString('hex');
-    await redis.set(`refresh_token:${refreshToken}`, result.user.id, 'EX', 7 * 24 * 60 * 60);
+    try {
+      await redis.set(`refresh_token:${refreshToken}`, result.user.id, 'EX', 7 * 24 * 60 * 60);
+    } catch (redisErr) {
+      console.warn('[VERIFY_OTP] Redis refresh token store failed (non-fatal):', redisErr.message);
+      // Login still works — user gets a JWT. Refresh token won't work until Redis recovers.
+    }
 
     console.log('[VERIFY_OTP] Tokens generated successfully');
 
@@ -550,7 +555,13 @@ router.post('/refresh', async (req, res) => {
   if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
 
   try {
-    const userId = await redis.get(`refresh_token:${refreshToken}`);
+    let userId = null;
+    try {
+      userId = await redis.get(`refresh_token:${refreshToken}`);
+    } catch (redisErr) {
+      console.warn('[REFRESH] Redis read failed:', redisErr.message);
+      return res.status(503).json({ error: 'Session service temporarily unavailable. Please log in again.' });
+    }
     if (!userId) {
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
     }
@@ -562,7 +573,11 @@ router.post('/refresh', async (req, res) => {
     if (user.banned) return res.status(403).json({ error: 'Account suspended' });
 
     // Invalidate the old refresh token (Token Rotation for theft detection)
-    await redis.del(`refresh_token:${refreshToken}`);
+    try {
+      await redis.del(`refresh_token:${refreshToken}`);
+    } catch (redisErr) {
+      console.warn('[REFRESH] Redis del failed (non-fatal):', redisErr.message);
+    }
 
     // Generate new Access Token
     const secret = process.env.JWT_SECRET;
@@ -579,7 +594,11 @@ router.post('/refresh', async (req, res) => {
 
     // Generate new Refresh Token
     const newRefreshToken = crypto.randomBytes(40).toString('hex');
-    await redis.set(`refresh_token:${newRefreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60);
+    try {
+      await redis.set(`refresh_token:${newRefreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60);
+    } catch (redisErr) {
+      console.warn('[REFRESH] Redis set failed (non-fatal):', redisErr.message);
+    }
 
     return res.json({ token: newToken, refreshToken: newRefreshToken });
   } catch (err) {
@@ -601,19 +620,27 @@ router.post('/logout', async (req, res) => {
     if (token) {
       // Decode without verifying just to get expiry time and minimize Redis bloat
       const decoded = jwt.decode(token);
-      if (decoded && decoded.exp) {
-        const ttl = Math.max(0, decoded.exp - Math.floor(Date.now() / 1000));
-        if (ttl > 0) {
-           await redis.set(`jwt_bl:${token}`, 'revoked', 'EX', ttl);
+      try {
+        if (decoded && decoded.exp) {
+          const ttl = Math.max(0, decoded.exp - Math.floor(Date.now() / 1000));
+          if (ttl > 0) {
+            await redis.set(`jwt_bl:${token}`, 'revoked', 'EX', ttl);
+          }
+        } else {
+          // Fallback if unable to decode cleanly
+          await redis.set(`jwt_bl:${token}`, 'revoked', 'EX', 15 * 60); 
         }
-      } else {
-        // Fallback if unable to decode cleanly
-        await redis.set(`jwt_bl:${token}`, 'revoked', 'EX', 15 * 60); 
+      } catch (redisErr) {
+        console.warn('[LOGOUT] Redis blacklist failed (non-fatal):', redisErr.message);
       }
     }
 
     if (refreshToken) {
-      await redis.del(`refresh_token:${refreshToken}`);
+      try {
+        await redis.del(`refresh_token:${refreshToken}`);
+      } catch (redisErr) {
+        console.warn('[LOGOUT] Redis refresh token del failed (non-fatal):', redisErr.message);
+      }
     }
 
     return res.json({ ok: true, message: 'Logged out securely' });
