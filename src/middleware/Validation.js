@@ -34,7 +34,7 @@ const validate = (schema, source = 'body') => {
 const schemas = {
   // Financial Operations
   deposit: z.object({
-    amount: z.coerce.number().int('Amount must be an integer').min(10, 'Minimum deposit is 10 ETB').max(100000, 'Maximum single deposit limit is 100000 ETB')
+    amount: z.coerce.number().min(10, 'Minimum deposit is 10 ETB').max(100000, 'Maximum single deposit limit is 100000 ETB')
   }).passthrough(),
 
   withdraw: z.object({

@@ -521,4 +521,179 @@ router.get('/user/:id', auth, async (req, res) => {
   }
 });
 
+// ─── GET /leaderboard/monthly — Top 50 monthly + current user rank ──────────────
+router.get('/monthly', auth, async (req, res) => {
+  try {
+    const userId = req.user.id || req.user.userId || req.user.sub;
+    const startOfMonth = new Date();
+    startOfMonth.setUTCDate(1);
+    startOfMonth.setUTCHours(0, 0, 0, 0);
+
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 50));
+
+    // Get top users based on wins in current month
+    const { rows } = await pool.query(`
+      SELECT 
+        u.id::text as id,
+        u.username,
+        u.avatar,
+        COUNT(CASE WHEN g.winner = u.id THEN 1 END) AS wins,
+        COUNT(g.id) AS total
+      FROM users u
+      JOIN games g ON g.player_x = u.id OR g.player_o = u.id
+      WHERE g.status IN ('completed', 'finished')
+        AND g.created_at >= $1
+      GROUP BY u.id, u.username, u.avatar
+      ORDER BY wins DESC, total ASC, MAX(g.created_at) ASC
+      LIMIT $2
+    `, [startOfMonth.toISOString(), limit]);
+
+    const leaderboard = rows.map((r, idx) => ({
+      id: r.id,
+      username: r.username,
+      avatar: r.avatar,
+      wins: Number(r.wins),
+      total: Number(r.total),
+      rank: idx + 1,
+      isMe: r.id === userId
+    }));
+
+    const top3 = leaderboard.slice(0, 3);
+
+    // Find current user rank
+    let myRank = leaderboard.find(u => u.isMe) || null;
+    if (!myRank) {
+      // Calculate my wins/total if not in top list
+      const { rows: myRows } = await pool.query(`
+        SELECT 
+          COUNT(CASE WHEN g.winner = $1 THEN 1 END) AS wins,
+          COUNT(g.id) AS total
+        FROM games g
+        WHERE (g.player_x = $1 OR g.player_o = $1)
+          AND g.status IN ('completed', 'finished')
+          AND g.created_at >= $2
+      `, [userId, startOfMonth.toISOString()]);
+
+      const myWins = Number(myRows[0]?.wins || 0);
+      const myTotal = Number(myRows[0]?.total || 0);
+
+      // Count players with more wins
+      const { rows: aboveRows } = await pool.query(`
+        SELECT COUNT(*) AS cnt FROM (
+          SELECT u.id
+          FROM users u
+          JOIN games g ON g.player_x = u.id OR g.player_o = u.id
+          WHERE g.status IN ('completed', 'finished')
+            AND g.created_at >= $2
+            AND u.id != $1
+          GROUP BY u.id
+          HAVING COUNT(CASE WHEN g.winner = u.id THEN 1 END) > $3
+        ) sub
+      `, [userId, startOfMonth.toISOString(), myWins]);
+
+      const rank = Number(aboveRows[0]?.cnt || 0) + 1;
+      const { rows: userRows } = await pool.query('SELECT username, avatar FROM users WHERE id = $1', [userId]);
+
+      myRank = {
+        id: userId,
+        username: userRows[0]?.username || 'You',
+        avatar: userRows[0]?.avatar || null,
+        wins: myWins,
+        total: myTotal,
+        rank,
+        isMe: true
+      };
+    }
+
+    res.json({ ok: true, leaderboard, top3, myRank });
+  } catch (err) {
+    console.error('[LEADERBOARD] monthly error:', err);
+    res.status(500).json({ error: 'Failed to fetch monthly leaderboard' });
+  }
+});
+
+// ─── GET /leaderboard/alltime — Overall rankings ──────────────────────────────────
+router.get('/alltime', auth, async (req, res) => {
+  try {
+    const userId = req.user.id || req.user.userId || req.user.sub;
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 50));
+
+    // Get top users based on total wins
+    const { rows } = await pool.query(`
+      SELECT 
+        u.id::text as id,
+        u.username,
+        u.avatar,
+        COUNT(CASE WHEN g.winner = u.id THEN 1 END) AS wins,
+        COUNT(g.id) AS total
+      FROM users u
+      JOIN games g ON g.player_x = u.id OR g.player_o = u.id
+      WHERE g.status IN ('completed', 'finished')
+      GROUP BY u.id, u.username, u.avatar
+      ORDER BY wins DESC, total ASC, MAX(g.created_at) ASC
+      LIMIT $1
+    `, [limit]);
+
+    const leaderboard = rows.map((r, idx) => ({
+      id: r.id,
+      username: r.username,
+      avatar: r.avatar,
+      wins: Number(r.wins),
+      total: Number(r.total),
+      rank: idx + 1,
+      isMe: r.id === userId
+    }));
+
+    const top3 = leaderboard.slice(0, 3);
+
+    // Find current user rank
+    let myRank = leaderboard.find(u => u.isMe) || null;
+    if (!myRank) {
+      // Calculate my wins/total if not in top list
+      const { rows: myRows } = await pool.query(`
+        SELECT 
+          COUNT(CASE WHEN g.winner = $1 THEN 1 END) AS wins,
+          COUNT(g.id) AS total
+        FROM games g
+        WHERE (g.player_x = $1 OR g.player_o = $1)
+          AND g.status IN ('completed', 'finished')
+      `, [userId]);
+
+      const myWins = Number(myRows[0]?.wins || 0);
+      const myTotal = Number(myRows[0]?.total || 0);
+
+      // Count players with more wins
+      const { rows: aboveRows } = await pool.query(`
+        SELECT COUNT(*) AS cnt FROM (
+          SELECT u.id
+          FROM users u
+          JOIN games g ON g.player_x = u.id OR g.player_o = u.id
+          WHERE g.status IN ('completed', 'finished')
+            AND u.id != $1
+          GROUP BY u.id
+          HAVING COUNT(CASE WHEN g.winner = u.id THEN 1 END) > $2
+        ) sub
+      `, [userId, myWins]);
+
+      const rank = Number(aboveRows[0]?.cnt || 0) + 1;
+      const { rows: userRows } = await pool.query('SELECT username, avatar FROM users WHERE id = $1', [userId]);
+
+      myRank = {
+        id: userId,
+        username: userRows[0]?.username || 'You',
+        avatar: userRows[0]?.avatar || null,
+        wins: myWins,
+        total: myTotal,
+        rank,
+        isMe: true
+      };
+    }
+
+    res.json({ ok: true, leaderboard, top3, myRank });
+  } catch (err) {
+    console.error('[LEADERBOARD] alltime error:', err);
+    res.status(500).json({ error: 'Failed to fetch alltime leaderboard' });
+  }
+});
+
 module.exports = router;

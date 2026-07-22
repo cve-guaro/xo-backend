@@ -64,7 +64,16 @@ router.get('/methods', auth, async (req, res) => {
   }
 });
 // Chapa Return Page — After payment completes, redirect to home page
-router.get('/chapa-return', (req, res) => {
+router.get('/chapa-return', async (req, res) => {
+  const { tx_ref, status } = req.query;
+  if (process.env.NODE_ENV !== 'production' && tx_ref && status === 'success') {
+    try {
+      const { completeDeposit } = require('../models/payments.service');
+      await completeDeposit(tx_ref, 'CHAPA', 'MOCK_REF_' + Date.now());
+    } catch (e) {
+      console.log('[DEV MOCK DEPOSIT COMPLETE LOG]', e.message);
+    }
+  }
   const homeUrl = process.env.NODE_ENV === 'production'
     ? 'https://xoethiopia.com/home/gameplay'
     : 'http://localhost:8081/home/gameplay';
@@ -220,17 +229,17 @@ router.post('/withdraw', auth, validate(schemas.withdraw), async (req, res) => {
       return res.status(400).json({ detail: `Minimum withdrawal is ${dynMin} ETB` });
     }
 
-    // Lock payout destination to user's registered phone number only if not provided
     // Respect the user's provided payout destination; fallback to registered phone only if destination is null/undefined/empty
+    const phone = req.user.phone_number || req.user.number || '';
     const destination = (payoutDestination && String(payoutDestination).trim() !== "")
       ? payoutDestination
-      : req.user.phone_number;
+      : (phone || '251911000000');
 
     const out = await requestWithdraw({
       userId,
       amount: amt,
-      phoneNumber: req.user.phone_number,
-      payoutMethod: payoutMethod || "chapa",
+      phoneNumber: phone || destination,
+      payoutMethod: payoutMethod || "TELEBIRR",
       payoutDestination: destination,
     });
 

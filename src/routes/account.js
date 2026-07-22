@@ -135,38 +135,93 @@ router.post('/history', auth, async (req, res) => {
 });
 
 // ─── GET /account/transactions ──────────────────────────────────────
-// Returns the user's payment history (deposits + withdrawals only)
+// Returns unified financial activity: wallet deposits/withdrawals + game prize winnings
 router.get('/transactions', auth, async (req, res) => {
   try {
     const userId = req.user.id;
+
+    // Unified query: wallet_transactions (deposits, withdrawals, refunds, gifts)
+    // UNION payment_transactions (XO match & Spin prizes)
     const result = await pool.query(`
-      SELECT 
-        id,
-        tx_type,
-        amount,
-        status,
-        provider AS bank,
-        provider_ref AS tx_ref,
-        created_at
-      FROM wallet_transactions
-      WHERE user_id = $1
-        AND LOWER(tx_type::text) IN ('deposit', 'withdrawal', 'withdraw_request', 'withdraw_settled', 'prize')
+      (
+        SELECT
+          id,
+          tx_type::text AS tx_type,
+          amount::numeric,
+          status::text,
+          provider::text AS bank,
+          provider_ref::text AS tx_ref,
+          meta::jsonb AS meta,
+          created_at,
+          CASE
+            WHEN LOWER(tx_type::text) IN ('deposit')                              THEN 'deposit'
+            WHEN LOWER(tx_type::text) IN ('withdraw_request', 'withdraw_settled') THEN 'withdrawal'
+            WHEN LOWER(tx_type::text) IN ('refund')                               THEN 'deposit'
+            WHEN LOWER(tx_type::text) IN ('gift')                                 THEN 'deposit'
+            ELSE 'deposit'
+          END::text AS normalized_type,
+          NULL::text AS game_type
+        FROM wallet_transactions
+        WHERE user_id = $1
+      )
+      UNION ALL
+      (
+        SELECT
+          id,
+          type::text AS tx_type,
+          amount::numeric,
+          status::text,
+          bank::text AS bank,
+          tx_ref::text AS tx_ref,
+          provider_payload::jsonb AS meta,
+          created_at,
+          'prize'::text AS normalized_type,
+          CASE
+            WHEN bank IN ('SPIN_PRIZE', 'SPIN_REFUND') THEN 'SPIN'
+            ELSE 'XO'
+          END::text AS game_type
+        FROM payment_transactions
+        WHERE user_id = $1
+      )
       ORDER BY created_at DESC
       LIMIT 500
     `, [userId]);
 
+    const transactions = result.rows.map(tx => ({
+      id: tx.id,
+      tx_type: tx.normalized_type,
+      type: tx.normalized_type,
+      amount: Number(tx.amount),
+      status: (tx.status || 'pending').toLowerCase(),
+      method: tx.bank || 'Chapa',
+      ref: tx.tx_ref,
+      createdAt: tx.created_at,
+      game_type: tx.game_type || null,
+    }));
+
+    // Compute aggregate stats server-side
+    let depCount = 0, depSum = 0;
+    let witCount = 0, witSum = 0;
+    let prizeCount = 0, prizeSum = 0;
+    let successCount = 0;
+    for (const tx of transactions) {
+      const isSuccess = ['success', 'completed', 'settled', 'paid'].includes(tx.status);
+      if (isSuccess) successCount++;
+      if (tx.type === 'deposit' && isSuccess) { depCount++; depSum += tx.amount; }
+      if (tx.type === 'withdrawal' && isSuccess) { witCount++; witSum += tx.amount; }
+      if (tx.type === 'prize' && isSuccess) { prizeCount++; prizeSum += tx.amount; }
+    }
+
     return res.json({
       ok: true,
-      transactions: result.rows.map(tx => ({
-        id: tx.id,
-        tx_type: tx.tx_type,           // raw type for frontend normalizeType()
-        type: tx.tx_type,              // alias used by some callers
-        amount: Number(tx.amount),
-        status: tx.status?.toLowerCase() || 'pending',
-        method: tx.bank || 'Chapa',
-        ref: tx.tx_ref,
-        createdAt: tx.created_at,
-      }))
+      transactions,
+      stats: {
+        deposits: { count: depCount, total: depSum },
+        withdrawals: { count: witCount, total: witSum },
+        prizes: { count: prizeCount, total: prizeSum },
+        net: depSum + prizeSum - witSum,
+        successCount,
+      },
     });
   } catch (err) {
     console.error('[account] /transactions error:', err);

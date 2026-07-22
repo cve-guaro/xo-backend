@@ -977,6 +977,145 @@ function setupGameSocket(io) {
     }
   }, 60000);
 
+  // Background queue scanner: periodically check all queues for stranded pairs (every 3 seconds)
+  // This is a safety net for the race condition where two near-simultaneous joins
+  // both fail to match because of lock contention.
+  setInterval(async () => {
+    try {
+      const queueKeys = await redis.smembers(MM_QUEUES_SET).catch(() => []);
+      if (!queueKeys?.length) return;
+
+      for (const queueKey of queueKeys) {
+        const len = await redis.llen(queueKey).catch(() => 0);
+        if (len < 2) continue;
+
+        // Extract bet amount from queue key (e.g., "queue:15" -> 15)
+        const betAmount = Number(queueKey.split(':')[1]);
+        if (!Number.isFinite(betAmount) || betAmount <= 0) continue;
+
+        const roomNumber = determineRoomByBetAmount(betAmount);
+        const timerDuration = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
+
+        const locked = await withRedisLock(redis, `lock:matcher:${betAmount}`, 2000, async () => {
+          while ((await redis.llen(queueKey)) >= 2) {
+            let popped = await lpopN(queueKey, 2);
+            if (!Array.isArray(popped)) popped = [popped].filter(Boolean);
+            if (popped.length < 2) {
+              if (popped.length === 1) await redis.lpush(queueKey, popped[0]);
+              break;
+            }
+
+            let p1, p2;
+            try { p1 = JSON.parse(popped[0]); p2 = JSON.parse(popped[1]); } catch { continue; }
+            if (!p1?.userId || !p2?.userId) continue;
+
+            // Skip stale entries
+            const now = Date.now();
+            if (now - p1.joinedAt > QUEUE_TTL) continue;
+            if (now - p2.joinedAt > QUEUE_TTL) { await redis.lpush(queueKey, JSON.stringify(p1)); continue; }
+
+            if (p1.userId === p2.userId) {
+              await redis.lpush(queueKey, JSON.stringify(p2));
+              const nextRaw = await redis.lpop(queueKey);
+              if (!nextRaw) { await redis.lpush(queueKey, JSON.stringify(p1)); break; }
+              p2 = JSON.parse(nextRaw);
+            }
+
+            let s1 = resolveActiveSocket(io, p1.userId, p1.socketId);
+            let s2 = resolveActiveSocket(io, p2.userId, p2.socketId);
+            if (!s1 || !s2) {
+              if (s1) { p1.socketId = s1.id; await redis.lpush(queueKey, JSON.stringify(p1)); }
+              if (s2) { p2.socketId = s2.id; await redis.lpush(queueKey, JSON.stringify(p2)); }
+              continue;
+            }
+            p1.socketId = s1.id;
+            p2.socketId = s2.id;
+
+            const p1Banned = await isShadowBanned(p1.userId, p1.betMin, p1.betMax);
+            const p2Banned = await isShadowBanned(p2.userId, p2.betMin, p2.betMax);
+            if (p1Banned || p2Banned) {
+              if (p1Banned && p2Banned) { await redis.rpush(queueKey, JSON.stringify(p1)); await redis.rpush(queueKey, JSON.stringify(p2)); }
+              else if (p1Banned) { await redis.lpush(queueKey, JSON.stringify(p2)); await redis.rpush(queueKey, JSON.stringify(p1)); }
+              else { await redis.lpush(queueKey, JSON.stringify(p1)); await redis.rpush(queueKey, JSON.stringify(p2)); }
+              continue;
+            }
+
+            const lockResult = await acquireMatchLocks(p1.userId, p2.userId);
+            if (!lockResult.ok) {
+              if (lockResult.reason === "IN_GAME") {
+                if (!lockResult.details.userId1) await redis.lpush(queueKey, JSON.stringify(p1));
+                if (!lockResult.details.userId2) await redis.lpush(queueKey, JSON.stringify(p2));
+              } else {
+                await redis.lpush(queueKey, JSON.stringify(p1));
+                await redis.lpush(queueKey, JSON.stringify(p2));
+              }
+              continue;
+            }
+
+            const matchId = uuidv4();
+            try {
+              await lockAndStartMatch(matchId, p1.userId, p2.userId, betAmount);
+            } catch (e) {
+              await lockResult.release();
+              let p1Bal = 0, p2Bal = 0;
+              try {
+                const balRes = await pool.query(`SELECT user_id, (available_balance + COALESCE(bonus_balance, 0)) as balance FROM wallets WHERE user_id = ANY($1::uuid[])`, [[p1.userId, p2.userId]]);
+                for (const row of balRes.rows) { if (row.user_id === p1.userId) p1Bal = Number(row.balance); if (row.user_id === p2.userId) p2Bal = Number(row.balance); }
+              } catch {}
+              if (p1Bal < betAmount) { s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." }); } else { await redis.lpush(queueKey, JSON.stringify(p1)); }
+              if (p2Bal < betAmount) { s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." }); } else { await redis.lpush(queueKey, JSON.stringify(p2)); }
+              continue;
+            }
+
+            await lockResult.release();
+            await Promise.all([purgeUserFromAllQueues(p1.userId), purgeUserFromAllQueues(p2.userId)]);
+
+            const players = { X: p1.userId, O: p2.userId };
+            const sockets = { X: s1, O: s2 };
+            const initialTimer = timerDuration;
+
+            const game = {
+              id: matchId, board: Array(9).fill("_"), turn: "X", players, sockets,
+              timers: { X: initialTimer, O: initialTimer }, betAmount,
+              room: roomNumber, rangeX: `${p1.betMin}-${p1.betMax}`, rangeO: `${p2.betMin}-${p2.betMax}`,
+              timerInterval: null, reconnectTimeout: null, startTimeout: null, status: "countdown", round: 1,
+            };
+            activeGames.set(matchId, game);
+
+            if (sockets.X) sockets.X.data = { matchId, userId: players.X, symbol: "X" };
+            if (sockets.O) sockets.O.data = { matchId, userId: players.O, symbol: "O" };
+            io.in(userRoom(players.X)).socketsJoin(matchId);
+            io.in(userRoom(players.O)).socketsJoin(matchId);
+            socketSearching.delete(p1.socketId);
+            socketSearching.delete(p2.socketId);
+            clearQueueTimeout(p1.socketId);
+            clearQueueTimeout(p2.socketId);
+            sockets.X.emit("queue_status", { searching: false });
+            sockets.O.emit("queue_status", { searching: false });
+
+            await redis.set(`in_game:${players.X}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+            await redis.set(`in_game:${players.O}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+
+            const nameRes = await pool.query(`SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`, [[players.X, players.O]]).catch(() => ({ rows: [] }));
+            const nameMap = new Map(nameRes.rows.map(r => [String(r.id), r.display_name]));
+            const nameX = nameMap.get(String(players.X)) || p1.username || players.X.slice(0, 8);
+            const nameO = nameMap.get(String(players.O)) || p2.username || players.O.slice(0, 8);
+
+            const payloadX = { matchId, youAre: "X", symbol: "X", opponentId: players.O, opponentUsername: nameO, opponentSymbol: "O", players, betAmount: Number(betAmount), room: roomNumber, roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null, timerDuration: initialTimer, houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null };
+            const payloadO = { matchId, youAre: "O", symbol: "O", opponentId: players.X, opponentUsername: nameX, opponentSymbol: "X", players, betAmount: Number(betAmount), room: roomNumber, roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null, timerDuration: initialTimer, houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null };
+
+            logAlways(`BG SCANNER MATCHED`, { matchId, X: players.X, O: players.O, bet: betAmount, queue: queueKey });
+            emitToUser(io, players.X, "match_found", payloadX);
+            emitToUser(io, players.O, "match_found", payloadO);
+            scheduleGameStart(io, matchId);
+          }
+        });
+      }
+    } catch (err) {
+      // Silent — background scanner should not crash the server
+    }
+  }, 3000);
+
   // Background interval for simulated/fake wins ticker (runs once globally)
   setInterval(async () => {
     try {
@@ -1472,7 +1611,141 @@ function setupGameSocket(io) {
 
         dbg(`rid=${rid} sid=${socket.id}`, locked ? "matcher ran" : "matcher skipped (lock held)");
 
-        // ── 500ms Fallback Timeout ──
+        // ── Retry matcher if lock was contended (race condition fix) ──
+        // When two players join near-simultaneously, the second player's matcher
+        // may fail to acquire the lock because the first player's (empty) matcher
+        // still holds it. After the first player's lock expires, both are stuck
+        // in the queue with no one to re-trigger matching. This retry fixes that.
+        if (!locked) {
+          const retryDelays = [300, 800, 1500];
+          for (const delay of retryDelays) {
+            setTimeout(async () => {
+              try {
+                // Bail if this user is no longer searching
+                if (!socketSearching.has(socket.id)) return;
+                const inGameCheck = await redis.get(`in_game:${userId}`).catch(() => null);
+                if (inGameCheck) return;
+                const retryQueueLen = await redis.llen(queueKey).catch(() => 0);
+                if (retryQueueLen < 2) return;
+
+                dbg(ctx, `matcher retry (${delay}ms delay)`);
+                await withRedisLock(redis, `lock:matcher:${searchAmount}`, 2000, async () => {
+                  while ((await redis.llen(queueKey)) >= 2) {
+                    let popped = await lpopN(queueKey, 2);
+                    if (!Array.isArray(popped)) popped = [popped].filter(Boolean);
+                    if (popped.length < 2) {
+                      if (popped.length === 1) await redis.lpush(queueKey, popped[0]);
+                      break;
+                    }
+
+                    let p1, p2;
+                    try { p1 = JSON.parse(popped[0]); p2 = JSON.parse(popped[1]); } catch { continue; }
+                    if (!p1?.userId || !p2?.userId) continue;
+
+                    if (p1.userId === p2.userId) {
+                      await redis.lpush(queueKey, JSON.stringify(p2));
+                      const nextRaw = await redis.lpop(queueKey);
+                      if (!nextRaw) { await redis.lpush(queueKey, JSON.stringify(p1)); break; }
+                      p2 = JSON.parse(nextRaw);
+                    }
+
+                    let s1 = resolveActiveSocket(io, p1.userId, p1.socketId);
+                    let s2 = resolveActiveSocket(io, p2.userId, p2.socketId);
+                    if (!s1 || !s2) {
+                      if (s1) { p1.socketId = s1.id; await redis.lpush(queueKey, JSON.stringify(p1)); }
+                      if (s2) { p2.socketId = s2.id; await redis.lpush(queueKey, JSON.stringify(p2)); }
+                      continue;
+                    }
+                    p1.socketId = s1.id;
+                    p2.socketId = s2.id;
+
+                    const p1Banned = await isShadowBanned(p1.userId, p1.betMin, p1.betMax);
+                    const p2Banned = await isShadowBanned(p2.userId, p2.betMin, p2.betMax);
+                    if (p1Banned || p2Banned) {
+                      if (p1Banned && p2Banned) { await redis.rpush(queueKey, JSON.stringify(p1)); await redis.rpush(queueKey, JSON.stringify(p2)); }
+                      else if (p1Banned) { await redis.lpush(queueKey, JSON.stringify(p2)); await redis.rpush(queueKey, JSON.stringify(p1)); }
+                      else { await redis.lpush(queueKey, JSON.stringify(p1)); await redis.rpush(queueKey, JSON.stringify(p2)); }
+                      continue;
+                    }
+
+                    const lockResult = await acquireMatchLocks(p1.userId, p2.userId);
+                    if (!lockResult.ok) {
+                      if (lockResult.reason === "IN_GAME") {
+                        if (!lockResult.details.userId1) await redis.lpush(queueKey, JSON.stringify(p1));
+                        if (!lockResult.details.userId2) await redis.lpush(queueKey, JSON.stringify(p2));
+                      } else {
+                        await redis.lpush(queueKey, JSON.stringify(p1));
+                        await redis.lpush(queueKey, JSON.stringify(p2));
+                      }
+                      continue;
+                    }
+
+                    const matchId = uuidv4();
+                    try {
+                      await lockAndStartMatch(matchId, p1.userId, p2.userId, searchAmount);
+                    } catch (e) {
+                      await lockResult.release();
+                      let p1Bal = 0, p2Bal = 0;
+                      try {
+                        const balRes = await pool.query(`SELECT user_id, (available_balance + COALESCE(bonus_balance, 0)) as balance FROM wallets WHERE user_id = ANY($1::uuid[])`, [[p1.userId, p2.userId]]);
+                        for (const row of balRes.rows) { if (row.user_id === p1.userId) p1Bal = Number(row.balance); if (row.user_id === p2.userId) p2Bal = Number(row.balance); }
+                      } catch {}
+                      if (p1Bal < searchAmount) { s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." }); } else { await redis.lpush(queueKey, JSON.stringify(p1)); }
+                      if (p2Bal < searchAmount) { s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." }); } else { await redis.lpush(queueKey, JSON.stringify(p2)); }
+                      continue;
+                    }
+
+                    await lockResult.release();
+                    await Promise.all([purgeUserFromAllQueues(p1.userId), purgeUserFromAllQueues(p2.userId)]);
+
+                    const players = { X: p1.userId, O: p2.userId };
+                    const sockets = { X: s1, O: s2 };
+                    const initialTimer = timerDuration;
+
+                    const game = {
+                      id: matchId, board: Array(9).fill("_"), turn: "X", players, sockets,
+                      timers: { X: initialTimer, O: initialTimer }, betAmount: searchAmount,
+                      room: roomNumber, rangeX: `${p1.betMin}-${p1.betMax}`, rangeO: `${p2.betMin}-${p2.betMax}`,
+                      timerInterval: null, reconnectTimeout: null, startTimeout: null, status: "countdown", round: 1,
+                    };
+                    activeGames.set(matchId, game);
+
+                    if (sockets.X) sockets.X.data = { matchId, userId: players.X, symbol: "X" };
+                    if (sockets.O) sockets.O.data = { matchId, userId: players.O, symbol: "O" };
+                    io.in(userRoom(players.X)).socketsJoin(matchId);
+                    io.in(userRoom(players.O)).socketsJoin(matchId);
+                    socketSearching.delete(p1.socketId);
+                    socketSearching.delete(p2.socketId);
+                    clearQueueTimeout(p1.socketId);
+                    clearQueueTimeout(p2.socketId);
+                    sockets.X.emit("queue_status", { searching: false });
+                    sockets.O.emit("queue_status", { searching: false });
+
+                    await redis.set(`in_game:${players.X}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+                    await redis.set(`in_game:${players.O}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+
+                    const nameRes = await pool.query(`SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`, [[players.X, players.O]]).catch(() => ({ rows: [] }));
+                    const nameMap = new Map(nameRes.rows.map(r => [String(r.id), r.display_name]));
+                    const nameX = nameMap.get(String(players.X)) || p1.username || players.X.slice(0, 8);
+                    const nameO = nameMap.get(String(players.O)) || p2.username || players.O.slice(0, 8);
+
+                    const payloadX = { matchId, youAre: "X", symbol: "X", opponentId: players.O, opponentUsername: nameO, opponentSymbol: "O", players, betAmount: Number(searchAmount), room: roomNumber, roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null, timerDuration: initialTimer, houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null };
+                    const payloadO = { matchId, youAre: "O", symbol: "O", opponentId: players.X, opponentUsername: nameX, opponentSymbol: "X", players, betAmount: Number(searchAmount), room: roomNumber, roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null, timerDuration: initialTimer, houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null };
+
+                    logAlways(`RETRY MATCHED rid=${rid}`, { matchId, X: players.X, O: players.O, bet: searchAmount });
+                    emitToUser(io, players.X, "match_found", payloadX);
+                    emitToUser(io, players.O, "match_found", payloadO);
+                    scheduleGameStart(io, matchId);
+                  }
+                });
+              } catch (retryErr) {
+                console.error(`[MM] matcher retry error (${delay}ms):`, retryErr?.message);
+              }
+            }, delay);
+          }
+        }
+
+
         if (searchAmount === safeBetMax && safeBetMin < safeBetMax) {
           setTimeout(async () => {
             try {

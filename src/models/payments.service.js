@@ -16,8 +16,9 @@ function makeIdempotencyKey(prefix, userId, anchor) {
 
 // ----------- Deposit (init) -----------
 // payments.service.js
-async function initDeposit({ userId, phoneNumber, amount, provider, username, email, returnUrl, isWeb }) {
+async function initDeposit({ userId, phoneNumber, amount, provider, clientRef, username, email, returnUrl, isWeb }) {
   return withTx(async (client) => {
+    let paymentData = null;
     try {
       await client.query(SQL.ensureWallet, [userId]);
 
@@ -46,7 +47,7 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
         { isWeb },
       ]);
 
-      const paymentData = rows[0];
+      paymentData = rows[0];
       const callbackUrl = CHAPA.callbackUrl || 'https://xo-et-backend-production.up.railway.app/payments/webhook';
 
       const deposit = await initChapaDeposit(
@@ -62,11 +63,20 @@ async function initDeposit({ userId, phoneNumber, amount, provider, username, em
 
       const url = (deposit && deposit.data && deposit.data.checkout_url) || null;
 
-      return { txId: rows[0].tx_id, checkout_url: url };
+      return { txId: paymentData.tx_id, checkout_url: url };
     } catch (err) {
       // Surface Chapa's actual error message for easier debugging
       const chapaMsg = err.response?.message || err.response?.data?.message || err.message;
       console.error("[ERROR] initDeposit failure:", chapaMsg, err.response || '');
+
+      // In local dev mode, if Chapa key is a dummy placeholder or returns unauthorized, provide a test return URL
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[DEV DEPOSIT FALLBACK] Returning mock checkout URL for local dev testing');
+        const txRef = paymentData?.tx_id || ('DEV_MOCK_TX_' + Date.now());
+        const mockReturnUrl = `http://localhost:8081/payments/chapa-return?tx_ref=${txRef}&status=success`;
+        return { txId: txRef, checkout_url: mockReturnUrl };
+      }
+
       const errorInfo = new Error(`Deposit service error: ${chapaMsg}`);
       errorInfo.status = 400;
       throw errorInfo;

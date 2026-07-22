@@ -10,7 +10,7 @@ const pool = new Pool({
     ? { rejectUnauthorized: false } 
     : (process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false),
   // Tuned for Supabase PgBouncer: lower pool prevents over-subscribing the bouncer's own limit
-  max: 12,
+  max: Number(process.env.DB_POOL_MAX || 12),
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 3000,   // Faster failure detection (was 5s)
   statement_timeout: 30000,        // Kill runaway queries after 30s
@@ -50,6 +50,7 @@ async function withTx(fn, maxRetries = 3) {
 }
 const Redis = require('ioredis');
 const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+  enableOfflineQueue: false, // Prevents commands from hanging indefinitely in queue when offline
   maxRetriesPerRequest: 3,
   retryStrategy(times) {
     if (times > 5) return null; // Stop retrying after 5 failed attempts

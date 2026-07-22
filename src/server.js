@@ -1,3 +1,4 @@
+// Trigger nodemon reload
 const express = require('express');
 const compression = require('compression');
 const Sentry = require("@sentry/node");
@@ -31,9 +32,11 @@ const userRoutes = require('./routes/user');
 const accountRoutes = require('./routes/account');
 const otpAuthRoutes = require('./routes/otp');
 const adminRoutes = require('./routes/admin');
+const telegramAuthRoutes = require('./routes/telegram-auth');
 
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
+const { setupSpinSocket } = require('./socket/spinRoom');
 const { platformDetection } = require('./middleware/Detection');
 const { systemLockdownCheck } = require('./middleware/Security');
 const { pool, redis } = require('./db/index');
@@ -88,7 +91,7 @@ app.use(helmet({
 
 // Manually applying Permissions-Policy since helmet doesn't support it natively yet
 app.use((req, res, next) => {
-  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(self *), geolocation=()");
   res.setHeader("X-XSS-Protection", "1; mode=block");
   
   // Enforce UTF-8 charset for all application/json responses
@@ -150,7 +153,12 @@ app.use('/uploads', express.static(path.join(__dirname, '../public/uploads')));
 
 // ─── SOCKET.IO & REDIS ADAPTER (RESILIENT) ─────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: corsOptions.origin, methods: ["GET", "POST", "OPTIONS"], credentials: true }
+  cors: { origin: corsOptions.origin, methods: ["GET", "POST", "OPTIONS"], credentials: true },
+  pingTimeout: 60000,          // 60 seconds to survive carrier network hops/jitter
+  pingInterval: 25000,         // 25 seconds heartbeat
+  maxHttpBufferSize: 1e6,      // 1MB payload ceiling for security
+  connectTimeout: 45000,       // 45 seconds connection timeout
+  transports: ["websocket", "polling"]
 });
 
 // Resilient Redis adapter — falls back to in-memory if Redis is rate-limited/down
@@ -207,23 +215,22 @@ connectRedisAdapter();
 // ─── RATE LIMITING (FIREWALL) ──────────────────────────────────────────────────
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500, // Raised from 100 → 500 to accommodate normal SPA usage
+  max: Number(process.env.GENERAL_RATE_MAX || 15000), // Raised default to prevent NAT gateway blocking
   message: { error: "Too many requests, please try again later." },
   skip: (req) => req.path === '/health' // Never throttle health checks
 });
 
 const paymentLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: 5, // Limit each IP to 5 payment requests per minute
+  max: Number(process.env.PAYMENT_RATE_MAX || 60), // Increased from 5 to 60 to prevent NAT blocking on deposits
   message: { error: "Security alert: Too many payment attempts. Please wait 1 minute." }
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  // Per-IP cap. Raised from 30 → 120 because Ethiopian mobile carriers frequently NAT many
-  // users behind one shared IP; 30 locked out legitimate users sharing an IP. Per-phone OTP
-  // throttling (in routes/otp.js) is the real brute-force guard for OTP specifically.
-  max: Number(process.env.AUTH_RATE_MAX || 120),
+  // Per-IP cap. Raised because Ethiopian mobile carriers frequently NAT many
+  // users behind one shared IP; 30 locked out legitimate users sharing an IP.
+  max: Number(process.env.AUTH_RATE_MAX || 1200),
   message: {
     error: "TOO_MANY_REQUESTS",
     message: "Too many login attempts. For security, please wait 15 minutes before trying again."
@@ -238,7 +245,7 @@ const authLimiter = rateLimit({
 // Dedicated high-capacity limiter for authenticated profile polling
 const profileLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: 60, // 60 profile fetches/min per IP — covers all active tabs
+  max: Number(process.env.PROFILE_RATE_MAX || 600), // Raised default to prevent NAT gateway blocking
   message: { error: "Too many profile requests, please slow down." }
 });
 
@@ -314,10 +321,14 @@ app.use('/api/auth', authRoutes);
 app.use("/api/transactions", txRoutes);
 app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
+app.use('/auth', telegramAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
 app.use('/notifications', require('./routes/notifications'));
 app.use('/leaderboard', require('./routes/leaderboard'));
+app.use('/spin', require('./routes/spin'));
+app.use('/voice', require('./routes/voice'));
+app.use('/api/voice', require('./routes/voice'));
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
   const CACHE_KEY = 'cache:api_features';
@@ -383,6 +394,11 @@ app.get('/promo-popup/active', async (req, res) => {
 
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
+setupSpinSocket(io);
+
+// ─── TELEGRAM BOT ──────────────────────────────────────────────────────────────
+const { initTelegramBot } = require('./bot/telegram');
+initTelegramBot();
 
 // ─── BACKGROUND CRON SCHEDULER ──────────────────────────────────────────────────
 const { initCron } = require('./cron');
@@ -392,9 +408,75 @@ initCron();
 // Awaited on startup so the database schema is guaranteed to be ready before accepting requests.
 async function runMigrations() {
   try {
+    // ── Spin Game tables ──
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS spin_room_configs (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        bet_amount NUMERIC NOT NULL,
+        max_players INT DEFAULT 5,
+        house_cut_percent NUMERIC DEFAULT 10,
+        is_active BOOLEAN DEFAULT true
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS spin_rounds (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        config_id INT REFERENCES spin_room_configs(id),
+        status TEXT DEFAULT 'waiting',
+        players JSONB DEFAULT '[]',
+        winning_slice INT,
+        winner_user_id UUID,
+        pot_amount NUMERIC DEFAULT 0,
+        prize_amount NUMERIC DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        locked_at TIMESTAMPTZ,
+        resolved_at TIMESTAMPTZ
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS spin_bets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        round_id UUID REFERENCES spin_rounds(id),
+        user_id UUID NOT NULL,
+        amount NUMERIC NOT NULL,
+        is_bot BOOLEAN DEFAULT false,
+        seat_index INT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_spin_rounds_config ON spin_rounds(config_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_spin_rounds_status ON spin_rounds(status);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_spin_bets_round ON spin_bets(round_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_spin_bets_user ON spin_bets(user_id);`);
+
+    // Seed default spin room configs (exactly 5_PLAYER and RAIL)
+    console.log('[DB] Seeding exactly two spin room configs: 5_PLAYER and RAIL...');
+    await pool.query('TRUNCATE TABLE spin_room_configs CASCADE');
+    await pool.query(
+      `INSERT INTO spin_room_configs (id, name, bet_amount, max_players, house_cut_percent, is_active)
+       VALUES 
+         (1, '5_PLAYER', 100, 5, 10, true),
+         (2, 'RAIL', 0, 9999, 10, true)
+       ON CONFLICT (id) DO NOTHING`
+    );
+    // Seed spin_5p_entry_amount in global_settings
+    await pool.query(
+      `INSERT INTO global_settings (key, value)
+       VALUES ('spin_5p_entry_amount', '100'::jsonb)
+       ON CONFLICT (key) DO NOTHING`
+    );
+    console.log('[DB] Seeded two spin room configs and spin_5p_entry_amount global setting.');
+
     // Unconditional schema updates & index creation for performance & gameplay features
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS room_2_wins INTEGER DEFAULT 0;`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS room_3_wins INTEGER DEFAULT 0;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS r1_15_wins INTEGER DEFAULT 0;`);
+
+    // Telegram login support
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_id BIGINT;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_username TEXT;`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL;`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS r2_100_wins INTEGER DEFAULT 0;`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS r3_1000_wins INTEGER DEFAULT 0;`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS raw_user_meta_data JSONB DEFAULT '{}'::jsonb;`);

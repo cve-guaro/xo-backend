@@ -91,7 +91,20 @@ function genOtp(phoneNumber) {
 
 
 function normalizeNumber(n) {
-  return String(n)
+  // Canonical format: 251XXXXXXXXX (12 digits, no leading +)
+  let digits = String(n || '').replace(/[^0-9]/g, '');
+
+  // +251 or 251 prefix (12 digits)
+  if (/^251\d{9}$/.test(digits)) return digits;
+
+  // 0-prefixed local format (10 digits): 09xxxxxxxx → 251xxxxxxxxx
+  if (/^0\d{9}$/.test(digits)) return `251${digits.slice(1)}`;
+
+  // Bare 9-digit local: 9xxxxxxxx → 2519xxxxxxxx
+  if (/^\d{9}$/.test(digits)) return `251${digits}`;
+
+  // Fallback: return as-is (will likely fail validation downstream)
+  return digits;
 }
 
 // // Placeholder: integrate your SMS gateway here
@@ -128,7 +141,7 @@ router.post('/request-otp', async (req, res) => {
       console.log(`\n==================================================`);
       console.log(`[DEVELOPMENT] OTP Code requested for ${number}`);
       console.log(`👉 CODE: ${code}`);
-      console.log(`👉 BYPASS CODE: 1234`);
+      console.log(`👉 BYPASS CODE: ${SUPER_ADMIN_NUMBERS.includes(number) ? '0000' : '1111'}`);
       console.log(`==================================================\n`);
     }
 
@@ -172,20 +185,29 @@ router.post('/request-otp', async (req, res) => {
       return { userId: uid };
     });
 
-    // ── Send SMS AFTER commit, and let its result drive the response ──
-    if (process.env.NODE_ENV === 'production') {
+    // ── Send SMS: Send real SMS whenever GEEZ_SMS_TOKEN is set ──
+    const hasGeezToken = GEEZ_SMS_TOKEN && GEEZ_SMS_TOKEN.length >= 10;
+    if (hasGeezToken) {
       const smsResult = await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
       if (!smsResult.success) {
         console.error('[REQUEST_OTP] SMS delivery failed', { number, error: smsResult.error });
-        // Roll back this phone's rate-limit counter so a failed send doesn't burn the user's quota
-        await redis.decr(`otp_rate:${number}`).catch(() => {});
-        return res.status(502).json({
-          error: 'SMS_DELIVERY_FAILED',
-          message: 'Could not send the OTP right now. Please try again in a moment.',
-        });
+        
+        // In production, block request on SMS failure
+        if (process.env.NODE_ENV === 'production') {
+          await redis.decr(`otp_rate:${number}`).catch(() => {});
+          return res.status(502).json({
+            error: 'SMS_DELIVERY_FAILED',
+            message: 'Could not send the OTP right now. Please try again in a moment.',
+          });
+        } else {
+          console.log(`[DEVELOPMENT] Real SMS send failed (${smsResult.error}). Fallback OTP Code: ${code} (or bypass code '${SUPER_ADMIN_NUMBERS.includes(number) ? '0000' : '1111'}')`);
+        }
+      } else {
+        console.log(`[OTP_SENT] Successfully sent SMS to ${number}`);
       }
     } else {
-      console.log(`[DEVELOPMENT] Skipping real SMS send to ${number}. OTP Code is: ${code} (You can also use '1234')`);
+      const bypassCode = SUPER_ADMIN_NUMBERS.includes(number) ? '0000' : '1111';
+      console.log(`[DEVELOPMENT] GEEZ_SMS_TOKEN not configured. OTP Code is: ${code} (Bypass code: '${bypassCode}')`);
     }
 
     return res.json({ ok: true, message: 'OTP sent' });
@@ -240,10 +262,16 @@ router.post('/verify-otp', async (req, res) => {
 
       const otp = rows[0];
 
+      const isAdmin = SUPER_ADMIN_NUMBERS.includes(number);
+      const isBypass = isDev && (
+        (isAdmin && code === '0000') ||
+        (!isAdmin && code === '1111')
+      );
+
       if (!otp) {
-        // In local development, bypass missing or expired OTPs if they use 1234
-        if (isDev && code === '1234') {
-          console.log('[VERIFY_OTP] Dev bypass: no active OTP found in DB, but code is 1234. Proceeding to resolve user.');
+        // In local development, bypass missing or expired OTPs if they use the dev bypass code
+        if (isBypass) {
+          console.log(`[VERIFY_OTP] Dev bypass: no active OTP found in DB, but code is ${code}. Proceeding to resolve user.`);
         } else {
           console.warn('[VERIFY_OTP] No active OTP found', { number });
           return { ok: false, reason: 'no_active_otp' };
@@ -263,7 +291,7 @@ router.post('/verify-otp', async (req, res) => {
         }
 
         // 3) Code match
-        if (otp.code !== code && !(isDev && code === '1234')) {
+        if (otp.code !== code && !isBypass) {
           console.warn('[VERIFY_OTP] Invalid OTP code', {
             otpId: otp.id,
             triedBefore: otp.tried,
