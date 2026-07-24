@@ -109,7 +109,7 @@ app.use((req, res, next) => {
 });
 
 // ─── STRICT CORS ───────────────────────────────────────────────────────────────
-// Hardcoded whitelist — no dynamic origin reflection
+// Whitelist and dynamic origin matcher
 const ALLOWED_ORIGINS = [
   "https://xoethiopia.com",
   "https://www.xoethiopia.com",
@@ -136,7 +136,9 @@ const corsOptions = {
                     origin.startsWith('http://10.') || 
                     origin.startsWith('http://172.');
 
-    if (ALLOWED_ORIGINS.includes(origin) || (process.env.NODE_ENV !== 'production' && isLocal)) {
+    const isVercel = /\.vercel\.app$/.test(origin);
+
+    if (ALLOWED_ORIGINS.includes(origin) || isVercel || (process.env.NODE_ENV !== 'production' && isLocal)) {
       return callback(null, true);
     }
     return callback(new Error('CORS: Origin not allowed'));
