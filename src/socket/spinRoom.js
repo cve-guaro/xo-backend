@@ -287,31 +287,33 @@ async function resolveRound(io, round) {
 
   // Payout
   try {
-    const winner = round.players[round.winningSlice];
-    await creditWinnings({
-      userId: winner.userId,
-      prizeAmount: round.prizeAmount,
-      bonusUsed: winner.bonusUsed || 0,
-      roundId: round.id,
-      isBot: winner.isBot,
-    });
-
-    round.status = "paid";
-
-    // Update DB
-    await pool.query(
-      `UPDATE spin_rounds SET status = 'paid', resolved_at = NOW() WHERE id = $1::uuid`,
-      [round.id]
-    );
-
-    // Emit global win event (same pattern as XO Game)
-    if (!winner.isBot) {
-      io.emit("global_win", {
-        username: winner.username,
-        amount: round.prizeAmount,
-        timestamp: Date.now(),
-        game_type: "SPIN",
+    const winner = round.players[round.winningSlice] || round.players[0];
+    if (winner && winner.userId) {
+      await creditWinnings({
+        userId: winner.userId,
+        prizeAmount: round.prizeAmount,
+        bonusUsed: winner.bonusUsed || 0,
+        roundId: round.id,
+        isBot: !!winner.isBot,
       });
+
+      round.status = "paid";
+
+      // Update DB
+      await pool.query(
+        `UPDATE spin_rounds SET status = 'paid', resolved_at = NOW() WHERE id = $1::uuid`,
+        [round.id]
+      );
+
+      // Emit global win event (same pattern as XO Game)
+      if (!winner.isBot) {
+        io.emit("global_win", {
+          username: winner.username,
+          amount: round.prizeAmount,
+          timestamp: Date.now(),
+          game_type: "SPIN",
+        });
+      }
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Payout failed for round=${round.id}:`, err.message);
@@ -682,14 +684,17 @@ function setupSpinSocket(io) {
     // ── spin:add_stake ──────────────────────────────────────────────────
     socket.on("spin:add_stake", async (data, ack) => {
       try {
-        const { amount, token } = data || {};
+        const { amount, token, roundId: clientRoundId } = data || {};
         if (!token) return ack?.({ ok: false, error: "AUTH_FAILED" });
 
         let decoded;
         try { decoded = verifyToken(token); } catch { return ack?.({ ok: false, error: "AUTH_FAILED" }); }
 
         const userId = decoded.sub || decoded.userId || decoded.id;
-        const roundId = socket.data?.spinRoundId;
+        let roundId = clientRoundId || socket.data?.spinRoundId;
+        if (!roundId && playerToRound.has(userId)) {
+          roundId = playerToRound.get(userId);
+        }
         if (!roundId) return ack?.({ ok: false, error: "NOT_IN_ROUND" });
 
         const round = activeSpinRounds.get(roundId);
