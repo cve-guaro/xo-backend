@@ -80,10 +80,14 @@ async function getSpinConfigs() {
 }
 
 // ── Find or create a waiting round for a given config ──────────────────────
-function findWaitingRound(configId) {
+function findWaitingRound(configId, isRealPlayer = true) {
   for (const [id, round] of activeSpinRounds) {
-    if (round.configId === configId && round.status === "waiting" && round.players.length < round.maxPlayers) {
-      return round;
+    if (round.configId === configId && round.status === "waiting") {
+      const botCount = round.players.filter(p => p.isBot).length;
+      // Real players can join if room has open seats OR if there are bots that can be evicted
+      if (round.players.length < round.maxPlayers || (isRealPlayer && botCount > 0)) {
+        return round;
+      }
     }
   }
   return null;
@@ -390,11 +394,29 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
   if (round.status !== "waiting") {
     throw new Error("ROUND_NOT_WAITING");
   }
-  if (round.players.length >= round.maxPlayers) {
-    throw new Error("ROUND_FULL");
-  }
   if (round.players.some(p => p.userId === userId)) {
     throw new Error("ALREADY_IN_ROUND");
+  }
+
+  // If room is full but a real player is joining, evict a bot to make room
+  if (round.players.length >= round.maxPlayers) {
+    if (!isBot) {
+      const botIdx = round.players.findIndex(p => p.isBot);
+      if (botIdx !== -1) {
+        const evictedBot = round.players.splice(botIdx, 1)[0];
+        console.log(`${LOG_PREFIX} Evicted bot ${evictedBot.username} to make room for real player ${username}`);
+        round.players.forEach((p, i) => { p.seatIndex = i; });
+        broadcastToRound(io, round, "spin:player_left", {
+          roundId: round.id,
+          userId: evictedBot.userId,
+          currentPlayers: round.players.length,
+        });
+      } else {
+        throw new Error("ROUND_FULL");
+      }
+    } else {
+      throw new Error("ROUND_FULL");
+    }
   }
 
   const finalStake = round.mode === "5_PLAYER" ? round.betAmount : Number(stake);
@@ -890,9 +912,13 @@ function setupSpinSocket(io) {
 
     // ── Handle voice chat relay ─────────────────────────────────────────
     socket.on("spin:voice_chunk", (data) => {
-      const userId = socket.data?.userId;
-      const roundId = socket.data?.spinRoundId;
-      if (!userId || !roundId) return;
+      const userId = socket.data?.userId || data?.userId;
+      let roundId = socket.data?.spinRoundId || data?.roundId;
+      if (!userId) return;
+      if (!roundId && playerToRound.has(userId)) {
+        roundId = playerToRound.get(userId);
+      }
+      if (!roundId) return;
 
       // Broadcast voice chunk to other players in the room
       socket.to(`spin:${roundId}`).emit("spin:voice_chunk", {
@@ -904,8 +930,12 @@ function setupSpinSocket(io) {
     // ── Handle host voice moderation ────────────────────────────────────
     socket.on("spin:mute_player", async (data, ack) => {
       const userId = socket.data?.userId;
-      const roundId = socket.data?.spinRoundId;
-      if (!userId || !roundId) return ack?.({ ok: false, error: "UNAUTHORIZED" });
+      let roundId = socket.data?.spinRoundId || data?.roundId;
+      if (!userId) return ack?.({ ok: false, error: "UNAUTHORIZED" });
+      if (!roundId && playerToRound.has(userId)) {
+        roundId = playerToRound.get(userId);
+      }
+      if (!roundId) return ack?.({ ok: false, error: "UNAUTHORIZED" });
 
       const round = activeSpinRounds.get(roundId);
       if (!round) return ack?.({ ok: false, error: "ROOM_NOT_FOUND" });

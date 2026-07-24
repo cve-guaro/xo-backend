@@ -1497,12 +1497,14 @@ function setupGameSocket(io) {
         await redis.sadd(MM_QUEUES_SET, queueKey).catch(() => { });
         dbg(ctx, "queueKey", queueKey);
 
-        // socket already searching?
+        // socket already searching? Re-purge old queue entries cleanly instead of erroring out
         if (socketSearching.has(socket.id)) {
-          dbg(ctx, "ALREADY_IN_QUEUE (socket)");
-          if (typeof ack === "function") ack({ ok: true, data: { state: "ALREADY_IN_QUEUE" } });
-          socket.emit("info", { code: "ALREADY_IN_QUEUE", message: "Already searching…" });
-          return;
+          dbg(ctx, "Re-purging active searching socket before re-enqueue");
+          const oldQueueKey = socketSearching.get(socket.id);
+          if (oldQueueKey) memQueueRemoveUser(oldQueueKey, userId);
+          socketSearching.delete(socket.id);
+          clearQueueTimeout(socket.id);
+          await purgeUserFromAllQueues(userId);
         }
 
         // remove stale entry (this queue)
