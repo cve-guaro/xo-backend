@@ -231,7 +231,7 @@ function initTelegramBot() {
       }
 
       // 8) Store completed login result for the app to poll
-      await redis.set(`tg_login:${sessionToken}`, JSON.stringify({
+      const doneResult = JSON.stringify({
         status: 'done',
         token,
         refreshToken,
@@ -244,7 +244,18 @@ function initTelegramBot() {
           role: user.role || 'user',
           sound_muted: user.sound_muted,
         },
-      }), 'EX', RESULT_TTL);
+      });
+
+      memoryTgSessions.set(sessionToken, {
+        data: doneResult,
+        expiresAt: Date.now() + RESULT_TTL * 1000,
+      });
+
+      try {
+        await redis.set(`tg_login:${sessionToken}`, doneResult, 'EX', RESULT_TTL);
+      } catch (err) {
+        console.warn('[TELEGRAM] Redis set completed login failed, using memory fallback:', err.message);
+      }
 
       // Clean up the chat mapping
       await redis.del(`tg_login:${sessionToken}:chat`).catch(() => {});
@@ -327,15 +338,31 @@ function initTelegramBot() {
 /**
  * Create a new login session. Returns { sessionToken, deepLink }.
  */
+// In-memory fallback for Telegram login sessions when Redis circuit breaker is open
+const memoryTgSessions = new Map();
+
+/**
+ * Create a new login session. Returns { sessionToken, deepLink }.
+ */
 async function createTelegramLoginSession() {
   const sessionToken = crypto.randomUUID();
+  const sessionObj = { status: 'waiting' };
 
-  await redis.set(
-    `tg_login:${sessionToken}`,
-    JSON.stringify({ status: 'waiting' }),
-    'EX',
-    SESSION_TTL
-  );
+  memoryTgSessions.set(sessionToken, {
+    data: JSON.stringify(sessionObj),
+    expiresAt: Date.now() + SESSION_TTL * 1000,
+  });
+
+  try {
+    await redis.set(
+      `tg_login:${sessionToken}`,
+      JSON.stringify(sessionObj),
+      'EX',
+      SESSION_TTL
+    );
+  } catch (err) {
+    console.warn('[TELEGRAM] Redis set tg_login failed, using memory fallback:', err.message);
+  }
 
   const envUsername = process.env.TELEGRAM_BOT_USERNAME;
   const username = (envUsername && envUsername !== 'Xoethiopia_Dev_Bot') ? envUsername : 'XoethiopiaBot';
@@ -348,7 +375,17 @@ async function createTelegramLoginSession() {
  * Poll a login session. Returns the current state.
  */
 async function pollTelegramLoginSession(sessionToken) {
-  const raw = await redis.get(`tg_login:${sessionToken}`);
+  let raw = await redis.get(`tg_login:${sessionToken}`).catch(() => null);
+
+  if (!raw && memoryTgSessions.has(sessionToken)) {
+    const mem = memoryTgSessions.get(sessionToken);
+    if (Date.now() <= mem.expiresAt) {
+      raw = mem.data;
+    } else {
+      memoryTgSessions.delete(sessionToken);
+    }
+  }
+
   if (!raw) return { status: 'expired' };
 
   try {
