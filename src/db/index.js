@@ -62,20 +62,26 @@ const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
   },
 });
 
-// ─── REDIS CIRCUIT BREAKER ─────────────────────────────────────────────────────
+// ─── REDIS CIRCUIT BREAKER (EXPONENTIAL BACKOFF) ──────────────────────────────
 // When Redis is rate-limited, skip ALL Redis calls for a cooldown period.
-// This prevents log spam AND stops hammering the rate-limited Upstash (which would
-// extend the rate limit duration).
+// Each consecutive trip doubles the cooldown: 60s → 120s → 300s (5min cap).
+// A successful command resets the backoff level.
 let _redisCircuitOpen = false;
 let _redisCircuitOpenedAt = 0;
-const CIRCUIT_COOLDOWN_MS = 60_000; // Skip Redis for 60s after failure
+let _redisBackoffLevel = 0; // 0 = first failure
+const CIRCUIT_COOLDOWN_STEPS = [60_000, 120_000, 300_000]; // 60s, 2min, 5min
+
+function getCircuitCooldown() {
+  const idx = Math.min(_redisBackoffLevel, CIRCUIT_COOLDOWN_STEPS.length - 1);
+  return CIRCUIT_COOLDOWN_STEPS[idx];
+}
 
 function isRedisAvailable() {
   if (!_redisCircuitOpen) return true;
-  // Check if cooldown has passed
-  if (Date.now() - _redisCircuitOpenedAt > CIRCUIT_COOLDOWN_MS) {
+  const cooldown = getCircuitCooldown();
+  if (Date.now() - _redisCircuitOpenedAt > cooldown) {
     _redisCircuitOpen = false;
-    console.log('[REDIS] Circuit breaker reset — will probe Redis on next call.');
+    console.log(`[REDIS] Circuit breaker reset (backoff level ${_redisBackoffLevel}) — probing Redis.`);
     return true;
   }
   return false;
@@ -85,7 +91,17 @@ function tripCircuitBreaker(err) {
   if (!_redisCircuitOpen) {
     _redisCircuitOpen = true;
     _redisCircuitOpenedAt = Date.now();
-    console.warn(`[REDIS] ⚡ Circuit breaker OPEN — skipping Redis for ${CIRCUIT_COOLDOWN_MS / 1000}s. Reason: ${err.message}`);
+    const cooldown = getCircuitCooldown();
+    console.warn(`[REDIS] ⚡ Circuit breaker OPEN — skipping Redis for ${cooldown / 1000}s (level ${_redisBackoffLevel}). Reason: ${err.message}`);
+    // Escalate backoff for next failure
+    _redisBackoffLevel = Math.min(_redisBackoffLevel + 1, CIRCUIT_COOLDOWN_STEPS.length - 1);
+  }
+}
+
+function resetCircuitBackoff() {
+  if (_redisBackoffLevel > 0) {
+    _redisBackoffLevel = 0;
+    console.log('[REDIS] ✅ Redis success — backoff level reset to 0.');
   }
 }
 
@@ -149,7 +165,9 @@ const safeRedis = new Proxy(redis, {
       }
 
       try {
-        return await originalValue.apply(target, args);
+        const result = await originalValue.apply(target, args);
+        resetCircuitBackoff(); // Success — reset backoff level
+        return result;
       } catch (err) {
         tripCircuitBreaker(err);
         return fallbackValue;

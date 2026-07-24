@@ -8,8 +8,6 @@ const { getChapaTransferStatus } = require('../models/Chapa');
 const { sendWithdrawalSMS } = require('../utils/sms');
 
 async function verifyPendingPayouts() {
-  console.log('[CRON] Verifying pending withdrawal payouts...');
-  
   try {
     // Find all PENDING WITHDRAW_REQUESTs older than 10 seconds (give Chapa time to process)
     // FOR UPDATE SKIP LOCKED prevents double-refund if two cron workers run concurrently
@@ -26,8 +24,7 @@ async function verifyPendingPayouts() {
     `);
 
     if (pendingTxs.length === 0) {
-      console.log('[CRON] No pending payouts to verify.');
-      return;
+      return; // Silent — no spam
     }
 
     console.log(`[CRON] Checking ${pendingTxs.length} pending payout(s)...`);

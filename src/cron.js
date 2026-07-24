@@ -34,6 +34,11 @@ function initCron() {
                     updated_at = NOW()
                 WHERE user_id = $2
               `, [betAmount, game.player_x]);
+              await client.query(`
+                INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+                VALUES ($1, 'REFUND', $2, 'COMPLETED', 'GHOST_CLEANUP', $3, $4)
+                ON CONFLICT (user_id, idempotency_key) DO NOTHING
+              `, [game.player_x, betAmount, JSON.stringify({ gameId: game.id, reason: 'Ghost game cleanup' }), `GHOST_REFUND_${game.id}_X`]);
             }
             if (game.player_o) {
               await client.query(`
@@ -43,9 +48,15 @@ function initCron() {
                     updated_at = NOW()
                 WHERE user_id = $2
               `, [betAmount, game.player_o]);
+              await client.query(`
+                INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+                VALUES ($1, 'REFUND', $2, 'COMPLETED', 'GHOST_CLEANUP', $3, $4)
+                ON CONFLICT (user_id, idempotency_key) DO NOTHING
+              `, [game.player_o, betAmount, JSON.stringify({ gameId: game.id, reason: 'Ghost game cleanup' }), `GHOST_REFUND_${game.id}_O`]);
             }
           }
         }
+
         
         if (stuckGames.length > 0) {
           console.log(`[CRON] Cleaned up & refunded ${stuckGames.length} stuck games.`);
@@ -96,9 +107,8 @@ function initCron() {
      }
   });
 
-  // 4) 💳 Verify Pending Payouts (Runs every 30 seconds for fast processing)
-  // Checks Chapa transfer status and auto-completes/refunds instantly
-  cron.schedule('*/1 * * * *', async () => {
+  // 4) 💳 Verify Pending Payouts (Runs every 2 minutes — reduced from 30s to avoid Redis rate-limiting)
+  cron.schedule('*/2 * * * *', async () => {
     try {
       await verifyPendingPayouts();
     } catch (err) {
@@ -106,18 +116,9 @@ function initCron() {
     }
   });
 
-  // Run payouts verification every 30 seconds (node-cron doesn't support sub-minute, so use setInterval)
-  setInterval(async () => {
-    try {
-      await verifyPendingPayouts();
-    } catch (err) {
-      console.error('[CRON] Fast payout check error:', err.message);
-    }
-  }, 30_000);
-
-  // 5) 💰 Verify Pending Deposits (Runs every 90 seconds — secondary safety net)
+  // 5) 💰 Verify Pending Deposits (Runs every 5 minutes — secondary safety net)
   // Checks Chapa payment status for deposits that missed the webhook
-  cron.schedule('*/2 * * * *', async () => {
+  cron.schedule('*/5 * * * *', async () => {
     try {
       await verifyPendingDeposits();
     } catch (err) {

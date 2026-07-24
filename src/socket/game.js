@@ -131,6 +131,46 @@ const queueTimers = new Map();        // socket.id -> timeoutId
 const activeGames = new Map();        // matchId -> game
 const socketSearching = new Map();    // socket.id -> queueKey
 
+// ── IN-MEMORY FALLBACK QUEUE (used when Redis circuit breaker is open) ──────
+// Mirrors Redis queue operations so matchmaking works even during Redis outages.
+const memoryQueues = new Map();       // queueKey -> Array<entry>
+
+function memQueuePush(queueKey, entry) {
+  if (!memoryQueues.has(queueKey)) memoryQueues.set(queueKey, []);
+  memoryQueues.get(queueKey).push(entry);
+}
+function memQueueLen(queueKey) {
+  return (memoryQueues.get(queueKey) || []).length;
+}
+function memQueuePopPair(queueKey) {
+  const q = memoryQueues.get(queueKey);
+  if (!q || q.length < 2) return null;
+  const p1 = q.shift();
+  const p2 = q.shift();
+  return [p1, p2];
+}
+function memQueueRemoveUser(queueKey, userId) {
+  const q = memoryQueues.get(queueKey);
+  if (!q) return;
+  const idx = q.findIndex(e => e.userId === userId);
+  if (idx !== -1) q.splice(idx, 1);
+}
+function memQueuePurgeUser(userId) {
+  for (const [key, q] of memoryQueues) {
+    for (let i = q.length - 1; i >= 0; i--) {
+      if (q[i].userId === userId) q.splice(i, 1);
+    }
+  }
+}
+function memQueuePutBack(queueKey, entry) {
+  if (!memoryQueues.has(queueKey)) memoryQueues.set(queueKey, []);
+  memoryQueues.get(queueKey).unshift(entry); // put at front
+}
+function isRedisUp() {
+  // Check if safeRedis proxy indicates Redis is available
+  return typeof redis.isAvailable === 'function' ? redis.isAvailable() : true;
+}
+
 const BOARD_SIZE = 9;
 const INITIAL_BOARD = Array(BOARD_SIZE).fill("_");
 const WINNING_COMBINATIONS = [
@@ -489,9 +529,11 @@ async function removeAllOccurrencesFromQueue(queueKey, userId) {
   return removed;
 }
 async function purgeUserFromAllQueues(userId) {
+  memQueuePurgeUser(userId);
   const keys = await redis.smembers(MM_QUEUES_SET).catch(() => []);
-  if (!keys?.length) return;
-  await Promise.all(keys.map(k => removeAllOccurrencesFromQueue(k, userId)));
+  if (keys?.length) {
+    await Promise.all(keys.map(k => removeAllOccurrencesFromQueue(k, userId)));
+  }
 }
 async function lpopN(key, n) {
   if (typeof redis.lpop === "function" && redis.lpop.length >= 2) {
@@ -1116,6 +1158,117 @@ function setupGameSocket(io) {
     }
   }, 3000);
 
+  // ── IN-MEMORY FALLBACK QUEUE SCANNER (runs every 3 seconds) ─────────────────
+  // When Redis is rate-limited, the Redis-based scanner finds nothing because
+  // lpush/lrange return fallback values. This scanner checks the in-memory queues
+  // and creates matches using the same logic.
+  setInterval(async () => {
+    try {
+      for (const [queueKey, queue] of memoryQueues) {
+        if (queue.length < 2) continue;
+
+        const betAmount = Number(queueKey.split(':')[1]);
+        if (!Number.isFinite(betAmount) || betAmount <= 0) continue;
+
+        const roomNumber = determineRoomByBetAmount(betAmount);
+        const timerDuration = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
+
+        // Try to match pairs from the memory queue
+        while (memQueueLen(queueKey) >= 2) {
+          const pair = memQueuePopPair(queueKey);
+          if (!pair) break;
+
+          let [p1, p2] = pair;
+          const now = Date.now();
+
+          // Skip stale entries
+          if (now - p1.joinedAt > QUEUE_TTL) continue;
+          if (now - p2.joinedAt > QUEUE_TTL) { memQueuePutBack(queueKey, p1); continue; }
+
+          // Skip same user
+          if (p1.userId === p2.userId) {
+            memQueuePutBack(queueKey, p2);
+            continue;
+          }
+
+          // Validate sockets
+          let s1 = resolveActiveSocket(io, p1.userId, p1.socketId);
+          let s2 = resolveActiveSocket(io, p2.userId, p2.socketId);
+          if (!s1 || !s2) {
+            if (s1) { p1.socketId = s1.id; memQueuePutBack(queueKey, p1); }
+            if (s2) { p2.socketId = s2.id; memQueuePutBack(queueKey, p2); }
+            continue;
+          }
+          p1.socketId = s1.id;
+          p2.socketId = s2.id;
+
+          // Try to start the match
+          const matchId = uuidv4();
+          try {
+            await lockAndStartMatch(matchId, p1.userId, p2.userId, betAmount);
+          } catch (e) {
+            // Check balances and re-queue eligible players
+            let p1Bal = 0, p2Bal = 0;
+            try {
+              const balRes = await pool.query(`SELECT user_id, (available_balance + COALESCE(bonus_balance, 0)) as balance FROM wallets WHERE user_id = ANY($1::uuid[])`, [[p1.userId, p2.userId]]);
+              for (const row of balRes.rows) { if (row.user_id === p1.userId) p1Bal = Number(row.balance); if (row.user_id === p2.userId) p2Bal = Number(row.balance); }
+            } catch {}
+            if (p1Bal < betAmount) { s1.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." }); } else { memQueuePutBack(queueKey, p1); }
+            if (p2Bal < betAmount) { s2.emit("error", { code: "INSUFFICIENT_BALANCE", message: "Insufficient balance." }); } else { memQueuePutBack(queueKey, p2); }
+            continue;
+          }
+
+          // Match successful — clean up both queues
+          memQueuePurgeUser(p1.userId);
+          memQueuePurgeUser(p2.userId);
+          purgeUserFromAllQueues(p1.userId).catch(() => {});
+          purgeUserFromAllQueues(p2.userId).catch(() => {});
+
+          const players = { X: p1.userId, O: p2.userId };
+          const sockets = { X: s1, O: s2 };
+          const initialTimer = timerDuration;
+
+          const game = {
+            id: matchId, board: Array(9).fill("_"), turn: "X", players, sockets,
+            timers: { X: initialTimer, O: initialTimer }, betAmount,
+            room: roomNumber, rangeX: `${p1.betMin}-${p1.betMax}`, rangeO: `${p2.betMin}-${p2.betMax}`,
+            timerInterval: null, reconnectTimeout: null, startTimeout: null, status: "countdown", round: 1,
+          };
+          activeGames.set(matchId, game);
+
+          if (sockets.X) sockets.X.data = { matchId, userId: players.X, symbol: "X" };
+          if (sockets.O) sockets.O.data = { matchId, userId: players.O, symbol: "O" };
+          io.in(userRoom(players.X)).socketsJoin(matchId);
+          io.in(userRoom(players.O)).socketsJoin(matchId);
+          socketSearching.delete(p1.socketId);
+          socketSearching.delete(p2.socketId);
+          clearQueueTimeout(p1.socketId);
+          clearQueueTimeout(p2.socketId);
+          sockets.X.emit("queue_status", { searching: false });
+          sockets.O.emit("queue_status", { searching: false });
+
+          await redis.set(`in_game:${players.X}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+          await redis.set(`in_game:${players.O}`, matchId, "PX", IN_GAME_TTL_MS).catch(() => { });
+
+          const nameRes = await pool.query(`SELECT id, COALESCE(display_name, username, number::text) AS display_name FROM users WHERE id = ANY($1::uuid[])`, [[players.X, players.O]]).catch(() => ({ rows: [] }));
+          const nameMap = new Map(nameRes.rows.map(r => [String(r.id), r.display_name]));
+          const nameX = nameMap.get(String(players.X)) || p1.username || players.X.slice(0, 8);
+          const nameO = nameMap.get(String(players.O)) || p2.username || players.O.slice(0, 8);
+
+          const payloadX = { matchId, youAre: "X", symbol: "X", opponentId: players.O, opponentUsername: nameO, opponentSymbol: "O", players, betAmount: Number(betAmount), room: roomNumber, roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null, timerDuration: initialTimer, houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null };
+          const payloadO = { matchId, youAre: "O", symbol: "O", opponentId: players.X, opponentUsername: nameX, opponentSymbol: "X", players, betAmount: Number(betAmount), room: roomNumber, roomName: roomNumber ? ROOMS_CONFIG[roomNumber].name : null, timerDuration: initialTimer, houseCutPercent: roomNumber ? ROOMS_CONFIG[roomNumber].houseCutPercent : null };
+
+          logAlways(`MEM SCANNER MATCHED`, { matchId, X: players.X, O: players.O, bet: betAmount, queue: queueKey });
+          emitToUser(io, players.X, "match_found", payloadX);
+          emitToUser(io, players.O, "match_found", payloadO);
+          scheduleGameStart(io, matchId);
+        }
+      }
+    } catch (err) {
+      // Silent — memory scanner should not crash the server
+    }
+  }, 3000);
+
   // Background interval for simulated/fake wins ticker (runs once globally)
   setInterval(async () => {
     try {
@@ -1355,6 +1508,7 @@ function setupGameSocket(io) {
         // remove stale entry (this queue)
         const removed = await removeFromQueue(queueKey, userId);
         if (removed) dbg(ctx, "removed stale entry in this queue");
+        memQueueRemoveUser(queueKey, userId); // also clean memory queue
 
         // enqueue
         const entry = {
@@ -1371,6 +1525,8 @@ function setupGameSocket(io) {
           timerDuration: timerDuration
         };
         await redis.rpush(queueKey, JSON.stringify(entry));
+        // Always push to in-memory queue as well (critical fallback when Redis is down)
+        memQueuePush(queueKey, entry);
         socketSearching.set(socket.id, queueKey);
         startQueueTimeout(socket, queueKey, userId);
         socket.emit("queue_status", {

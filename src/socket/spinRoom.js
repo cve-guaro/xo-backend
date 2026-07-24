@@ -487,6 +487,23 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
 function setupSpinSocket(io) {
   console.log(`${LOG_PREFIX} Spin socket handlers registered.`);
 
+  // Background sweeper for stuck spin rounds (runs every 60s)
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, round] of activeSpinRounds.entries()) {
+      const ageMs = now - new Date(round.createdAt).getTime();
+      // If round is completed/paid/resolved or stuck in locked/spinning for > 2 minutes, clean up
+      if ((round.status === "paid" || round.status === "resolved" || round.status === "cancelled") && ageMs > 15_000) {
+        cleanupRound(round);
+      } else if ((round.status === "locked" || round.status === "spinning") && ageMs > 120_000) {
+        console.warn(`${LOG_PREFIX} Force cleaning stuck round=${id} status=${round.status}`);
+        cleanupRound(round);
+      } else if (round.status === "waiting" && round.players.length === 0 && ageMs > 300_000) {
+        cleanupRound(round);
+      }
+    }
+  }, 60_000);
+
   io.on("connection", (socket) => {
     // ── spin:join ──────────────────────────────────────────────────────
     socket.on("spin:join", async (data, ack) => {
@@ -781,16 +798,23 @@ function setupSpinSocket(io) {
 
         const player = round.players[playerIdx];
 
-        // Refund if leaving before spin starts (waiting or pre_countdown)
-        if (round.status === "waiting" || round.status === "pre_countdown") {
-          await refundWager({
-            userId,
-            amount: player.stake,
-            bonusUsed: player.bonusUsed || 0,
-            roundId: round.id,
-            isBot: false,
-          }).catch(err => console.error(`${LOG_PREFIX} Refund on leave error:`, err.message));
+        // If round is already locked, spinning, resolved, or paid: do not splice players array or refund,
+        // because outcome and winning slice index are already fixed. Just detach user.
+        if (round.status !== "waiting" && round.status !== "pre_countdown") {
+          playerToRound.delete(userId);
+          socket.leave(`spin:${round.id}`);
+          console.log(`${LOG_PREFIX} User ${userId} detached from in-progress/completed round ${round.id} (status: ${round.status})`);
+          return ack?.({ ok: true });
         }
+
+        // Refund if leaving while waiting
+        await refundWager({
+          userId,
+          amount: player.stake,
+          bonusUsed: player.bonusUsed || 0,
+          roundId: round.id,
+          isBot: false,
+        }).catch(err => console.error(`${LOG_PREFIX} Refund on leave error:`, err.message));
 
         // Remove from round
         round.players.splice(playerIdx, 1);

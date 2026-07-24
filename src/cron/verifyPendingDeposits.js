@@ -9,8 +9,6 @@ const { verifyTx } = require('../models/Chapa');
 const { completeDeposit } = require('../models/payments.service');
 
 async function verifyPendingDeposits() {
-  console.log('[CRON] Verifying pending deposit payments...');
-  
   try {
     // 1) Auto-expire deposits older than 1 hour — user never completed checkout (clicked X or abandoned)
     const { rowCount: expiredCount } = await pool.query(`
