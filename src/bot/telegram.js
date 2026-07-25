@@ -61,17 +61,32 @@ function initTelegramBot() {
   }
 
   bot = new TelegramBot(BOT_TOKEN, {
-    polling: true,
+    polling: {
+      autoStart: true,
+      params: { timeout: 10 },
+    },
     request: proxyUrl ? requestOptions : undefined
   });
+
+  // Clear any existing WebHook to avoid conflict
+  bot.deleteWebHook().catch(() => {});
 
   // Log all incoming messages for debugging
   bot.on('message', (msg) => {
     console.log(`[TELEGRAM] Raw message received: chat=${msg.chat.id}, text="${msg.text || ''}"`);
   });
 
-  // Swallow polling errors to prevent server crash
+  let lastConflictLog = 0;
+  // Swallow polling errors to prevent server crash (throttles 409 multi-instance logs)
   bot.on('polling_error', (err) => {
+    if (err.message && err.message.includes('409 Conflict')) {
+      const now = Date.now();
+      if (now - lastConflictLog > 60000) { // Log at most once per minute
+        lastConflictLog = now;
+        console.warn('[TELEGRAM] 409 Conflict: Another bot instance or old Railway container is polling. Active instance will auto-recover once previous container stops.');
+      }
+      return;
+    }
     console.error('[TELEGRAM] Polling error (non-fatal):', err.message);
   });
 
