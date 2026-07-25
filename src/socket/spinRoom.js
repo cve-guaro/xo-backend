@@ -395,7 +395,10 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
     throw new Error("ROUND_NOT_WAITING");
   }
   if (round.players.some(p => p.userId === userId)) {
-    throw new Error("ALREADY_IN_ROUND");
+    // Already seated — return their seat (idempotent, prevents race condition crashes)
+    const existing = round.players.find(p => p.userId === userId);
+    console.log(`${LOG_PREFIX} Player ${username} already in round=${round.id} seat=${existing.seatIndex} (idempotent)`);
+    return { seatIndex: existing.seatIndex, alreadySeated: true };
   }
 
   // If room is full but a real player is joining, evict a bot to make room
