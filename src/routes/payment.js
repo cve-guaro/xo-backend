@@ -63,7 +63,7 @@ router.get('/methods', auth, async (req, res) => {
     return res.status(500).json({ detail: "failed to return payment methods" });
   }
 });
-// Chapa Return Page — After payment completes, redirect to home page
+// Chapa Return Page — After payment completes, show receipt & auto-redirect in 2 seconds
 router.get('/chapa-return', async (req, res) => {
   const { tx_ref, status } = req.query;
   if (process.env.NODE_ENV !== 'production' && tx_ref && status === 'success') {
@@ -77,7 +77,30 @@ router.get('/chapa-return', async (req, res) => {
   const homeUrl = process.env.NODE_ENV === 'production'
     ? 'https://xoethiopia.com/home/gameplay'
     : 'http://localhost:8081/home/gameplay';
-  res.redirect(homeUrl);
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <meta http-equiv="refresh" content="2; url=${homeUrl}">
+      <title>Payment Successful — Redirecting...</title>
+    </head>
+    <body style="background: #060814; color: #fff; font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+      <div style="text-align: center; background: rgba(255,255,255,0.05); padding: 32px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); max-width: 360px;">
+         <div style="font-size: 48px; margin-bottom: 12px;">✅</div>
+         <p style="font-weight: bold; font-size: 18px; margin: 0 0 8px 0; color: #22c55e;">Payment Received!</p>
+         <p style="font-size: 13px; color: #888; margin: 0 0 16px 0;">Returning to XO ET in 2 seconds...</p>
+         <a href="${homeUrl}" style="display: inline-block; background: #06b6d4; color: #fff; text-decoration: none; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: bold;">Return Now</a>
+      </div>
+      <script>
+         setTimeout(function() {
+            window.location.href = "${homeUrl}";
+         }, 2000);
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 // Intermediate Bounce Page for Telegram/WebView CSRF Fix
