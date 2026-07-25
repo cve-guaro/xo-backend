@@ -505,6 +505,10 @@ async function runMigrations() {
       ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb;
     `);
 
+    // ── IP Tracking (idempotent, runs every startup) ──
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip TEXT;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;`);
+
     // Check if migrations already completed (skip on subsequent deploys)
     const guardRes = await pool.query(
       `SELECT value FROM global_settings WHERE key = 'migrations_v3_completed'`

@@ -88,8 +88,9 @@ function initTelegramBot() {
           '❌ ጊዜው ያለፈበት ሊንክ ነው።\n\nLink expired. Please go back to XO ET and try again.');
       }
 
-      // Store which chat is linked to this session
+      // Store which chat is linked to this session (forward + reverse lookup)
       await redis.set(`tg_login:${sessionToken}:chat`, String(chatId), 'EX', SESSION_TTL);
+      await redis.set(`tg_chat_session:${chatId}`, sessionToken, 'EX', SESSION_TTL);
 
       // Show the special "Share Phone Number" keyboard button
       await bot.sendMessage(chatId,
@@ -131,17 +132,12 @@ function initTelegramBot() {
   // ── Helper to process phone login for both contact & text messages ────────
   async function processPhoneLogin(chatId, phone, msg) {
     try {
-      // Find which login session belongs to this chat
-      const allKeys = await redis.keys('tg_login:*:chat');
+      // Direct reverse lookup — we stored chatId→sessionToken in /start handler
       let sessionToken = null;
-
-      for (const key of allKeys) {
-        const storedChatId = await redis.get(key);
-        if (storedChatId === String(chatId)) {
-          const parts = key.split(':');
-          sessionToken = parts[1];
-          break;
-        }
+      try {
+        sessionToken = await redis.get(`tg_chat_session:${chatId}`);
+      } catch (redisErr) {
+        console.warn('[TELEGRAM] Redis get chat session failed:', redisErr.message);
       }
 
       if (!sessionToken) {
@@ -257,8 +253,9 @@ function initTelegramBot() {
         console.warn('[TELEGRAM] Redis set completed login failed, using memory fallback:', err.message);
       }
 
-      // Clean up the chat mapping
+      // Clean up the chat mapping (both directions)
       await redis.del(`tg_login:${sessionToken}:chat`).catch(() => {});
+      await redis.del(`tg_chat_session:${chatId}`).catch(() => {});
 
       console.log(`[TELEGRAM] Login completed: user=${user.id} phone=${normalizedPhone} isNew=${isNewUser}`);
 

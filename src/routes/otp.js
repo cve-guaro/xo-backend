@@ -390,6 +390,13 @@ router.post('/verify-otp', async (req, res) => {
 
     console.log('[VERIFY_OTP] Tokens generated successfully');
 
+    // ── Record login IP (fire-and-forget) ──
+    const loginIp = (req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+    pool.query(
+      `UPDATE users SET last_login_ip = $1, last_login_at = NOW() WHERE id = $2`,
+      [loginIp, result.user.id]
+    ).catch(err => console.warn('[IP_TRACK] Failed to record login IP:', err.message));
+
      // ---- FIRE-AND-FORGET: Apply bonuses AFTER login succeeds ----
      if (result.isNewUser) {
        const bonusUserId = result.user.id;
@@ -457,6 +464,13 @@ router.post('/verify-otp', async (req, res) => {
                            `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
                            [referrerId, bonusAmount, `Referral bonus (invited user ${bonusUserId.slice(0,8)})`]
                          );
+
+                         // Audit trail: record in wallet_transactions for reconciliation
+                         await client.query(`
+                           INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+                           VALUES ($1, 'GIFT', $2, 'COMPLETED', 'REFERRAL', $3, $4)
+                           ON CONFLICT (user_id, idempotency_key) DO NOTHING
+                         `, [referrerId, bonusAmount, JSON.stringify({ referredUserId: bonusUserId }), `REFERRAL_BONUS_${referrerId}_${bonusUserId}`]);
 
                          console.log(`[REFERRAL] Credited ${bonusAmount} ETB to referrer ${referrerId} for new user ${bonusUserId}`);
                        }
@@ -529,6 +543,13 @@ router.post('/verify-otp', async (req, res) => {
                      await client.query(`
                        INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)
                      `, [bonusUserId, promoAmount, `Promotion bonus: ${promo.name} (${promo.code})`]);
+
+                     // Audit trail: record in wallet_transactions for reconciliation
+                     await client.query(`
+                       INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+                       VALUES ($1, 'GIFT', $2, 'COMPLETED', 'PROMO_LINK', $3, $4)
+                       ON CONFLICT (user_id, idempotency_key) DO NOTHING
+                     `, [bonusUserId, promoAmount, JSON.stringify({ promoCode: promo.code, promoName: promo.name }), `PROMO_LINK_${bonusUserId}_${promo.id}`]);
 
                      console.log(`[PROMO] Credited ${promoAmount} ETB to new user ${bonusUserId} via promotion ${promo.code}`);
                    }
