@@ -20,8 +20,13 @@ function platformDetection(req, res, next) {
     // If the request comes from a known web origin, treat as web.
     const origin  = (req.headers.origin || '').toLowerCase();
     const referer = (req.headers.referer || '').toLowerCase();
+    const userAgent = (req.headers['user-agent'] || '').toLowerCase();
 
-    const isFromWeb = WEB_ORIGINS.some(o => origin.includes(o) || referer.includes(o));
+    const isFromWeb = WEB_ORIGINS.some(o => origin.includes(o) || referer.includes(o)) ||
+                      origin.includes('vercel.app') || referer.includes('vercel.app') ||
+                      origin.includes('railway.app') || referer.includes('railway.app') ||
+                      origin.includes('localhost') || referer.includes('localhost') ||
+                      userAgent.includes('mozilla') || userAgent.includes('chrome') || userAgent.includes('safari') || userAgent.includes('webkit');
 
     // Also check: requests with no origin AND no x-platform are server-to-server
     // (webhooks, cron, etc.) — let them through as web to avoid blocking
