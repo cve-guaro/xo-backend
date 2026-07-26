@@ -667,10 +667,21 @@ function setupSpinSocket(io) {
               const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
               const spin5pEntry = Number(spin5pEntryStr || 100);
 
+              // Bot timing per user spec:
+              // Bot 1: 60-50s left (~5-10s after room creation)
+              // Bot 2: ~30s left (~30s after room creation)
+              // Bot 3: 10-0s left (~48-53s after room creation)
+              const botDelays = [
+                5000 + Math.random() * 5000,    // 5-10s (60-50s window)
+                28000 + Math.random() * 4000,   // 28-32s (~30s window)
+                48000 + Math.random() * 5000,   // 48-53s (10-0s window)
+              ];
+
               round.botCancelFn = scheduleBotFill({
-                maxBots: 4,
+                maxBots: 3,
                 currentPlayerCount: round.players.length,
                 maxPlayers: round.maxPlayers,
+                staggerDelaysMs: botDelays,
                 onBotJoin: async (bot) => {
                   if (round.status !== "waiting" || round.players.length >= round.maxPlayers) return;
                   try {
@@ -685,8 +696,6 @@ function setupSpinSocket(io) {
                     console.error(`${LOG_PREFIX} 5-Player Bot join failed:`, err.message);
                   }
                 },
-                minDelayMs: 6000,
-                maxDelayMs: 12000,
               });
             }
           }

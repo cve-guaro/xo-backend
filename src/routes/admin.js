@@ -168,7 +168,7 @@ router.get('/reconcile', async (req, res) => {
           user_id,
           SUM(
             CASE 
-              WHEN tx_type IN ('DEPOSIT', 'PRIZE', 'GIFT', 'REFUND') AND status IN ('COMPLETED', 'success') THEN amount
+              WHEN tx_type IN ('DEPOSIT', 'PRIZE', 'GIFT', 'REFUND', 'BONUS') AND status IN ('COMPLETED', 'success') THEN amount
               WHEN tx_type IN ('WITHDRAW_REQUEST', 'WITHDRAW_SETTLED', 'STAKE') AND status IN ('COMPLETED', 'success', 'PENDING', 'PENDING_MANUAL') THEN -amount
               ELSE 0
             END
@@ -176,22 +176,91 @@ router.get('/reconcile', async (req, res) => {
         FROM wallet_transactions
         GROUP BY user_id
       ),
+      -- Legacy bonus_logs that predate wallet_transactions audit trail.
+      -- These modified available_balance + bonus_balance but never created
+      -- wallet_transactions entries (referral bonuses, promo link bonuses,
+      -- giveaway v-claims, admin adjustments from before the fix).
+      -- We sum ALL bonus_logs and subtract any that ARE already tracked in
+      -- wallet_transactions (giveaway promocodes, leaderboard prizes) to avoid
+      -- double-counting.
+      bonus_gap AS (
+        SELECT
+          bl.user_id,
+          COALESCE(SUM(bl.amount), 0) AS total_bonus_logs
+        FROM bonus_logs bl
+        GROUP BY bl.user_id
+      ),
+      bonus_already_in_ledger AS (
+        SELECT
+          user_id,
+          COALESCE(SUM(amount), 0) AS amount
+        FROM wallet_transactions
+        WHERE tx_type IN ('GIFT', 'PRIZE', 'BONUS')
+          AND status IN ('COMPLETED', 'success')
+          AND provider IN ('REFERRAL', 'PROMO_LINK', 'GIVEAWAY_CLAIM', 'GIVEAWAY', 'LEADERBOARD_PRIZE', 'GHOST_CLEANUP')
+        GROUP BY user_id
+      ),
+      -- Ghost game refunds that predate the audit trail fix:
+      -- Games completed with no winner (ghost cleanup) where no REFUND
+      -- wallet_transaction exists yet.
+      ghost_refund_gap AS (
+        SELECT
+          player_id AS user_id,
+          SUM(bet_amount) AS total_ghost_refunds
+        FROM (
+          SELECT player_x AS player_id, bet_amount FROM games
+          WHERE status = 'completed' AND winner IS NULL AND finished_at IS NOT NULL
+            AND player_x IS NOT NULL AND bet_amount > 0
+          UNION ALL
+          SELECT player_o AS player_id, bet_amount FROM games
+          WHERE status = 'completed' AND winner IS NULL AND finished_at IS NOT NULL
+            AND player_o IS NOT NULL AND bet_amount > 0
+        ) ghost_games
+        GROUP BY player_id
+      ),
+      ghost_already_in_ledger AS (
+        SELECT
+          user_id,
+          COALESCE(SUM(amount), 0) AS amount
+        FROM wallet_transactions
+        WHERE tx_type = 'REFUND'
+          AND status IN ('COMPLETED', 'success')
+          AND provider = 'GHOST_CLEANUP'
+        GROUP BY user_id
+      ),
+      -- available_balance is the total playable balance.
+      -- bonus_balance and withdrawable_balance are subsets/trackers, NOT additive.
       wallets_live AS (
         SELECT 
           user_id,
-          (COALESCE(available_balance, 0) + COALESCE(withdrawable_balance, 0) + COALESCE(bonus_balance, 0)) AS current_total_balance
+          COALESCE(available_balance, 0) AS current_total_balance
         FROM wallets
       )
       SELECT 
         w.user_id,
         u.phone_number,
-        COALESCE(l.calculated_net_balance, 0) AS derived_history_balance,
+        COALESCE(l.calculated_net_balance, 0)
+          + (COALESCE(bg.total_bonus_logs, 0) - COALESCE(bal.amount, 0))
+          + (COALESCE(gr.total_ghost_refunds, 0) - COALESCE(gal.amount, 0))
+          AS derived_history_balance,
         w.current_total_balance AS live_wallet_balance,
-        (w.current_total_balance - COALESCE(l.calculated_net_balance, 0)) AS discrepancy
+        w.current_total_balance - (
+          COALESCE(l.calculated_net_balance, 0)
+          + (COALESCE(bg.total_bonus_logs, 0) - COALESCE(bal.amount, 0))
+          + (COALESCE(gr.total_ghost_refunds, 0) - COALESCE(gal.amount, 0))
+        ) AS discrepancy
       FROM wallets_live w
       LEFT JOIN ledger l ON w.user_id = l.user_id
+      LEFT JOIN bonus_gap bg ON w.user_id = bg.user_id
+      LEFT JOIN bonus_already_in_ledger bal ON w.user_id = bal.user_id
+      LEFT JOIN ghost_refund_gap gr ON w.user_id = gr.user_id
+      LEFT JOIN ghost_already_in_ledger gal ON w.user_id = gal.user_id
       LEFT JOIN users u ON w.user_id = u.id
-      WHERE (w.current_total_balance - COALESCE(l.calculated_net_balance, 0)) != 0
+      WHERE (w.current_total_balance - (
+          COALESCE(l.calculated_net_balance, 0)
+          + (COALESCE(bg.total_bonus_logs, 0) - COALESCE(bal.amount, 0))
+          + (COALESCE(gr.total_ghost_refunds, 0) - COALESCE(gal.amount, 0))
+        )) != 0
          OR w.current_total_balance < 0;
     `);
 
@@ -999,6 +1068,19 @@ router.patch('/users/:id/balance', superAdminAuth, async (req, res) => {
         [req.params.id, amountCents, `Admin Adjustment (${req.user?.username || 'admin'})`]
       ).catch(err => console.error('[BONUS_LOG] Admin log error:', err));
     }
+
+    // Audit trail: Log transaction in wallet_transactions for reconciliation
+    await pool.query(
+      `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+       VALUES ($1, 'BONUS', $2, 'COMPLETED', 'ADMIN_ADJUSTMENT', $3, $4)
+       ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+      [
+        req.params.id,
+        amountCents,
+        JSON.stringify({ field, adminId: req.user.id, adminUsername: req.user?.username || 'admin' }),
+        `ADMIN_ADJUST_${req.params.id}_${field}_${Date.now()}`
+      ]
+    ).catch(err => console.error('[WALLET_TX] Admin adjustment log error:', err));
 
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     
@@ -2742,57 +2824,77 @@ router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
   try {
     const { snapshotId } = req.params;
 
-    const { rows } = await pool.query(`SELECT * FROM leaderboard_snapshots WHERE id = $1`, [snapshotId]);
-    if (!rows.length) return res.status(404).json({ error: 'Snapshot not found' });
+    const snap = await withTx(async (client) => {
+      // 🔒 Lock snapshot row FOR UPDATE to prevent concurrent double-approvals
+      const { rows } = await client.query(`SELECT * FROM leaderboard_snapshots WHERE id = $1 FOR UPDATE`, [snapshotId]);
+      if (!rows.length) {
+        const err = new Error('Snapshot not found');
+        err.status = 404;
+        throw err;
+      }
 
-    const snap = rows[0];
-    if (snap.prize_status === 'approved') return res.status(400).json({ error: 'Already approved' });
+      const snapshot = rows[0];
+      if (snapshot.prize_status === 'approved') {
+        const err = new Error('Already approved');
+        err.status = 400;
+        throw err;
+      }
+
+      const prizeAmount = Math.round(Number(snapshot.prize_amount));
+
+      // Mark as approved IMMEDIATELY inside the lock
+      await client.query(`UPDATE leaderboard_snapshots SET prize_status = 'approved' WHERE id = $1`, [snapshotId]);
+
+      // Award prize if amount > 0
+      if (prizeAmount > 0) {
+        await client.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snapshot.user_id]);
+        await client.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snapshot.user_id, prizeAmount, `Weekly Leaderboard #${snapshot.rank} Prize`]);
+        
+        // Log transaction in wallet_transactions
+        try {
+          await client.query(
+            `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+             VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+             ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+            [
+              snapshot.user_id,
+              prizeAmount,
+              JSON.stringify({ rank: snapshot.rank, weekStart: snapshot.week_start }),
+              `LEADERBOARD_PRIZE_${snapshot.id}`
+            ]
+          );
+        } catch (txErr) {
+          console.error('[ADMIN APPROVE] wallet_transactions insert failed:', txErr);
+        }
+
+        try {
+          const weekStartMD = formatMonthDay(snapshot.week_start);
+          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snapshot.rank} - Awarded ${prizeAmount} ETB`;
+          await client.query(`
+            UPDATE users
+            SET raw_user_meta_data = jsonb_set(
+              COALESCE(raw_user_meta_data, '{}'::jsonb),
+              '{accomplishments}',
+              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+            )
+            WHERE id = $2
+          `, [accomplishmentStr, snapshot.user_id]);
+        } catch (err) {
+          console.error('[ADMIN APPROVE] accomplishment update failed:', err);
+        }
+      }
+
+      return snapshot;
+    });
 
     const prizeAmount = Math.round(Number(snap.prize_amount));
 
-    // Award prize
+    // Send SMS & Notifications outside the critical DB transaction
     if (prizeAmount > 0) {
-      await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
-      await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
-      
-      // Log transaction in wallet_transactions
-      try {
-        await pool.query(
-          `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-           VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
-           ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
-          [
-            snap.user_id,
-            prizeAmount,
-            JSON.stringify({ rank: snap.rank, weekStart: snap.week_start }),
-            `LEADERBOARD_PRIZE_${snap.id}`
-          ]
-        );
-      } catch (txErr) {
-        console.error('[ADMIN APPROVE] wallet_transactions insert failed:', txErr);
-      }
-      
-      try {
-        const weekStartMD = formatMonthDay(snap.week_start);
-        const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snap.rank} - Awarded ${prizeAmount} ETB`;
-        await pool.query(`
-          UPDATE users
-          SET raw_user_meta_data = jsonb_set(
-            COALESCE(raw_user_meta_data, '{}'::jsonb),
-            '{accomplishments}',
-            (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
-          )
-          WHERE id = $2
-        `, [accomplishmentStr, snap.user_id]);
-      } catch (err) {
-        console.error('[ADMIN APPROVE] accomplishment update failed:', err);
-      }
-
       // Fetch user's phone number for congratulations SMS
       const { rows: userRows } = await pool.query(`SELECT number FROM users WHERE id = $1`, [snap.user_id]);
       if (userRows.length > 0 && userRows[0].number) {
         const phone = userRows[0].number;
-        // Fetch SMS template or use default
         const { rows: smsRes } = await pool.query(`SELECT value FROM global_settings WHERE key = 'leaderboard_sms_template'`);
         const smsTemplate = smsRes.length > 0 ? smsRes[0].value : '🏆 Congratulations {username}! You ranked #{rank} on the XO ET weekly leaderboard and won {prize} ETB! Your prize has been credited. Keep playing!';
         const smsMsg = smsTemplate
@@ -2804,7 +2906,6 @@ router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
       }
     }
 
-    // Send in-app leaderboard award notification
     const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
     await pool.query(`
       INSERT INTO notifications (user_id, type, title, message, meta)
@@ -2822,7 +2923,6 @@ router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
       })
     ]).catch(err => console.error('[ADMIN APPROVE] notification insert failed (non-fatal):', err));
 
-    await pool.query(`UPDATE leaderboard_snapshots SET prize_status = 'approved' WHERE id = $1`, [snapshotId]);
     await logAdminAction(req.user.id, 'approved_leaderboard_prize', snap.user_id, { rank: snap.rank, amount: prizeAmount });
 
     // Emit socket event for real-time update
@@ -2861,57 +2961,70 @@ router.post('/leaderboard/approve-all', async (req, res) => {
 
     const approvedList = [];
 
-    // Process all pending prizes
-    for (const snap of pendingSnaps) {
-      const prizeAmount = Math.round(Number(snap.prize_amount));
-      if (prizeAmount > 0) {
-        // Credit wallet
-        await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snap.user_id]);
-        // Insert bonus log
-        await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snap.user_id, prizeAmount, `Weekly Leaderboard #${snap.rank} Prize`]);
-        
-        // Log transaction in wallet_transactions
-        try {
-          await pool.query(
-            `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-             VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
-             ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
-            [
-              snap.user_id,
-              prizeAmount,
-              JSON.stringify({ rank: snap.rank, weekStart: snap.week_start }),
-              `LEADERBOARD_PRIZE_${snap.id}`
-            ]
-          );
-        } catch (txErr) {
-          console.error('[ADMIN APPROVE ALL] wallet_transactions insert failed:', txErr);
-        }
-        
-        try {
-          const weekStartMD = formatMonthDay(snap.week_start);
-          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snap.rank} - Awarded ${prizeAmount} ETB`;
-          await pool.query(`
-            UPDATE users
-            SET raw_user_meta_data = jsonb_set(
-              COALESCE(raw_user_meta_data, '{}'::jsonb),
-              '{accomplishments}',
-              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
-            )
-            WHERE id = $2
-          `, [accomplishmentStr, snap.user_id]);
-        } catch (err) {
-          console.error('[ADMIN APPROVE ALL] accomplishment update failed:', err);
-        }
-        
-        // Send SMS
-        if (snap.number) {
-          const smsMsg = smsTemplate
-            .replace('{username}', snap.username || '')
-            .replace('{rank}', String(snap.rank))
-            .replace('{prize}', String(prizeAmount));
+    // Process all pending prizes safely with row-level transaction locks
+    for (const snapItem of pendingSnaps) {
+      let isApprovedInTx = false;
+      const prizeAmount = Math.round(Number(snapItem.prize_amount));
+
+      await withTx(async (client) => {
+        // Lock snapshot row FOR UPDATE to verify it hasn't been approved by another concurrent request
+        const { rows } = await client.query(`SELECT prize_status FROM leaderboard_snapshots WHERE id = $1 FOR UPDATE`, [snapItem.id]);
+        if (!rows.length || rows[0].prize_status === 'approved') return;
+
+        // Mark snapshot as approved IMMEDIATELY inside the transaction lock
+        await client.query(`UPDATE leaderboard_snapshots SET prize_status = 'approved' WHERE id = $1`, [snapItem.id]);
+        isApprovedInTx = true;
+
+        if (prizeAmount > 0) {
+          // Credit wallet
+          await client.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snapItem.user_id]);
+          // Insert bonus log
+          await client.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snapItem.user_id, prizeAmount, `Weekly Leaderboard #${snapItem.rank} Prize`]);
           
-          await sendSMS(snap.number, smsMsg).catch(e => console.error('[ADMIN APPROVE-ALL SMS ERROR]', e.message));
+          // Log transaction in wallet_transactions
+          try {
+            await client.query(
+              `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+               VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
+               ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
+              [
+                snapItem.user_id,
+                prizeAmount,
+                JSON.stringify({ rank: snapItem.rank, weekStart: snapItem.week_start }),
+                `LEADERBOARD_PRIZE_${snapItem.id}`
+              ]
+            );
+          } catch (txErr) {
+            console.error('[ADMIN APPROVE ALL] wallet_transactions insert failed:', txErr);
+          }
+          
+          try {
+            const weekStartMD = formatMonthDay(snapItem.week_start);
+            const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snapItem.rank} - Awarded ${prizeAmount} ETB`;
+            await client.query(`
+              UPDATE users
+              SET raw_user_meta_data = jsonb_set(
+                COALESCE(raw_user_meta_data, '{}'::jsonb),
+                '{accomplishments}',
+                (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+              )
+              WHERE id = $2
+            `, [accomplishmentStr, snapItem.user_id]);
+          } catch (err) {
+            console.error('[ADMIN APPROVE ALL] accomplishment update failed:', err);
+          }
         }
+      });
+
+      if (!isApprovedInTx) continue; // Skip SMS/Notifs if another concurrent request already approved this item
+
+      if (prizeAmount > 0 && snapItem.number) {
+        const smsMsg = smsTemplate
+          .replace('{username}', snapItem.username || '')
+          .replace('{rank}', String(snapItem.rank))
+          .replace('{prize}', String(prizeAmount));
+        
+        await sendSMS(snapItem.number, smsMsg).catch(e => console.error('[ADMIN APPROVE-ALL SMS ERROR]', e.message));
       }
 
       // Send in-app leaderboard award notification
@@ -2920,28 +3033,26 @@ router.post('/leaderboard/approve-all', async (req, res) => {
         INSERT INTO notifications (user_id, type, title, message, meta)
         VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
       `, [
-        snap.user_id,
-        rankLabels[snap.rank - 1] || `#${snap.rank} Weekly Award`,
-        `🏆 Congratulations! You ranked #${snap.rank} on this week's leaderboard with ${snap.wins} wins and earned ${Math.round(Number(snap.prize_amount))} ETB! The prize has been added to your balance.`,
+        snapItem.user_id,
+        rankLabels[snapItem.rank - 1] || `#${snapItem.rank} Weekly Award`,
+        `🏆 Congratulations! You ranked #${snapItem.rank} on this week's leaderboard with ${snapItem.wins} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`,
         JSON.stringify({
-          rank: snap.rank,
-          prize: Math.round(Number(snap.prize_amount)),
-          wins: Number(snap.wins),
-          weekStart: snap.week_start,
-          weekEnd: snap.week_end
+          rank: snapItem.rank,
+          prize: prizeAmount,
+          wins: Number(snapItem.wins),
+          weekStart: snapItem.week_start,
+          weekEnd: snapItem.week_end
         })
       ]).catch(err => console.error('[ADMIN APPROVE-ALL] notification insert failed (non-fatal):', err));
 
-      // Mark snapshot as approved
-      await pool.query(`UPDATE leaderboard_snapshots SET prize_status = 'approved' WHERE id = $1`, [snap.id]);
-      await logAdminAction(req.user.id, 'approved_leaderboard_prize', snap.user_id, { rank: snap.rank, amount: prizeAmount, bulk: true });
+      await logAdminAction(req.user.id, 'approved_leaderboard_prize', snapItem.user_id, { rank: snapItem.rank, amount: prizeAmount, bulk: true });
 
       // Emit socket event for real-time update
       try {
-        emitToUserEvent(snap.user_id, 'balance_update', {});
-        emitToUserEvent(snap.user_id, 'info', {
-          title: rankLabels[snap.rank - 1] || `#${snap.rank} Weekly Award`,
-          message: `🏆 Congratulations! You ranked #${snap.rank} on this week's leaderboard with ${snap.wins} wins and earned ${Math.round(Number(snap.prize_amount))} ETB! The prize has been added to your balance.`
+        emitToUserEvent(snapItem.user_id, 'balance_update', {});
+        emitToUserEvent(snapItem.user_id, 'info', {
+          title: rankLabels[snapItem.rank - 1] || `#${snapItem.rank} Weekly Award`,
+          message: `🏆 Congratulations! You ranked #${snapItem.rank} on this week's leaderboard with ${snapItem.wins} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`
         });
       } catch (e) {
         console.error('[ADMIN APPROVE-ALL] socket emit failed:', e.message);
@@ -3820,7 +3931,42 @@ router.get('/spin/history', async (req, res) => {
       [limit, offset]
     );
 
-    return res.json({ ok: true, rounds, total, limit, offset });
+    const enrichedRounds = rounds.map(r => {
+      let playersArr = [];
+      try {
+        playersArr = typeof r.players_json === 'string' ? JSON.parse(r.players_json) : (r.players_json || []);
+      } catch (e) {
+        playersArr = [];
+      }
+
+      const totalP = r.total_players || playersArr.length || 0;
+      const realP = r.real_players || playersArr.filter(p => !p.isBot).length || 0;
+      const isRealSpin = realP > 0 && realP === totalP;
+
+      let winnerDisplayName = r.winner_username;
+      let winnerIsBot = !r.winner_user_id;
+
+      if (!winnerDisplayName && playersArr.length > 0) {
+        const sliceIdx = r.winning_slice ?? 0;
+        const winnerObj = playersArr[sliceIdx] || playersArr.find(p => p.isBot);
+        if (winnerObj) {
+          winnerDisplayName = winnerObj.username + (winnerObj.isBot ? ' (Bot)' : '');
+          winnerIsBot = !!winnerObj.isBot;
+        }
+      }
+
+      return {
+        ...r,
+        winner_display_name: winnerDisplayName || '—',
+        winner_is_bot: winnerIsBot,
+        is_real_spin: isRealSpin,
+        mode_label: r.config_id === 2 ? 'Rail Spin' : '5-Player Spin',
+        total_players: totalP,
+        real_players: realP,
+      };
+    });
+
+    return res.json({ ok: true, rounds: enrichedRounds, total, limit, offset });
   } catch (err) {
     console.error('[ADMIN] GET /spin/history err', err);
     res.status(500).json({ error: 'Failed to fetch spin history' });
