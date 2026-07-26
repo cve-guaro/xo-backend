@@ -8,19 +8,14 @@ const { v4: uuidv4 } = require("uuid");
 
 const LOG_PREFIX = "[SPIN_BOT]";
 
-// ── Pre-generated pool of Ethiopian-sounding names ─────────────────────────
-const ETHIOPIAN_NAMES = [
+// ── Pre-generated pool of 20 Ethiopian-sounding names ─────────────────────────
+const BOT_NAMES = [
   "Abebe_Pro", "Almaz_Star", "Bekele_XO", "Dawit_Champ", "Eyob_Play",
   "Fikru_Top", "Genet_ET", "Helen_Pro", "Ibrahim_XO", "Jemila_Star",
-  "Kidus_Hero", "Liya_Champ", "Meron_Top", "Natnael_Pro", "Omega_Play",
-  "Petros_XO", "Rahel_Star", "Samuel_Hero", "Tigist_Champ", "Yared_Top",
-  "Zeritu_Pro", "Abnet_XO", "Beza_Star", "Chala_Hero", "Desta_Champ",
-  "Elias_Play", "Feven_Pro", "Girmay_XO", "Hana_Star", "Iyasu_Hero",
-  "Jalene_Top", "Kebede_Pro", "Lidya_XO", "Meseret_Star", "Nebil_Hero",
-  "Omer_Champ", "Paulos_Play", "Ruth_Pro", "Selam_XO", "Tsion_Star",
-  "Urael_Hero", "Winta_Champ", "Yonas_Top", "Zara_Pro", "Alem_XO",
-  "Berhan_Star", "Dagne_Hero", "Eskinder_Champ", "Frezer_Play", "Haben_Pro",
+  "Kidus_Hero", "Liya_Champ", "Meron_Top", "Natnael_Pro", "Petros_XO",
+  "Rahel_Star", "Samuel_Hero", "Tigist_Champ", "Yared_Top", "Zeritu_Pro",
 ];
+const ETHIOPIAN_NAMES = BOT_NAMES;
 
 // Each bot gets a stable UUID so we can track them in logs
 const _botCache = new Map(); // name → { id, username }
@@ -83,4 +78,5 @@ module.exports = {
   getBot,
   scheduleBotFill,
   ETHIOPIAN_NAMES,
+  BOT_NAMES,
 };

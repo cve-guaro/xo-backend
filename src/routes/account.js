@@ -14,10 +14,16 @@ router.patch(
     try {
       const userId = req.user?.id || req.user?.sub || req.user?.userId;
 
+      const { BOT_NAMES } = require('../socket/spinBot');
+
       // Zod has already validated and sanitized req.body
       const { username, display_name, avatar } = req.body;
       if (!username && !display_name && !avatar) {
         return res.status(400).json({ message: "No data provided" });
+      }
+
+      if (username && BOT_NAMES.map(n => n.toLowerCase()).includes(String(username).toLowerCase())) {
+        return res.status(400).json({ message: "Username is already taken" });
       }
 
       // --- Build dynamic update ---
@@ -277,6 +283,14 @@ router.patch("/welcome-seen", auth, async (req, res) => {
       [userId, bonusAmount, `Giveaway v${currentVersion} Claimed`]
     ).catch(err => console.error('[BONUS_LOG] Claim log error:', err));
 
+    // Audit trail: record in wallet_transactions for reconciliation
+    await pool.query(`
+      INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+      VALUES ($1, 'GIFT', $2, 'COMPLETED', 'GIVEAWAY_CLAIM', $3, $4)
+      ON CONFLICT (user_id, idempotency_key) DO NOTHING
+    `, [userId, bonusAmount, JSON.stringify({ version: currentVersion }), `GIVEAWAY_V${currentVersion}_${userId}`])
+    .catch(err => console.error('[WALLET_TX] Giveaway claim tx log error:', err));
+
     res.json({ ok: true, amount: bonusAmount, version: currentVersion });
   } catch (e) {
     console.error("Giveaway claim error:", e);
@@ -460,6 +474,14 @@ router.post('/redeem-code', auth, async (req, res) => {
     await pool.query(`
       INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)
     `, [userId, amount, promocode.title || `Promocode: ${cleanCode}`]);
+
+    // Audit trail: record in wallet_transactions for reconciliation
+    await pool.query(`
+      INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
+      VALUES ($1, 'GIFT', $2, 'COMPLETED', 'PROMOCODE', $3, $4)
+      ON CONFLICT (user_id, idempotency_key) DO NOTHING
+    `, [userId, amount, JSON.stringify({ promocodeId: promocode.id, title: promocode.title }), `PROMOCODE_${promocode.id}_${userId}`])
+    .catch(err => console.error('[WALLET_TX] Promocode claim tx log error:', err));
 
     return res.json({ ok: true, amount });
   } catch (err) {
