@@ -61,29 +61,43 @@ function initTelegramBot() {
   }
 
   bot = new TelegramBot(BOT_TOKEN, {
-    polling: {
-      autoStart: true,
-      params: { timeout: 10 },
-    },
+    polling: false, // Don't autostart until webhook is cleared
     request: proxyUrl ? requestOptions : undefined
   });
 
-  // Clear any existing WebHook to avoid conflict
-  bot.deleteWebHook().catch(() => {});
+  // Clear any existing WebHook before starting polling
+  const clearWebhookAndStart = async () => {
+    try {
+      if (typeof bot.deleteWebhook === 'function') {
+        await bot.deleteWebhook();
+      } else {
+        await bot.deleteWebHook();
+      }
+    } catch (_) {}
+    bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
+  };
+
+  clearWebhookAndStart();
 
   // Log all incoming messages for debugging
   bot.on('message', (msg) => {
     console.log(`[TELEGRAM] Raw message received: chat=${msg.chat.id}, text="${msg.text || ''}"`);
   });
 
-  let lastConflictLog = 0;
-  // Swallow polling errors to prevent server crash (throttles 409 multi-instance logs)
-  bot.on('polling_error', (err) => {
+  let isBackingOff = false;
+  // Handle polling errors cleanly (pauses polling on 409 Conflict during container swaps)
+  bot.on('polling_error', async (err) => {
     if (err.message && err.message.includes('409 Conflict')) {
-      const now = Date.now();
-      if (now - lastConflictLog > 60000) { // Log at most once per minute
-        lastConflictLog = now;
-        console.warn('[TELEGRAM] 409 Conflict: Another bot instance or old Railway container is polling. Active instance will auto-recover once previous container stops.');
+      if (!isBackingOff) {
+        isBackingOff = true;
+        console.warn('[TELEGRAM] 409 Conflict detected (another instance active). Pausing polling for 10s...');
+        try {
+          await bot.stopPolling();
+        } catch (_) {}
+        setTimeout(() => {
+          isBackingOff = false;
+          clearWebhookAndStart();
+        }, 10000);
       }
       return;
     }
