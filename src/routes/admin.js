@@ -5,7 +5,7 @@
 const express = require('express');
 const axios = require("axios");
 const crypto = require("crypto");
-const { pool, withTx, redis } = require('../db/index');
+const { pool, withTx, redis, invalidateGlobalSettingCache } = require('../db/index');
 const { adminAuth, superAdminAuth } = require('../middleware/Auth');
 const { getChapaBalance } = require('../models/Chapa');
 const { CHAPA } = require('../env');
@@ -322,9 +322,10 @@ router.patch('/settings', async (req, res) => {
       redis.del('feature_status_rooms_locked'),
     ]).catch(() => {});
 
-    // Flush settings cache keys
+    // Flush settings cache keys (both Redis and In-Memory)
     for (const key of Object.keys(updates)) {
       await redis.del(`global_setting:${key}`).catch(() => {});
+      invalidateGlobalSettingCache(key);
     }
 
     await logAdminAction(req.user.id, 'updated_global_settings', null, updates);

@@ -532,7 +532,14 @@ async function purgeUserFromAllQueues(userId) {
   memQueuePurgeUser(userId);
   const keys = await redis.smembers(MM_QUEUES_SET).catch(() => []);
   if (keys?.length) {
-    await Promise.all(keys.map(k => removeAllOccurrencesFromQueue(k, userId)));
+    await Promise.all(keys.map(async (k) => {
+      const removed = await removeAllOccurrencesFromQueue(k, userId);
+      const len = await redis.llen(k).catch(() => 0);
+      if (len === 0) {
+        await redis.srem(MM_QUEUES_SET, k).catch(() => {});
+      }
+      return removed;
+    }));
   }
 }
 async function lpopN(key, n) {
@@ -1019,9 +1026,8 @@ function setupGameSocket(io) {
     }
   }, 60000);
 
-  // Background queue scanner: periodically check all queues for stranded pairs (every 3 seconds)
-  // This is a safety net for the race condition where two near-simultaneous joins
-  // both fail to match because of lock contention.
+  // Safety-net queue scanner: check stranded pairs infrequently (every 3 minutes / 180 seconds)
+  // Primary matching is event-driven when players join. This scanner only runs as an edge-case safety net.
   setInterval(async () => {
     try {
       const queueKeys = await redis.smembers(MM_QUEUES_SET).catch(() => []);
@@ -1029,6 +1035,10 @@ function setupGameSocket(io) {
 
       for (const queueKey of queueKeys) {
         const len = await redis.llen(queueKey).catch(() => 0);
+        if (len === 0) {
+          await redis.srem(MM_QUEUES_SET, queueKey).catch(() => {});
+          continue;
+        }
         if (len < 2) continue;
 
         // Extract bet amount from queue key (e.g., "queue:15" -> 15)
@@ -1156,7 +1166,7 @@ function setupGameSocket(io) {
     } catch (err) {
       // Silent — background scanner should not crash the server
     }
-  }, 3000);
+  }, 180000);
 
   // ── IN-MEMORY FALLBACK QUEUE SCANNER (runs every 3 seconds) ─────────────────
   // When Redis is rate-limited, the Redis-based scanner finds nothing because

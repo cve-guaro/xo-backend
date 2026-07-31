@@ -176,23 +176,38 @@ const safeRedis = new Proxy(redis, {
   }
 });
 
-// Cache global settings query in Redis with a 30-second TTL
+// ─── IN-MEMORY GLOBAL SETTINGS CACHE ─────────────────────────────────────────
+// Caches settings in process memory to avoid continuous Redis GET commands.
+// Refreshes after 10 minutes or immediately when invalidated on admin change.
+const _memoryGlobalSettingsCache = new Map();
+const MEMORY_SETTINGS_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
 async function getGlobalSetting(key, defaultValue = null) {
+  const now = Date.now();
+  const cachedMem = _memoryGlobalSettingsCache.get(key);
+  if (cachedMem && (now - cachedMem.fetchedAt < MEMORY_SETTINGS_TTL_MS)) {
+    return cachedMem.value;
+  }
+
   const cacheKey = `global_setting:${key}`;
   try {
     const cached = await safeRedis.get(cacheKey);
     if (cached !== null) {
-      return JSON.parse(cached);
+      const parsed = JSON.parse(cached);
+      _memoryGlobalSettingsCache.set(key, { value: parsed, fetchedAt: now });
+      return parsed;
     }
     const { rows } = await pool.query('SELECT value FROM global_settings WHERE key = $1', [key]);
     const val = rows.length ? rows[0].value : defaultValue;
-    await safeRedis.setex(cacheKey, 30, JSON.stringify(val));
+    await safeRedis.setex(cacheKey, 300, JSON.stringify(val));
+    _memoryGlobalSettingsCache.set(key, { value: val, fetchedAt: now });
     return val;
   } catch (err) {
-    // If even DB fails, return default
     try {
       const { rows } = await pool.query('SELECT value FROM global_settings WHERE key = $1', [key]);
-      return rows.length ? rows[0].value : defaultValue;
+      const val = rows.length ? rows[0].value : defaultValue;
+      _memoryGlobalSettingsCache.set(key, { value: val, fetchedAt: now });
+      return val;
     } catch (dbErr) {
       console.error(`[DB] DB fallback failed for ${key}:`, dbErr.message);
       return defaultValue;
@@ -200,4 +215,12 @@ async function getGlobalSetting(key, defaultValue = null) {
   }
 }
 
-module.exports = { pool, withTx, getGlobalSetting, redis: safeRedis, rawRedis: redis };
+function invalidateGlobalSettingCache(key) {
+  if (key) {
+    _memoryGlobalSettingsCache.delete(key);
+  } else {
+    _memoryGlobalSettingsCache.clear();
+  }
+}
+
+module.exports = { pool, withTx, getGlobalSetting, invalidateGlobalSettingCache, redis: safeRedis, rawRedis: redis };
