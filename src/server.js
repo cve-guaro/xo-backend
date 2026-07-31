@@ -452,15 +452,15 @@ async function runMigrations() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_spin_bets_round ON spin_bets(round_id);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_spin_bets_user ON spin_bets(user_id);`);
 
-    // Seed default spin room configs (exactly 5_PLAYER and RAIL)
+    // Seed default spin room configs (exactly 5_PLAYER and RAIL with 20% house cut)
     console.log('[DB] Seeding exactly two spin room configs: 5_PLAYER and RAIL...');
     await pool.query('TRUNCATE TABLE spin_room_configs CASCADE');
     await pool.query(
       `INSERT INTO spin_room_configs (id, name, bet_amount, max_players, house_cut_percent, is_active)
        VALUES 
-         (1, '5_PLAYER', 100, 5, 10, true),
-         (2, 'RAIL', 0, 9999, 10, true)
-       ON CONFLICT (id) DO NOTHING`
+         (1, '5_PLAYER', 100, 5, 20, true),
+         (2, 'RAIL', 0, 9999, 20, true)
+       ON CONFLICT (id) DO UPDATE SET house_cut_percent = 20`
     );
     // Seed spin_5p_entry_amount in global_settings
     await pool.query(
@@ -469,6 +469,33 @@ async function runMigrations() {
        ON CONFLICT (key) DO NOTHING`
     );
     console.log('[DB] Seeded two spin room configs and spin_5p_entry_amount global setting.');
+
+    // Add is_bot column to users table and seed 30 bot users
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN DEFAULT false;`);
+    const BOT_NICKNAMES = [
+      "Xo_King", "SpinMaster", "LuckyBirr", "EthioGamer", "Nati_Pro", 
+      "HabeshaWin", "Abush99", "BetMaster", "GoldSpin", "MeronX",
+      "DiceKing", "FastSpin", "TopPlayer", "WinnerET", "ProGamer99",
+      "SpinLord", "BetaGamer", "XO_Champ", "LuckyStar", "CashKing",
+      "GameOn", "EthioSpin", "PlayHard", "SpinGeek", "NoLuck",
+      "BigWinner", "SilentBet", "NightOwl", "QuickSpin", "Ace_Player"
+    ];
+    for (const name of BOT_NICKNAMES) {
+      const botRes = await pool.query(
+        `INSERT INTO users (username, number, is_bot)
+         VALUES ($1, $2, true)
+         ON CONFLICT (username) DO UPDATE SET is_bot = true
+         RETURNING id`,
+        [name, `BOT_${name}`]
+      );
+      if (botRes.rows[0]?.id) {
+        await pool.query(
+          `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+          [botRes.rows[0].id]
+        );
+      }
+    }
+    console.log('[DB] Seeded 30 bot users in DB.');
 
     // Unconditional schema updates & index creation for performance & gameplay features
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS room_2_wins INTEGER DEFAULT 0;`);

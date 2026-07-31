@@ -8,39 +8,50 @@ const { v4: uuidv4 } = require("uuid");
 
 const LOG_PREFIX = "[SPIN_BOT]";
 
-// ── Pre-generated pool of 40 natural Ethiopian usernames (no underscores/fake titles) ──
+const { v4: uuidv4 } = require("uuid");
+const { pool } = require("../db/index");
+
+const LOG_PREFIX = "[SPIN_BOT]";
+
+// ── Pool of 30 gaming nicknames for bots ──
 const BOT_NAMES = [
-  "Abebe", "Almaz", "Bekele", "Dawit", "Eyob",
-  "Fikru", "Genet", "Helen", "Ibrahim", "Jemila",
-  "Kidus", "Liya", "Meron", "Natnael", "Petros",
-  "Rahel", "Samuel", "Tigist", "Yared", "Zeritu",
-  "Selam", "Tewodros", "Biniyam", "Kalkidan", "Robel",
-  "Martha", "Daniel", "Ermias", "Tsehay", "Hana",
-  "Sami", "Aman", "Miki", "Yohannes", "Aster",
-  "Birtukan", "Fitsum", "Girma", "Haile", "Kassa"
+  "Xo_King", "SpinMaster", "LuckyBirr", "EthioGamer", "Nati_Pro", 
+  "HabeshaWin", "Abush99", "BetMaster", "GoldSpin", "MeronX",
+  "DiceKing", "FastSpin", "TopPlayer", "WinnerET", "ProGamer99",
+  "SpinLord", "BetaGamer", "XO_Champ", "LuckyStar", "CashKing",
+  "GameOn", "EthioSpin", "PlayHard", "SpinGeek", "NoLuck",
+  "BigWinner", "SilentBet", "NightOwl", "QuickSpin", "Ace_Player"
 ];
 const ETHIOPIAN_NAMES = BOT_NAMES;
 
-// Each bot gets a stable UUID so we can track them in logs
-const _botCache = new Map(); // name → { id, username }
+let _dbBotCache = null;
 
-function getBot() {
-  // Pick a random name from the pool
-  const name = ETHIOPIAN_NAMES[Math.floor(Math.random() * ETHIOPIAN_NAMES.length)];
+async function loadDbBots() {
+  try {
+    const { rows } = await pool.query(`SELECT id::text, username FROM users WHERE is_bot = true ORDER BY username ASC`);
+    if (rows.length > 0) {
+      _dbBotCache = rows;
+    }
+  } catch (err) {
+    console.error(`${LOG_PREFIX} Failed to load DB bots:`, err.message);
+  }
+}
 
-  if (!_botCache.has(name)) {
-    _botCache.set(name, {
-      id: uuidv4(),
-      username: name,
-      isBot: true,
-      avatar: null,
-    });
+async function getBot(excludeUserIds = []) {
+  if (!_dbBotCache || _dbBotCache.length === 0) {
+    await loadDbBots();
   }
 
-  // Return a fresh copy with a unique ID per instance (so same name can appear in different rooms)
+  const poolToUse = (_dbBotCache && _dbBotCache.length > 0) ? _dbBotCache : BOT_NAMES.map(name => ({ id: uuidv4(), username: name }));
+  
+  // Exclude bots already in the round
+  const availableBots = poolToUse.filter(b => !excludeUserIds.includes(b.id));
+  const candidatePool = availableBots.length > 0 ? availableBots : poolToUse;
+  const picked = candidatePool[Math.floor(Math.random() * candidatePool.length)];
+
   return {
-    id: uuidv4(), // unique per room join
-    username: name,
+    id: picked.id || uuidv4(),
+    username: picked.username,
     isBot: true,
     avatar: null,
   };
@@ -66,11 +77,11 @@ function scheduleBotFill({ maxBots, currentPlayerCount, maxPlayers, onBotJoin, m
       totalDelay = delay * (i + 1); // stagger: each bot waits progressively longer
     }
 
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (cancelled) return;
-      const bot = getBot();
+      const bot = await getBot();
       console.log(`${LOG_PREFIX} Bot joining: ${bot.username} (delay=${Math.round(totalDelay)}ms)`);
-      onBotJoin(bot);
+      await onBotJoin(bot);
     }, totalDelay);
 
     timers.push(timer);

@@ -84,7 +84,11 @@ router.get('/weekly', auth, async (req, res) => {
           u.id::text as id,
           u.username,
           u.avatar,
-          COUNT(*) AS wins
+          COUNT(*) AS wins,
+          COALESCE((
+            SELECT SUM(amount) FROM payment_transactions 
+            WHERE user_id = u.id AND bank IN ('GAME_WIN', 'SPIN_PRIZE', 'WIN') AND status = 'success'
+          ), COUNT(*) * 50) AS win_amount
         FROM games g
         JOIN users u ON u.id = g.winner
         WHERE g.status IN ('completed', 'finished')
@@ -109,6 +113,7 @@ router.get('/weekly', auth, async (req, res) => {
         username: r.username,
         avatar: r.avatar,
         wins: Number(r.wins),
+        winAmount: Number(r.win_amount || 0),
         rank: offset + idx + 1
       }));
 
@@ -118,7 +123,11 @@ router.get('/weekly', auth, async (req, res) => {
           u.id::text as id,
           u.username,
           u.avatar,
-          COUNT(*) AS wins
+          COUNT(*) AS wins,
+          COALESCE((
+            SELECT SUM(amount) FROM payment_transactions 
+            WHERE user_id = u.id AND bank IN ('GAME_WIN', 'SPIN_PRIZE', 'WIN') AND status = 'success'
+          ), COUNT(*) * 50) AS win_amount
         FROM games g
         JOIN users u ON u.id = g.winner
         WHERE g.status IN ('completed', 'finished')
@@ -134,6 +143,7 @@ router.get('/weekly', auth, async (req, res) => {
         username: r.username,
         avatar: r.avatar,
         wins: Number(r.wins),
+        winAmount: Number(r.win_amount || 0),
         rank: idx + 1
       }));
 

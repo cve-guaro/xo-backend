@@ -220,8 +220,9 @@ async function markTransactionStatusByExternal({
   return withTx(async (client) => {
     const provider = await getProviderByCode(client, providerCode);
 
-    // Advisory lock per (providerCode + providerExtId) to avoid races
-    await client.query(`SELECT advisory_lock_for($1)`, [`${providerCode}:${providerExtId}`]);
+    // NOTE: advisory_lock_for() was removed — pg_advisory_lock is incompatible with
+    // PgBouncer in transaction mode (Supabase NANO). The FOR UPDATE on the SELECT
+    // below already provides row-level serialization within this transaction.
 
     const { rows: found } = await client.query(
       `SELECT * FROM transactions WHERE provider_id = $1 AND provider_ext_id = $2 FOR UPDATE`,
@@ -399,8 +400,9 @@ async function recordAndProcessWebhook({
 
     // If the event references a specific provider_ext_id, update the transaction
     if (providerExtId && newStatus) {
-      // Lock by external id to prevent races
-      await client.query(`SELECT advisory_lock_for($1)`, [`${providerCode}:${providerExtId}`]);
+      // NOTE: advisory_lock_for() was removed — pg_advisory_lock is incompatible with
+      // PgBouncer in transaction mode (Supabase NANO). The FOR UPDATE on the SELECT
+      // below already provides row-level serialization within this transaction.
 
       const { rows: txRows } = await client.query(
         `SELECT * FROM transactions WHERE provider_id = $1 AND provider_ext_id = $2 FOR UPDATE`,

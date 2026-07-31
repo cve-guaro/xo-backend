@@ -47,12 +47,12 @@ router.get("/rooms", async (req, res) => {
         name: config.name,
         betAmount: Number(config.bet_amount),
         maxPlayers: config.max_players || 5,
-        houseCutPercent: Number(config.house_cut_percent || 10),
+        houseCutPercent: Number(config.house_cut_percent || 20),
         currentPlayers,
         activeRoundId,
         estimatedPrize: calculateSpinPrize(
           Number(config.bet_amount) * (config.max_players || 5),
-          Number(config.house_cut_percent || 10)
+          Number(config.house_cut_percent || 20)
         ).prize,
       };
     });

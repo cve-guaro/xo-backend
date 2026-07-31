@@ -101,7 +101,7 @@ function createRound(config) {
     mode: isRail ? "RAIL" : "5_PLAYER",
     betAmount: isRail ? 0 : Number(config.bet_amount),
     maxPlayers: isRail ? 9999 : (config.max_players || 5),
-    houseCutPercent: Number(config.house_cut_percent || 10),
+    houseCutPercent: Number(config.house_cut_percent || 20),
     roomName: isRail ? "Rail Spin" : "5-Player Spin",
     status: "waiting",
     players: [],
@@ -109,7 +109,7 @@ function createRound(config) {
     winnerId: null,
     winnerName: null,
     prizeAmount: 0,
-    countdown: isRail ? 60 : 0, // 60s countdown for Rail, 5_PLAYER has NO countdown (waits for 5 players)
+    countdown: isRail ? 120 : 0, // 120s (2 min) countdown for Rail
     countdownInterval: null,
     botCancelFn: null,
     createdAt: new Date(),
@@ -323,8 +323,134 @@ async function resolveRound(io, round) {
     console.error(`${LOG_PREFIX} Payout failed for round=${round.id}:`, err.message);
   }
 
-  // Clean up after 5 seconds
-  setTimeout(() => cleanupRound(round), 5000);
+  // Payout & Cleanup / Rematch
+  if (round.mode === "5_PLAYER") {
+    initiateSpinRematch(io, round);
+  } else {
+    setTimeout(() => cleanupRound(round), 5000);
+  }
+}
+
+// ── 5-Player Spin Rematch Subsystem ───────────────────────────────────────
+const spinRematches = new Map();
+
+function initiateSpinRematch(io, round) {
+  const realPlayers = round.players.filter(p => !p.isBot);
+  if (realPlayers.length === 0) {
+    setTimeout(() => cleanupRound(round), 5000);
+    return;
+  }
+
+  const rematchState = {
+    originalRoundId: round.id,
+    configId: round.configId,
+    betAmount: 100,
+    acceptedUsers: new Map(),
+    totalRealPlayers: realPlayers.length,
+    timer: null,
+  };
+
+  spinRematches.set(round.id, rematchState);
+
+  broadcastToRound(io, round, "spin:rematch_available", {
+    originalRoundId: round.id,
+    timeoutMs: 15000,
+    betAmount: 100,
+  });
+
+  rematchState.timer = setTimeout(() => {
+    finalizeSpinRematch(io, round.id);
+  }, 15000);
+}
+
+async function finalizeSpinRematch(io, originalRoundId) {
+  const rematchState = spinRematches.get(originalRoundId);
+  if (!rematchState) return;
+
+  clearTimeout(rematchState.timer);
+  spinRematches.delete(originalRoundId);
+
+  const originalRound = activeSpinRounds.get(originalRoundId);
+  const acceptedList = Array.from(rematchState.acceptedUsers.values());
+
+  if (acceptedList.length === 0) {
+    if (originalRound) cleanupRound(originalRound);
+    return;
+  }
+
+  // Create new round for rematch
+  const configs = await getSpinConfigs();
+  const config = configs.find(c => c.id === 1) || { id: 1, bet_amount: 100, max_players: 5, house_cut_percent: 20 };
+  const newRound = createRound(config);
+
+  try {
+    await pool.query(
+      `INSERT INTO spin_rounds (id, config_id, status, players, created_at)
+       VALUES ($1::uuid, $2, 'waiting', '[]'::jsonb, NOW())`,
+      [newRound.id, config.id]
+    );
+  } catch (err) {
+    console.error(`${LOG_PREFIX} DB round insert failed for rematch:`, err.message);
+  }
+
+  // Add each accepted player to the new round
+  for (const p of acceptedList) {
+    try {
+      await addPlayerToRound(io, newRound, {
+        userId: p.userId,
+        username: p.username,
+        isBot: false,
+        avatar: p.avatar,
+        stake: 100,
+      });
+
+      if (p.socket) {
+        p.socket.leave(`spin:${originalRoundId}`);
+        p.socket.join(`spin:${newRound.id}`);
+        p.socket.data = { ...(p.socket.data || {}), spinRoundId: newRound.id, userId: p.userId };
+        p.socket.emit("spin:rematch_started", {
+          newRoundId: newRound.id,
+          data: buildRoomState(newRound),
+        });
+      }
+    } catch (err) {
+      console.error(`${LOG_PREFIX} Failed to add player ${p.username} to rematch round:`, err.message);
+    }
+  }
+
+  // Start bot fill scheduler for remaining seats in 5_PLAYER mode if needed
+  const fivepBotsEnabled = await getGlobalSetting("spin_5p_bots_enabled", true);
+  if (fivepBotsEnabled && newRound.status === "waiting" && newRound.players.length < newRound.maxPlayers) {
+    const botDelays = [
+      10000 + Math.random() * 20000,
+      40000 + Math.random() * 30000,
+      80000 + Math.random() * 30000,
+      115000 + Math.random() * 30000,
+    ];
+
+    newRound.botCancelFn = scheduleBotFill({
+      maxBots: 4,
+      currentPlayerCount: newRound.players.length,
+      maxPlayers: newRound.maxPlayers,
+      staggerDelaysMs: botDelays,
+      onBotJoin: async (bot) => {
+        if (newRound.status !== "waiting" || newRound.players.length >= newRound.maxPlayers) return;
+        try {
+          await addPlayerToRound(io, newRound, {
+            userId: bot.id,
+            username: bot.username,
+            isBot: true,
+            avatar: null,
+            stake: 100,
+          });
+        } catch (err) {
+          console.error(`${LOG_PREFIX} Rematch 5-Player Bot join failed:`, err.message);
+        }
+      },
+    });
+  }
+
+  if (originalRound) cleanupRound(originalRound);
 }
 
 // ── Cancel round (not enough players) ──────────────────────────────────────
@@ -626,7 +752,7 @@ function setupSpinSocket(io) {
 
         // Manage bot scheduling
         const railBotsEnabled = await getGlobalSetting("spin_rail_bots_enabled", true);
-        const fivepBotsEnabled = await getGlobalSetting("spin_5p_bots_enabled", false);
+        const fivepBotsEnabled = await getGlobalSetting("spin_5p_bots_enabled", true);
 
         if (round.status === "waiting" && round.players.length < round.maxPlayers) {
           if (round.botCancelFn) {
@@ -639,13 +765,20 @@ function setupSpinSocket(io) {
               startCountdown(io, round);
             }
             if (railBotsEnabled) {
+              const realPlayer = round.players.find(p => !p.isBot);
+              const realStake = realPlayer ? Number(realPlayer.stake || 0) : 0;
+              let dynamicMaxBots = 4;
+              if (realStake > 500) dynamicMaxBots = 7;
+              else if (realStake > 250) dynamicMaxBots = 6;
+              else if (realStake > 100) dynamicMaxBots = 5;
+
               round.botCancelFn = scheduleBotFill({
-                maxBots: 5,
+                maxBots: dynamicMaxBots,
                 currentPlayerCount: round.players.length,
                 maxPlayers: round.maxPlayers,
                 onBotJoin: async (bot) => {
                   if (round.status !== "waiting" || round.players.length >= round.maxPlayers) return;
-                  const botStake = 10;
+                  const botStake = 10 + Math.floor(Math.random() * 11); // Random stake 10-20
                   try {
                     await addPlayerToRound(io, round, {
                       userId: bot.id,
@@ -667,18 +800,16 @@ function setupSpinSocket(io) {
               const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
               const spin5pEntry = Number(spin5pEntryStr || 100);
 
-              // Bot timing per user spec:
-              // Bot 1: 60-50s left (~5-10s after room creation)
-              // Bot 2: ~30s left (~30s after room creation)
-              // Bot 3: 10-0s left (~48-53s after room creation)
+              // 4 Bots enter within 0–2min 30s (0 - 150s)
               const botDelays = [
-                5000 + Math.random() * 5000,    // 5-10s (60-50s window)
-                28000 + Math.random() * 4000,   // 28-32s (~30s window)
-                48000 + Math.random() * 5000,   // 48-53s (10-0s window)
+                10000 + Math.random() * 20000,   // 10-30s
+                40000 + Math.random() * 30000,   // 40-70s
+                80000 + Math.random() * 30000,   // 80-110s
+                115000 + Math.random() * 30000,  // 115-145s
               ];
 
               round.botCancelFn = scheduleBotFill({
-                maxBots: 3,
+                maxBots: 4,
                 currentPlayerCount: round.players.length,
                 maxPlayers: round.maxPlayers,
                 staggerDelaysMs: botDelays,
@@ -883,6 +1014,58 @@ function setupSpinSocket(io) {
       }
     });
 
+    // ── spin:rematch_vote ──────────────────────────────────────────────
+    socket.on("spin:rematch_vote", async (data, ack) => {
+      try {
+        const { roundId, accept, token } = data || {};
+        if (!token) return ack?.({ ok: false, error: "AUTH_FAILED" });
+        let decoded;
+        try { decoded = verifyToken(token); } catch { return ack?.({ ok: false, error: "AUTH_FAILED" }); }
+        const userId = decoded.sub || decoded.userId || decoded.id;
+        if (!userId) return ack?.({ ok: false, error: "AUTH_FAILED" });
+
+        const rematchState = spinRematches.get(roundId);
+        if (!rematchState) return ack?.({ ok: false, error: "REMATCH_EXPIRED" });
+
+        if (accept) {
+          const walletRes = await pool.query(
+            `SELECT (available_balance + bonus_balance) AS total FROM wallets WHERE user_id = $1::uuid`,
+            [userId]
+          );
+          const totalBalance = Number(walletRes.rows[0]?.total || 0);
+          if (totalBalance < 100) {
+            return ack?.({ ok: false, error: "INSUFFICIENT_BALANCE" });
+          }
+
+          const userRes = await pool.query(`SELECT username, avatar FROM users WHERE id = $1::uuid`, [userId]);
+          const userObj = userRes.rows[0] || { username: "Player" };
+
+          rematchState.acceptedUsers.set(userId, {
+            userId,
+            username: userObj.username,
+            avatar: userObj.avatar,
+            socket,
+          });
+        } else {
+          rematchState.acceptedUsers.delete(userId);
+        }
+
+        broadcastToRound(io, { id: roundId }, "spin:rematch_status", {
+          originalRoundId: roundId,
+          acceptedCount: rematchState.acceptedUsers.size,
+        });
+
+        ack?.({ ok: true, acceptedCount: rematchState.acceptedUsers.size });
+
+        if (rematchState.acceptedUsers.size >= rematchState.totalRealPlayers) {
+          finalizeSpinRematch(io, roundId);
+        }
+      } catch (err) {
+        console.error(`${LOG_PREFIX} spin:rematch_vote error:`, err.message);
+        ack?.({ ok: false, error: "VOTE_FAILED" });
+      }
+    });
+
     // ── spin:get_rooms ─────────────────────────────────────────────────
     socket.on("spin:get_rooms", async (data, ack) => {
       try {
@@ -905,12 +1088,12 @@ function setupSpinSocket(io) {
             name: config.name,
             betAmount: Number(config.bet_amount),
             maxPlayers: config.max_players || 5,
-            houseCutPercent: Number(config.house_cut_percent || 10),
+            houseCutPercent: Number(config.house_cut_percent || 20),
             currentPlayers,
             activeRoundId,
             estimatedPrize: calculateSpinPrize(
               Number(config.bet_amount) * (config.max_players || 5),
-              Number(config.house_cut_percent || 10)
+              Number(config.house_cut_percent || 20)
             ).prize,
           };
         });

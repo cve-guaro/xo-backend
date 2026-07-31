@@ -3,7 +3,11 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
 
 const router = express.Router();
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecret';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set in auth.js. Refusing to start insecurely.');
+  process.exit(1);
+}
 
 router.post('/login', async (req, res) => {
   const { username } = req.body;

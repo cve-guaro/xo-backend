@@ -131,7 +131,7 @@ async function systemLockdownCheck(req, res, next) {
         if (r.key === 'mobile_app_lockout') isMobileLocked = (r.value === true || r.value === 'true');
         if (r.key === 'lockdown_whitelist') whitelist = Array.isArray(r.value) ? r.value : [];
       }
-      await redis.setex(cacheKey, 60, JSON.stringify({ isEmergencyLocked, isMobileLocked, whitelist }));
+      await redis.setex(cacheKey, 5, JSON.stringify({ isEmergencyLocked, isMobileLocked, whitelist }));
     }
 
     if (isEmergencyLocked) {
