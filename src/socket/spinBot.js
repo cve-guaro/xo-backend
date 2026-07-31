@@ -5,10 +5,6 @@
 // Bots use realistic Ethiopian names and are invisible to users.
 // ────────────────────────────────────────────────────────────────────────────
 const { v4: uuidv4 } = require("uuid");
-
-const LOG_PREFIX = "[SPIN_BOT]";
-
-const { v4: uuidv4 } = require("uuid");
 const { pool } = require("../db/index");
 
 const LOG_PREFIX = "[SPIN_BOT]";
