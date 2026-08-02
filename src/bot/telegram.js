@@ -65,16 +65,39 @@ function initTelegramBot() {
     request: proxyUrl ? requestOptions : undefined
   });
 
-  // Clear any existing WebHook before starting polling
+  // Clear any existing WebHook and acquire Redis leader lock before polling
   const clearWebhookAndStart = async () => {
     try {
-      if (typeof bot.deleteWebhook === 'function') {
-        await bot.deleteWebhook();
-      } else {
-        await bot.deleteWebHook();
+      // Ensure only 1 server instance polls Telegram in multi-container / cluster setups
+      const lockKey = "tg_bot_poller_leader";
+      const instanceId = `${process.pid}_${Math.random().toString(36).substring(2, 7)}`;
+      const acquired = await redis.set(lockKey, instanceId, "EX", 25, "NX").catch(() => "OK");
+      
+      if (!acquired) {
+        console.log("[TELEGRAM] Another active server instance is polling leader. Standing by...");
+        return;
       }
-    } catch (_) {}
-    bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
+
+      // Keep lock alive while server runs
+      const renewInterval = setInterval(async () => {
+        const val = await redis.get(lockKey).catch(() => null);
+        if (val === instanceId) {
+          await redis.expire(lockKey, 25).catch(() => {});
+        } else {
+          clearInterval(renewInterval);
+        }
+      }, 12000);
+
+      if (typeof bot.deleteWebhook === 'function') {
+        await bot.deleteWebhook().catch(() => {});
+      } else if (typeof bot.deleteWebHook === 'function') {
+        await bot.deleteWebHook().catch(() => {});
+      }
+
+      bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
+    } catch (_) {
+      bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
+    }
   };
 
   clearWebhookAndStart();
@@ -84,20 +107,22 @@ function initTelegramBot() {
     console.log(`[TELEGRAM] Raw message received: chat=${msg.chat.id}, text="${msg.text || ''}"`);
   });
 
+  let backoffDelay = 10000;
   let isBackingOff = false;
-  // Handle polling errors cleanly (pauses polling on 409 Conflict during container swaps)
+  // Handle polling errors cleanly
   bot.on('polling_error', async (err) => {
     if (err.message && err.message.includes('409 Conflict')) {
       if (!isBackingOff) {
         isBackingOff = true;
-        console.warn('[TELEGRAM] 409 Conflict detected (another instance active). Pausing polling for 10s...');
+        console.warn(`[TELEGRAM] 409 Conflict (another instance polling). Standing by for ${backoffDelay / 1000}s...`);
         try {
           await bot.stopPolling();
         } catch (_) {}
         setTimeout(() => {
           isBackingOff = false;
+          backoffDelay = Math.min(backoffDelay * 1.5, 60000); // Exponential backoff max 60s
           clearWebhookAndStart();
-        }, 10000);
+        }, backoffDelay);
       }
       return;
     }
