@@ -38,8 +38,12 @@ async function sendSMS(phone, message) {
     consecutiveFailures = 0; // Reset on success
     return true;
   } catch (e) {
+    const msg = e.response?.data?.msg || e.response?.data?.message || e.message;
+    if (typeof msg === 'string' && msg.includes('Safaricom')) {
+      console.warn(`[SMS] Safaricom number not supported by GeezSMS sender ID: ${phone}`);
+      return false;
+    }
     consecutiveFailures++;
-    const msg = e.response?.data?.msg || e.message;
     
     // Check for "Insufficient amount" = balance depleted
     if (msg.includes('Insufficient') || consecutiveFailures >= MAX_FAILURES) {

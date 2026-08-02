@@ -191,7 +191,16 @@ router.post('/request-otp', async (req, res) => {
       const smsResult = await sendGeezSMS({ userId, phone: number, message: `your OTP is: ${code}` });
       if (!smsResult.success) {
         console.error('[REQUEST_OTP] SMS delivery failed', { number, error: smsResult.error });
-        
+
+        const errStr = typeof smsResult.error === 'string' ? smsResult.error : JSON.stringify(smsResult.error || {});
+        if (errStr.includes('Safaricom') || number.startsWith('2517') || number.startsWith('07')) {
+          await redis.decr(`otp_rate:${number}`).catch(() => {});
+          return res.status(400).json({
+            error: 'SAFARICOM_NOT_SUPPORTED',
+            message: 'Safaricom numbers are currently not supported for SMS. Please use an Ethio Telecom number (09...).',
+          });
+        }
+
         // In production, block request on SMS failure
         if (process.env.NODE_ENV === 'production') {
           await redis.decr(`otp_rate:${number}`).catch(() => {});
