@@ -71,9 +71,10 @@ router.get("/history", requireAuth, async (req, res) => {
     const offset = Number(req.query.offset) || 0;
 
     const { rows } = await pool.query(
-      `SELECT sr.id AS round_id, sr.status, sr.pot_amount, sr.prize_amount,
-              sr.winner_user_id, sr.created_at, sr.resolved_at,
-              src.name AS room_name, src.bet_amount,
+      `SELECT sr.id AS round_id, sr.config_id, sr.status, sr.pot_amount::numeric, sr.prize_amount::numeric,
+              sr.winner_user_id, sr.winning_slice, sr.players AS players_json,
+              sr.created_at, sr.resolved_at,
+              src.name AS room_name, src.bet_amount::numeric,
               sb.seat_index,
               CASE WHEN sr.winner_user_id = $1::uuid THEN true ELSE false END AS is_winner,
               (SELECT username FROM users WHERE id = sr.winner_user_id) AS winner_name
@@ -86,7 +87,30 @@ router.get("/history", requireAuth, async (req, res) => {
       [req.userId, limit, offset]
     );
 
-    res.json({ ok: true, history: rows });
+    const history = rows.map(r => {
+      let players = [];
+      try {
+        players = typeof r.players_json === 'string' ? JSON.parse(r.players_json) : (r.players_json || []);
+      } catch (_) { players = []; }
+      const totalPlayers = players.length;
+      const botCount = players.filter(p => p.isBot).length;
+      const pot = Number(r.pot_amount || 0);
+      const prize = Number(r.prize_amount || 0);
+      const houseCut = Math.max(0, pot - prize);
+
+      return {
+        ...r,
+        pot_amount: pot,
+        prize_amount: prize,
+        house_cut: houseCut,
+        total_players: totalPlayers,
+        bot_count: botCount,
+        players,
+        mode_label: r.config_id === 2 ? 'Rail Spin' : '5-Player Spin'
+      };
+    });
+
+    res.json({ ok: true, history });
   } catch (err) {
     console.error("[SPIN_API] GET /history error:", err.message);
     res.status(500).json({ error: "Failed to load history" });

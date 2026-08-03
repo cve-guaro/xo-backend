@@ -669,10 +669,15 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
 }
 
 async function saveMove(gameId, moveObj) {
+  const gameObj = activeGames.get(gameId);
+  if (gameObj) {
+    if (!gameObj.moves) gameObj.moves = [];
+    gameObj.moves.push(moveObj);
+  }
   await pool.query(
-    `UPDATE games SET moves = moves || $1::jsonb WHERE id = $2`,
+    `UPDATE games SET moves = COALESCE(moves, '[]'::jsonb) || $1::jsonb WHERE id = $2`,
     [JSON.stringify([moveObj]), gameId]
-  );
+  ).catch(e => console.error('[SAVE_MOVE_ERR]', e.message));
 }
 
 async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
@@ -696,10 +701,21 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       return;
     }
 
-    await client.query(
-      `UPDATE games SET status = $1, winner = $2, finished_at = NOW(), prize_amount = $4 WHERE id = $3`,
-      [status === 'X' || status === 'O' ? 'completed' : status, winnerUserId || null, gameId, winnerUserId ? prizeAmount : 0]
-    );
+    const finalMovesJson = (gameObj && Array.isArray(gameObj.moves) && gameObj.moves.length > 0) 
+      ? JSON.stringify(gameObj.moves) 
+      : null;
+
+    if (finalMovesJson) {
+      await client.query(
+        `UPDATE games SET status = $1, winner = $2, finished_at = NOW(), prize_amount = $4, moves = CASE WHEN jsonb_array_length(COALESCE(moves, '[]'::jsonb)) = 0 THEN $5::jsonb ELSE moves END WHERE id = $3`,
+        [status === 'X' || status === 'O' ? 'completed' : status, winnerUserId || null, gameId, winnerUserId ? prizeAmount : 0, finalMovesJson]
+      );
+    } else {
+      await client.query(
+        `UPDATE games SET status = $1, winner = $2, finished_at = NOW(), prize_amount = $4 WHERE id = $3`,
+        [status === 'X' || status === 'O' ? 'completed' : status, winnerUserId || null, gameId, winnerUserId ? prizeAmount : 0]
+      );
+    }
 
     if (winnerUserId) {
       const isX = (winnerUserId === game.player_x);
