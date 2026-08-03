@@ -65,34 +65,58 @@ function initTelegramBot() {
     request: proxyUrl ? requestOptions : undefined
   });
 
+  // Track whether this instance is the polling leader
+  let isPollingLeader = false;
+  let renewInterval = null;
+  const lockKey = "tg_bot_poller_leader";
+  const instanceId = `${process.pid}_${Math.random().toString(36).substring(2, 7)}`;
+
   // Clear any existing WebHook and acquire Redis leader lock before polling
   const clearWebhookAndStart = async () => {
     try {
       // Ensure only 1 server instance polls Telegram in multi-container / cluster setups
-      const lockKey = "tg_bot_poller_leader";
-      const instanceId = `${process.pid}_${Math.random().toString(36).substring(2, 7)}`;
-      const acquired = await redis.set(lockKey, instanceId, "EX", 25, "NX").catch(() => "OK");
+      let acquired = false;
+      try {
+        const result = await redis.set(lockKey, instanceId, "EX", 25, "NX");
+        acquired = !!result; // NX returns null if key exists, "OK" if set
+      } catch (redisErr) {
+        // Redis is down — only allow polling if we were already the leader,
+        // otherwise assume another instance is polling.
+        if (!isPollingLeader) {
+          console.log("[TELEGRAM] Redis unavailable and not already leader. Standing by...");
+          return;
+        }
+        // We were already polling, so continue
+        acquired = true;
+      }
       
       if (!acquired) {
         console.log("[TELEGRAM] Another active server instance is polling leader. Standing by...");
         return;
       }
 
+      isPollingLeader = true;
+
       // Keep lock alive while server runs
-      const renewInterval = setInterval(async () => {
-        const val = await redis.get(lockKey).catch(() => null);
-        if (val === instanceId) {
-          await redis.expire(lockKey, 25).catch(() => {});
-        } else {
-          clearInterval(renewInterval);
-        }
+      if (renewInterval) clearInterval(renewInterval);
+      renewInterval = setInterval(async () => {
+        try {
+          const val = await redis.get(lockKey).catch(() => null);
+          if (val === instanceId) {
+            await redis.expire(lockKey, 25).catch(() => {});
+          } else {
+            // Another instance stole the lock — stop polling
+            console.log("[TELEGRAM] Lost leader lock to another instance. Stopping polling.");
+            isPollingLeader = false;
+            clearInterval(renewInterval);
+            renewInterval = null;
+            bot.stopPolling().catch(() => {});
+          }
+        } catch (_) {}
       }, 12000);
 
-      if (typeof bot.deleteWebhook === 'function') {
-        await bot.deleteWebhook().catch(() => {});
-      } else if (typeof bot.deleteWebHook === 'function') {
-        await bot.deleteWebHook().catch(() => {});
-      }
+      // Always use deleteWebhook (lowercase 'h') — the uppercase variant is deprecated
+      await bot.deleteWebhook().catch(() => {});
 
       bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
     } catch (_) {
@@ -107,23 +131,20 @@ function initTelegramBot() {
     console.log(`[TELEGRAM] Raw message received: chat=${msg.chat.id}, text="${msg.text || ''}"`);
   });
 
-  let backoffDelay = 10000;
-  let isBackingOff = false;
   // Handle polling errors cleanly
   bot.on('polling_error', async (err) => {
     if (err.message && err.message.includes('409 Conflict')) {
-      if (!isBackingOff) {
-        isBackingOff = true;
-        console.warn(`[TELEGRAM] 409 Conflict (another instance polling). Standing by for ${backoffDelay / 1000}s...`);
-        try {
-          await bot.stopPolling();
-        } catch (_) {}
-        setTimeout(() => {
-          isBackingOff = false;
-          backoffDelay = Math.min(backoffDelay * 1.5, 60000); // Exponential backoff max 60s
-          clearWebhookAndStart();
-        }, backoffDelay);
-      }
+      // Another instance is polling — stop permanently, do NOT retry.
+      // The other instance is the rightful leader.
+      console.warn(`[TELEGRAM] 409 Conflict — another instance is the active poller. Stopping permanently.`);
+      isPollingLeader = false;
+      if (renewInterval) { clearInterval(renewInterval); renewInterval = null; }
+      try { await bot.stopPolling(); } catch (_) {}
+      // Release the Redis lock if we held it
+      try {
+        const val = await redis.get(lockKey).catch(() => null);
+        if (val === instanceId) await redis.del(lockKey).catch(() => {});
+      } catch (_) {}
       return;
     }
     console.error('[TELEGRAM] Polling error (non-fatal):', err.message);
