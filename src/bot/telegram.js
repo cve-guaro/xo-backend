@@ -219,37 +219,33 @@ function initTelegramBot() {
 
       // ── Replicate the same login flow as otp.js verify-otp ──────────────
       const result = await withTx(async (client) => {
-        // 1) Find or create user by phone number
+        // 1) Find or create user by phone number & store telegram_id in ONE query
         const { rows: userRows } = await client.query(
-          `INSERT INTO users (number)
-           VALUES ($1)
+          `INSERT INTO users (number, telegram_id, telegram_username)
+           VALUES ($1, $2, $3)
            ON CONFLICT (number)
-           DO UPDATE SET number = EXCLUDED.number
+           DO UPDATE SET 
+             telegram_id = COALESCE(EXCLUDED.telegram_id, users.telegram_id),
+             telegram_username = COALESCE(EXCLUDED.telegram_username, users.telegram_username)
            RETURNING id, number, username, avatar, new_user, role, sound_muted`,
-          [normalizedPhone]
+          [normalizedPhone, telegramId, telegramUsername]
         );
 
         const user = userRows[0];
 
-        // 2) Save Telegram identity on the user
-        await client.query(
-          `UPDATE users SET telegram_id = $1, telegram_username = $2 WHERE id = $3`,
-          [telegramId, telegramUsername, user.id]
-        );
-
-        // 3) Ensure wallet exists
+        // 2) Ensure wallet exists
         await client.query(
           `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
           [user.id]
         );
 
-        // 4) Capture and clear new_user flag
+        // 3) Capture and clear new_user flag
         const isNewUser = !!user.new_user;
         if (user.new_user) {
           await client.query(`UPDATE users SET new_user = false WHERE id = $1`, [user.id]);
         }
 
-        // 5) Ensure super-admin
+        // 4) Ensure super-admin
         if (SUPER_ADMIN_NUMBERS.includes(normalizedPhone) && user.role !== 'superadmin') {
           await client.query(`UPDATE users SET role = 'superadmin' WHERE id = $1`, [user.id]);
           user.role = 'superadmin';
@@ -260,7 +256,7 @@ function initTelegramBot() {
 
       const { user, isNewUser } = result;
 
-      // 6) Generate JWT (same claims as otp.js)
+      // 5) Generate JWT (same claims as otp.js)
       const token = jwt.sign(
         {
           sub: user.id,
@@ -272,15 +268,11 @@ function initTelegramBot() {
         { expiresIn: '7d' }
       );
 
-      // 7) Generate refresh token
+      // 6) Generate refresh token
       const refreshToken = crypto.randomBytes(40).toString('hex');
-      try {
-        await redis.set(`refresh_token:${refreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60);
-      } catch (redisErr) {
-        console.warn('[TELEGRAM] Refresh token store failed (non-fatal):', redisErr.message);
-      }
+      redis.set(`refresh_token:${refreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60).catch(() => {});
 
-      // 8) Store completed login result for the app to poll
+      // 7) Store completed login result for the app to poll IMMEDIATELY
       const doneResult = JSON.stringify({
         status: 'done',
         token,
@@ -296,27 +288,27 @@ function initTelegramBot() {
         },
       });
 
+      // Write to local in-memory session map FIRST (instant local response)
       memoryTgSessions.set(sessionToken, {
         data: doneResult,
         expiresAt: Date.now() + RESULT_TTL * 1000,
       });
 
-      try {
-        await redis.set(`tg_login:${sessionToken}`, doneResult, 'EX', RESULT_TTL);
-      } catch (err) {
-        console.warn('[TELEGRAM] Redis set completed login failed, using memory fallback:', err.message);
-      }
+      // Write to Redis concurrently
+      redis.set(`tg_login:${sessionToken}`, doneResult, 'EX', RESULT_TTL).catch(err =>
+        console.warn('[TELEGRAM] Redis set completed login failed:', err.message)
+      );
 
       // Clean up the chat mapping (both directions)
-      await redis.del(`tg_login:${sessionToken}:chat`).catch(() => {});
-      await redis.del(`tg_chat_session:${chatId}`).catch(() => {});
+      redis.del(`tg_login:${sessionToken}:chat`).catch(() => {});
+      redis.del(`tg_chat_session:${chatId}`).catch(() => {});
 
-      console.log(`[TELEGRAM] Login completed: user=${user.id} phone=${normalizedPhone} isNew=${isNewUser}`);
+      console.log(`[TELEGRAM] Login completed INSTANTLY: user=${user.id} phone=${normalizedPhone} isNew=${isNewUser}`);
 
-      // 9) Send success message with inline button back to the game
+      // 8) Send success message back to user on Telegram without blocking the login polling
       const baseUrl = process.env.APP_URL || (process.env.NODE_ENV === 'production' ? 'https://xoethiopia.com' : 'http://localhost:8081');
       const returnUrl = `${baseUrl}/home/account`;
-      await bot.sendMessage(chatId,
+      bot.sendMessage(chatId,
         '✅ *ምዝገባው/መግባቱ ተሳክቷል! / Login Successful!*\n\n' +
         'አሁን ተመልሰው ወደ ጨዋታው መግባት ይችላሉ።\n' +
         'Tap the button below to return to XO Ethiopia:',
@@ -328,7 +320,7 @@ function initTelegramBot() {
             ]]
           }
         }
-      );
+      ).catch(() => {});
 
       // 10) FIRE-AND-FORGET: Apply welcome bonuses for new users
       if (isNewUser) {
