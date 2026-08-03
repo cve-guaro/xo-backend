@@ -409,7 +409,7 @@ async function removeFromQueue(queueKey, userId) {
   return false;
 }
 
-async function startDirectMatch(io, userA, userB, betAmount) {
+async function startDirectMatch(io, userA, userB, betAmount, isRematch = false) {
   const sA = findSocketByUser(io, userA);
   const sB = findSocketByUser(io, userB);
   if (!sA || !sB) throw new Error(`OPPONENT_OFFLINE:${!sA ? userA : userB}`);
@@ -506,8 +506,8 @@ async function startDirectMatch(io, userA, userB, betAmount) {
     emitToUser(io, X, "match_found", payloadX);
     emitToUser(io, O, "match_found", payloadO);
 
-    // 3-second pre-start countdown
-    scheduleGameStart(io, matchId);
+    // 3-second pre-start countdown (0s for instant rematches)
+    scheduleGameStart(io, matchId, isRematch ? 0 : PRE_MATCH_DELAY_MS);
 
     return { matchId, X, O };
   } finally {
@@ -927,14 +927,14 @@ async function sweepStuckGames(io) {
 }
 
 // schedule actual game start after PRE_MATCH_DELAY_MS
-function scheduleGameStart(io, matchId) {
+function scheduleGameStart(io, matchId, delayMs = PRE_MATCH_DELAY_MS) {
   const game = activeGames.get(matchId);
   if (!game) return;
 
   // broadcast a start-soon notification
   io.to(matchId).emit("match_starting", {
     matchId,
-    startingInMs: PRE_MATCH_DELAY_MS,
+    startingInMs: delayMs,
   });
 
   if (game.startTimeout) clearTimeout(game.startTimeout);
@@ -2733,7 +2733,7 @@ function setupGameSocket(io) {
 
         // Try direct, immediate match (will apply same house cut + 3s delay)
         try {
-          const { matchId, X, O } = await startDirectMatch(io, userId, opponentId, Number(amount || 0));
+          const { matchId, X, O } = await startDirectMatch(io, userId, opponentId, Number(amount || 0), true);
 
           // Optional: notify that we're transitioning
           emitToUser(io, userId, "rematch_result", { accepted: true, matchId, youAre: X === userId ? "X" : "O" });
