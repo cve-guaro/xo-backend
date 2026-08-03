@@ -19,7 +19,7 @@ const initLimiter = rateLimit({
 // Rate limit: prevent poll spamming
 const pollLimiter = rateLimit({
   windowMs: 60_000,
-  max: 120,               // 120 polls per minute (2/sec is fine)
+  max: 200,               // 200 polls per minute (~3/sec for 600ms interval)
   message: { error: 'Too many requests.' },
 });
 

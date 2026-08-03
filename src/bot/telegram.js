@@ -129,22 +129,55 @@ function initTelegramBot() {
     console.error('[TELEGRAM] Polling error (non-fatal):', err.message);
   });
 
+  // ── In-memory chat↔session mapping (fallback when Redis is down) ─────────
+  const memoryChatSessions = new Map();   // chatId → sessionToken
+  const processedStarts = new Map();       // sessionToken → timestamp (dedup)
+
   // ── Handle /start <sessionToken> ──────────────────────────────────────────
   bot.onText(/\/start (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const sessionToken = match[1];
 
+    // ── DEDUPLICATION: Prevent duplicate /start for the same session ──
+    const now = Date.now();
+    if (processedStarts.has(sessionToken)) {
+      const lastTime = processedStarts.get(sessionToken);
+      if (now - lastTime < 10000) { // within 10s → skip duplicate
+        console.log(`[TELEGRAM] Ignoring duplicate /start for session ${sessionToken.slice(0, 8)}…`);
+        return;
+      }
+    }
+    processedStarts.set(sessionToken, now);
+    // Cleanup old entries every 100 calls
+    if (processedStarts.size > 200) {
+      for (const [key, ts] of processedStarts) {
+        if (now - ts > 300000) processedStarts.delete(key);
+      }
+    }
+
     try {
-      // Verify session exists in Redis
-      const sessionData = await redis.get(`tg_login:${sessionToken}`);
+      // Verify session exists — check Redis first, then memory fallback
+      let sessionData = await redis.get(`tg_login:${sessionToken}`).catch(() => null);
+
+      if (!sessionData && memoryTgSessions.has(sessionToken)) {
+        const mem = memoryTgSessions.get(sessionToken);
+        if (Date.now() <= mem.expiresAt) {
+          sessionData = mem.data;
+        } else {
+          memoryTgSessions.delete(sessionToken);
+        }
+      }
+
       if (!sessionData) {
         return bot.sendMessage(chatId,
           '❌ ጊዜው ያለፈበት ሊንክ ነው።\n\nLink expired. Please go back to XO ET and try again.');
       }
 
-      // Store which chat is linked to this session (forward + reverse lookup)
-      await redis.set(`tg_login:${sessionToken}:chat`, String(chatId), 'EX', SESSION_TTL);
-      await redis.set(`tg_chat_session:${chatId}`, sessionToken, 'EX', SESSION_TTL);
+      // Store chat↔session mapping in MEMORY (always available) + Redis (best-effort)
+      memoryChatSessions.set(String(chatId), sessionToken);
+
+      redis.set(`tg_login:${sessionToken}:chat`, String(chatId), 'EX', SESSION_TTL).catch(() => {});
+      redis.set(`tg_chat_session:${chatId}`, sessionToken, 'EX', SESSION_TTL).catch(() => {});
 
       // Show the special "Share Phone Number" keyboard button
       await bot.sendMessage(chatId,
@@ -186,12 +219,18 @@ function initTelegramBot() {
   // ── Helper to process phone login for both contact & text messages ────────
   async function processPhoneLogin(chatId, phone, msg) {
     try {
-      // Direct reverse lookup — we stored chatId→sessionToken in /start handler
+      // Direct reverse lookup — try Redis first, then memory fallback
       let sessionToken = null;
       try {
         sessionToken = await redis.get(`tg_chat_session:${chatId}`);
       } catch (redisErr) {
         console.warn('[TELEGRAM] Redis get chat session failed:', redisErr.message);
+      }
+
+      // Memory fallback if Redis was unavailable
+      if (!sessionToken && memoryChatSessions.has(String(chatId))) {
+        sessionToken = memoryChatSessions.get(String(chatId));
+        console.log(`[TELEGRAM] Used memory fallback for chat ${chatId} → session ${sessionToken?.slice(0, 8)}…`);
       }
 
       if (!sessionToken) {
@@ -202,8 +241,14 @@ function initTelegramBot() {
         );
       }
 
-      // Verify the session is still active
-      const sessionCheck = await redis.get(`tg_login:${sessionToken}`);
+      // Verify the session is still active — check Redis first, then memory
+      let sessionCheck = await redis.get(`tg_login:${sessionToken}`).catch(() => null);
+      if (!sessionCheck && memoryTgSessions.has(sessionToken)) {
+        const mem = memoryTgSessions.get(sessionToken);
+        if (Date.now() <= mem.expiresAt) {
+          sessionCheck = mem.data;
+        }
+      }
       if (!sessionCheck) {
         return bot.sendMessage(chatId,
           '❌ Session expired. Go back to XO ET and try again.',
@@ -299,7 +344,8 @@ function initTelegramBot() {
         console.warn('[TELEGRAM] Redis set completed login failed:', err.message)
       );
 
-      // Clean up the chat mapping (both directions)
+      // Clean up the chat mapping (both directions — Redis + memory)
+      memoryChatSessions.delete(String(chatId));
       redis.del(`tg_login:${sessionToken}:chat`).catch(() => {});
       redis.del(`tg_chat_session:${chatId}`).catch(() => {});
 
