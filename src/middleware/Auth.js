@@ -52,14 +52,14 @@ async function auth(req, res, next) {
       return next();
     }
 
-    // No token provided at all
     return res.status(401).json({ error: 'Unauthorized' });
   } catch (err) {
-    // TokenExpiredError is NORMAL — user just needs to refresh. Never flag as anomaly.
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token expired' });
+    // TokenExpiredError or stale signature from client local storage is NORMAL — user just needs to re-auth. Never flag as anomaly.
+    const msg = String(err.message || '').toLowerCase();
+    if (err.name === 'TokenExpiredError' || msg.includes('invalid signature') || msg.includes('jwt malformed') || msg.includes('jwt expired')) {
+      return res.status(401).json({ error: 'Unauthorized', code: 'INVALID_TOKEN' });
     }
-    // All other JWT errors (forged token, invalid signature) ARE suspicious
+    // All other suspicious JWT crashes (e.g. injection attempts) ARE logged
     await logAnomaly(req, `JWT validation crash: ${err.message}`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
