@@ -423,15 +423,13 @@ router.post('/redeem-code', auth, async (req, res) => {
 
     const cleanCode = code.trim().toUpperCase();
 
-    // Find active promocode
+    // Find active promocode (robust query)
     const codeRes = await pool.query(`
       SELECT * FROM promocodes 
       WHERE UPPER(code) = $1 
-        AND status = 'ACTIVE'
+        AND (is_active IS NULL OR is_active = true)
         AND (starts_at IS NULL OR starts_at <= NOW())
-        AND (ends_at IS NULL OR ends_at >= NOW())
-        AND (usage_limit IS NULL OR usage_count < usage_limit)
-      FOR UPDATE
+        AND (expires_at IS NULL OR expires_at >= NOW())
     `, [cleanCode]);
 
     if (codeRes.rows.length === 0) {
@@ -439,6 +437,17 @@ router.post('/redeem-code', auth, async (req, res) => {
     }
 
     const promocode = codeRes.rows[0];
+
+    // Check usage limit if set
+    if (promocode.usage_limit !== null && promocode.usage_limit !== undefined && promocode.usage_limit > 0) {
+      const claimCountRes = await pool.query(
+        `SELECT COUNT(*)::int AS cnt FROM promocode_claims WHERE promocode_id = $1`,
+        [promocode.id]
+      );
+      if ((claimCountRes.rows[0]?.cnt || 0) >= Number(promocode.usage_limit)) {
+        return res.status(400).json({ error: 'Code usage limit reached' });
+      }
+    }
 
     // Check if user already used it
     const usageRes = await pool.query(`
@@ -465,10 +474,10 @@ router.post('/redeem-code', auth, async (req, res) => {
       INSERT INTO promocode_claims (promocode_id, user_id) VALUES ($1, $2)
     `, [promocode.id, userId]);
 
-    // Update usage count
+    // Update usage count if column exists
     await pool.query(`
-      UPDATE promocodes SET usage_count = usage_count + 1 WHERE id = $1
-    `, [promocode.id]);
+      UPDATE promocodes SET usage_count = COALESCE(usage_count, 0) + 1 WHERE id = $1
+    `).catch(() => {});
 
     // Log bonus
     await pool.query(`

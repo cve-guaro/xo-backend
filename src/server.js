@@ -692,6 +692,28 @@ async function runMigrations() {
     // Add starts_at column to promo_popups (for older installs that lack it)
     await pool.query(`ALTER TABLE promo_popups ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;`);
 
+    // Ensure promocodes table and all columns exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS promocodes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code TEXT UNIQUE NOT NULL,
+        amount NUMERIC NOT NULL DEFAULT 0,
+        description TEXT,
+        target_type TEXT DEFAULT 'ALL',
+        usage_limit INT,
+        usage_count INT DEFAULT 0,
+        status TEXT DEFAULT 'ACTIVE',
+        starts_at TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`ALTER TABLE promocodes ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ACTIVE';`);
+    await pool.query(`ALTER TABLE promocodes ADD COLUMN IF NOT EXISTS usage_count INT DEFAULT 0;`);
+    await pool.query(`ALTER TABLE promocodes ADD COLUMN IF NOT EXISTS usage_limit INT;`);
+    await pool.query(`ALTER TABLE promocodes ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;`);
+    await pool.query(`ALTER TABLE promocodes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`);
+
     // Create notifications table for in-app notification system
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notifications (

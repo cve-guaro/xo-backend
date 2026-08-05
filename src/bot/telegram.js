@@ -15,6 +15,8 @@ const SESSION_TTL = 300;     // 5 minutes — how long a login session lives
 const RESULT_TTL  = 120;     // 2 minutes — how long the completed result stays for polling
 
 let bot = null;
+// In-memory fallback for Telegram login sessions when Redis circuit breaker is open
+const memoryTgSessions = new Map();
 
 /**
  * Normalize phone number to the canonical 251XXXXXXXXX format
@@ -444,12 +446,6 @@ function initTelegramBot() {
   console.log(`[TELEGRAM] Bot @${BOT_USERNAME} initialized and polling.`);
   return bot;
 }
-
-/**
- * Create a new login session. Returns { sessionToken, deepLink }.
- */
-// In-memory fallback for Telegram login sessions when Redis circuit breaker is open
-const memoryTgSessions = new Map();
 
 /**
  * Create a new login session. Returns { sessionToken, deepLink }.
