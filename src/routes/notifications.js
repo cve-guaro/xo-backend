@@ -34,13 +34,26 @@ router.get('/user', authUser, async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 50), 100);
     const offset = Number(req.query.offset || 0);
 
-    const { rows } = await pool.query(`
+    let { rows } = await pool.query(`
       SELECT id, type, title, message, read, meta, created_at
       FROM notifications
       WHERE user_id = $1
       ORDER BY created_at DESC
       LIMIT $2 OFFSET $3
     `, [req.userId, limit, offset]);
+
+    if (rows.length === 0 && offset === 0) {
+      await pool.query(`
+        INSERT INTO notifications (user_id, type, title, message, meta)
+        VALUES ($1, 'welcome', '👋 Welcome to XO Ethiopia!', 'Play XO and Spin games to win real prizes daily. Good luck!', '{}'::jsonb)
+      `, [req.userId]).catch(() => {});
+
+      const retry = await pool.query(`
+        SELECT id, type, title, message, read, meta, created_at
+        FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
+      `, [req.userId, limit, offset]);
+      rows = retry.rows;
+    }
 
     const countRes = await pool.query(`SELECT COUNT(*) as total FROM notifications WHERE user_id = $1`, [req.userId]);
 

@@ -309,7 +309,7 @@ async function resolveRound(io, round) {
         [round.id]
       );
 
-      // Emit global win event (same pattern as XO Game)
+      // Emit global win event & create user in-app notification
       if (!winner.isBot) {
         io.emit("global_win", {
           username: winner.username,
@@ -317,6 +317,17 @@ async function resolveRound(io, round) {
           timestamp: Date.now(),
           game_type: "SPIN",
         });
+
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, message, meta)
+           VALUES ($1, 'spin_win', $2, $3, $4::jsonb)`,
+          [
+            winner.userId,
+            '🎯 Spin Victory!',
+            `Congratulations ${winner.username}! You won ${Number(round.prizeAmount).toLocaleString()} ETB in Spin Wheel (${round.mode === 'RAIL' ? 'Real Spin' : '5-Player'})!`,
+            JSON.stringify({ roundId: round.id, prizeAmount: round.prizeAmount, mode: round.mode })
+          ]
+        ).catch(err => console.error('[NOTIFICATIONS] Spin win notification error:', err.message));
       }
     }
   } catch (err) {
@@ -708,6 +719,21 @@ function setupSpinSocket(io) {
         const config = configs.find(c => c.name === mode || (mode === "5_PLAYER" && c.id === 1) || (mode === "RAIL" && c.id === 2));
         if (!config) {
           return ack?.({ ok: false, error: "INVALID_ROOM" });
+        }
+
+        // Check Granular 3-Switch Spin Locks
+        const spinLockAll = await getGlobalSetting("spin_lock_all", false);
+        const spinLockRail = await getGlobalSetting("spin_lock_rail", false);
+        const spinLock5p = await getGlobalSetting("spin_lock_5p", false);
+
+        if (spinLockAll === true || spinLockAll === 'true') {
+          return ack?.({ ok: false, error: "SPIN_LOCKED", message: "Spin game rooms are currently locked for maintenance." });
+        }
+        if (mode === "RAIL" && (spinLockRail === true || spinLockRail === 'true')) {
+          return ack?.({ ok: false, error: "SPIN_LOCKED", message: "Real Spin (Rail) mode is currently locked for maintenance." });
+        }
+        if (mode === "5_PLAYER" && (spinLock5p === true || spinLock5p === 'true')) {
+          return ack?.({ ok: false, error: "SPIN_LOCKED", message: "5-Player Spin mode is currently locked for maintenance." });
         }
 
         // Get user info
