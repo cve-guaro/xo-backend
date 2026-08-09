@@ -2058,7 +2058,7 @@ router.get('/maintenance/settings', async (req, res) => {
     if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
       return res.status(403).json({ error: 'Permission denied' });
     }
-    const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist')");
+    const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist', 'leaderboard_enabled', 'mobile_app_lockout')");
     const settings = {};
     rows.forEach(r => settings[r.key] = r.value);
     res.json(settings);
@@ -2081,6 +2081,8 @@ router.post('/maintenance/settings', async (req, res) => {
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
       [key, JSON.stringify(value)]
     );
+    const { invalidateGlobalSettingCache } = require('../db/index');
+    invalidateGlobalSettingCache(key);
     res.json({ ok: true });
   } catch (err) {
     console.error('[ADMIN] POST /maintenance/settings err', err);

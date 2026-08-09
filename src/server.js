@@ -470,15 +470,15 @@ async function runMigrations() {
     );
     console.log('[DB] Seeded two spin room configs and spin_5p_entry_amount global setting.');
 
-    // Add is_bot column to users table and seed 30 bot users
+    // Add is_bot column to users table and seed realistic Ethiopian bot users
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN DEFAULT false;`);
     const BOT_NICKNAMES = [
-      "Xo_King", "SpinMaster", "LuckyBirr", "EthioGamer", "Nati_Pro", 
-      "HabeshaWin", "Abush99", "BetMaster", "GoldSpin", "MeronX",
-      "DiceKing", "FastSpin", "TopPlayer", "WinnerET", "ProGamer99",
-      "SpinLord", "BetaGamer", "XO_Champ", "LuckyStar", "CashKing",
-      "GameOn", "EthioSpin", "PlayHard", "SpinGeek", "NoLuck",
-      "BigWinner", "SilentBet", "NightOwl", "QuickSpin", "Ace_Player"
+      "Yonas14", "Selam_B", "Nardos22", "Biniam_M", "Kaleb01", "Hana_G", "Mekdes7", 
+      "Dawit_A", "Fitsum99", "Rediet_N", "Samri23", "Nahom_T", "Betty_44", "Meklit_S", 
+      "Robel19", "Sara_K", "Yohannes5", "Liya_B", "Abel_D", "Mimi_23", "Naod88", 
+      "Bethel_G", "Hermon12", "Tsion_A", "Sami_45", "Kidus07", "Feven_M", "Elias_K", 
+      "Natnael9", "Rahel22", "Dagim_T", "Samuel04", "Winta_B", "Amanuel7", 
+      "player123", "newuser5", "guest22", "justme_1"
     ];
     for (const name of BOT_NICKNAMES) {
       const botRes = await pool.query(
@@ -495,7 +495,7 @@ async function runMigrations() {
         );
       }
     }
-    console.log('[DB] Seeded 30 bot users in DB.');
+    console.log('[DB] Seeded realistic Ethiopian bot users in DB.');
 
     // Unconditional schema updates & index creation for performance & gameplay features
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS room_2_wins INTEGER DEFAULT 0;`);

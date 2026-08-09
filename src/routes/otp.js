@@ -94,16 +94,21 @@ function normalizeNumber(n) {
   // Canonical format: 251XXXXXXXXX (12 digits, no leading +)
   let digits = String(n || '').replace(/[^0-9]/g, '');
 
-  // +251 or 251 prefix (12 digits)
-  if (/^251\d{9}$/.test(digits)) return digits;
+  // 1) Handle double prefix or leading zero after country code: 25109XXXXXXXX → 2519XXXXXXXX, 25107XXXXXXXX → 2517XXXXXXXX
+  if (/^2510[79]\d{8}$/.test(digits)) {
+    digits = `251${digits.slice(4)}`;
+  }
 
-  // 0-prefixed local format (10 digits): 09xxxxxxxx → 251xxxxxxxxx
-  if (/^0\d{9}$/.test(digits)) return `251${digits.slice(1)}`;
+  // 2) Standard 251 format (12 digits): 2519XXXXXXXX or 2517XXXXXXXX
+  if (/^251[79]\d{8}$/.test(digits)) return digits;
 
-  // Bare 9-digit local: 9xxxxxxxx → 2519xxxxxxxx
-  if (/^\d{9}$/.test(digits)) return `251${digits}`;
+  // 3) 0-prefixed local format (10 digits): 09xxxxxxxx → 2519xxxxxxxx, 07xxxxxxxx → 2517xxxxxxxx
+  if (/^0[79]\d{8}$/.test(digits)) return `251${digits.slice(1)}`;
 
-  // Fallback: return as-is (will likely fail validation downstream)
+  // 4) Bare 9-digit local: 9xxxxxxxx → 2519xxxxxxxx, 7xxxxxxxx → 2517xxxxxxxx
+  if (/^[79]\d{8}$/.test(digits)) return `251${digits}`;
+
+  // Fallback: return as-is
   return digits;
 }
 
@@ -126,6 +131,14 @@ router.post('/request-otp', async (req, res) => {
     if (!raw) return res.status(400).json({ error: 'number is required' });
 
     const number = normalizeNumber(raw);
+
+    // ─── Safaricom Pre-check ────────────────────────
+    if (number.startsWith('2517')) {
+      return res.status(400).json({
+        error: 'SAFARICOM_NOT_SUPPORTED',
+        message: 'Safaricom numbers are currently not supported for SMS. Please use an Ethio Telecom number (09...).',
+      });
+    }
 
     // ─── Per-phone rate limit ───────────────────────
     const allowed = await checkPhoneRateLimit(number);

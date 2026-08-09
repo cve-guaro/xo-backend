@@ -41,6 +41,21 @@ async function getSettings(keys) {
 // ─── GET /leaderboard/weekly — Top 50 + current user rank ─────────────────────
 router.get('/weekly', auth, async (req, res) => {
   try {
+    const config = await getSettings(['leaderboard_enabled']);
+    const isEnabled = config.leaderboard_enabled !== false && config.leaderboard_enabled !== 'false';
+    if (!isEnabled) {
+      return res.json({
+        enabled: false,
+        message: 'Leaderboard is currently offline for maintenance.',
+        leaderboard: [],
+        top3: [],
+        myRank: null,
+        prizes: [],
+        total: 0,
+        secondsRemaining: 0,
+      });
+    }
+
     const userId = req.user.id || req.user.userId || req.user.sub;
     const { weekStart, weekEnd } = getWeekBounds();
 
@@ -68,6 +83,7 @@ router.get('/weekly', auth, async (req, res) => {
         JOIN users u ON u.id = g.winner
         WHERE g.status IN ('completed', 'finished')
           AND g.winner IS NOT NULL
+          AND COALESCE(u.is_bot, false) = false
           AND g.created_at >= $1 AND g.created_at <= $2
       `;
       const countParams = [weekStart.toISOString(), weekEnd.toISOString()];
@@ -93,6 +109,7 @@ router.get('/weekly', auth, async (req, res) => {
         JOIN users u ON u.id = g.winner
         WHERE g.status IN ('completed', 'finished')
           AND g.winner IS NOT NULL
+          AND COALESCE(u.is_bot, false) = false
           AND g.created_at >= $1 AND g.created_at <= $2
       `;
       const itemsParams = [weekStart.toISOString(), weekEnd.toISOString()];
@@ -132,6 +149,7 @@ router.get('/weekly', auth, async (req, res) => {
         JOIN users u ON u.id = g.winner
         WHERE g.status IN ('completed', 'finished')
           AND g.winner IS NOT NULL
+          AND COALESCE(u.is_bot, false) = false
           AND g.created_at >= $1 AND g.created_at <= $2
         GROUP BY u.id, u.username, u.avatar
         ORDER BY wins DESC, MAX(g.created_at) ASC
@@ -278,6 +296,18 @@ router.get('/weekly', auth, async (req, res) => {
 // ─── GET /leaderboard/podium — Top 3 for home widget (lightweight) ────────────
 router.get('/podium', auth, async (req, res) => {
   try {
+    const config = await getSettings(['leaderboard_enabled']);
+    const isEnabled = config.leaderboard_enabled !== false && config.leaderboard_enabled !== 'false';
+    if (!isEnabled) {
+      return res.json({
+        enabled: false,
+        message: 'Leaderboard is currently offline for maintenance.',
+        podium: [],
+        myRank: null,
+        myWins: 0,
+      });
+    }
+
     const userId = req.user.id || req.user.userId || req.user.sub;
     const { weekStart, weekEnd } = getWeekBounds();
 
@@ -292,6 +322,7 @@ router.get('/podium', auth, async (req, res) => {
       JOIN users u ON u.id = g.winner
       WHERE g.status IN ('completed', 'finished')
         AND g.winner IS NOT NULL
+        AND COALESCE(u.is_bot, false) = false
         AND g.created_at >= $1 AND g.created_at <= $2
       GROUP BY u.id, u.username, u.avatar
       ORDER BY wins DESC, MAX(g.created_at) ASC

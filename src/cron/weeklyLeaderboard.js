@@ -20,6 +20,17 @@ function getPrevWeekBounds() {
 
 async function runWeeklyLeaderboardSnapshot() {
   console.log('[LEADERBOARD CRON] Starting weekly snapshot process...');
+
+  // Check if leaderboard feature is enabled globally
+  const { rows: enabledRes } = await pool.query(
+    `SELECT value FROM global_settings WHERE key = 'leaderboard_enabled'`
+  );
+  const leaderboardEnabled = enabledRes.length > 0 ? (enabledRes[0].value === true || enabledRes[0].value === 'true') : true;
+  if (!leaderboardEnabled) {
+    console.log('[LEADERBOARD CRON] Leaderboard is globally disabled (leaderboard_enabled=false). Skipping payouts.');
+    return;
+  }
+
   const { weekStart, weekEnd } = getPrevWeekBounds();
   const weekStartStr = weekStart.toISOString().slice(0, 10);
   const weekEndStr = weekEnd.toISOString().slice(0, 10);
@@ -52,6 +63,7 @@ async function runWeeklyLeaderboardSnapshot() {
     JOIN users u ON u.id = g.winner
     WHERE g.status IN ('completed', 'finished')
       AND g.winner IS NOT NULL
+      AND COALESCE(u.is_bot, false) = false
       AND g.created_at >= $1 AND g.created_at <= $2
     GROUP BY u.id, u.username, u.number
     ORDER BY wins DESC
