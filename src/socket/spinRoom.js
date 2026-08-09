@@ -1020,6 +1020,7 @@ function setupSpinSocket(io) {
         playerToRound.delete(userId);
         socket.leave(`spin:${round.id}`);
 
+        broadcastRoomUpdate(io, round);
         broadcastToRound(io, round, "spin:player_left", {
           roundId: round.id,
           userId,
@@ -1037,6 +1038,50 @@ function setupSpinSocket(io) {
       } catch (err) {
         console.error(`${LOG_PREFIX} spin:leave error:`, err.message);
         ack?.({ ok: false, error: "LEAVE_FAILED" });
+      }
+    });
+
+    // ── Handle socket disconnect for spin rooms ──────────────────────────
+    socket.on("disconnect", async () => {
+      try {
+        const userId = socket.data?.userId;
+        const roundId = socket.data?.spinRoundId || (userId ? playerToRound.get(userId) : null);
+        if (!roundId) return;
+
+        const round = activeSpinRounds.get(roundId);
+        if (!round) return;
+
+        if (round.status === "waiting" || round.status === "pre_countdown") {
+          const pIdx = round.players.findIndex(p => p.userId === userId && !p.isBot);
+          if (pIdx !== -1) {
+            const player = round.players[pIdx];
+            await refundWager({
+              userId,
+              amount: player.stake,
+              bonusUsed: player.bonusUsed || 0,
+              roundId: round.id,
+              isBot: false,
+            }).catch(err => console.error(`${LOG_PREFIX} Refund on disconnect error:`, err.message));
+
+            round.players.splice(pIdx, 1);
+            round.players.forEach((p, i) => { p.seatIndex = i; });
+            if (userId) playerToRound.delete(userId);
+
+            broadcastRoomUpdate(io, round);
+            broadcastToRound(io, round, "spin:player_left", {
+              roundId: round.id,
+              userId,
+              currentPlayers: round.players.length,
+            });
+
+            const realPlayers = round.players.filter(p => !p.isBot);
+            if (realPlayers.length === 0) {
+              cancelRound(io, round);
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`${LOG_PREFIX} disconnect error:`, err.message);
       }
     });
 
