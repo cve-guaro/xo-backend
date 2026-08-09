@@ -136,9 +136,8 @@ function initTelegramBot() {
   // Handle polling errors cleanly
   bot.on('polling_error', async (err) => {
     if (err.message && err.message.includes('409 Conflict')) {
-      // Another instance is polling — stop permanently, do NOT retry.
-      // The other instance is the rightful leader.
-      console.warn(`[TELEGRAM] 409 Conflict — another instance is the active poller. Stopping permanently.`);
+      // Another instance is polling — stop permanently & stand by silently.
+      console.log(`[TELEGRAM] Standby mode active — another server instance is primary poller.`);
       isPollingLeader = false;
       if (renewInterval) { clearInterval(renewInterval); renewInterval = null; }
       try { await bot.stopPolling(); } catch (_) {}
