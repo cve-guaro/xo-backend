@@ -324,6 +324,7 @@ app.use("/api/transactions", txRoutes);
 app.use('/user', userRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use('/auth', telegramAuthRoutes);
+app.use('/api/auth', telegramAuthRoutes);
 app.use("/account", accountRoutes);
 app.use('/admin', adminRoutes);
 app.use('/notifications', require('./routes/notifications'));
