@@ -82,13 +82,8 @@ function initTelegramBot() {
         const result = await redis.set(lockKey, instanceId, "EX", 25, "NX");
         acquired = !!result; // NX returns null if key exists, "OK" if set
       } catch (redisErr) {
-        // Redis is down — only allow polling if we were already the leader,
-        // otherwise assume another instance is polling.
-        if (!isPollingLeader) {
-          console.log("[TELEGRAM] Redis unavailable and not already leader. Standing by...");
-          return;
-        }
-        // We were already polling, so continue
+        // If Redis is unavailable, allow local polling instance to proceed
+        console.warn("[TELEGRAM] Redis set lock check failed, proceeding with local bot poller:", redisErr.message);
         acquired = true;
       }
       
@@ -106,7 +101,7 @@ function initTelegramBot() {
           const val = await redis.get(lockKey).catch(() => null);
           if (val === instanceId) {
             await redis.expire(lockKey, 25).catch(() => {});
-          } else {
+          } else if (val) {
             // Another instance stole the lock — stop polling
             console.log("[TELEGRAM] Lost leader lock to another instance. Stopping polling.");
             isPollingLeader = false;
@@ -117,11 +112,14 @@ function initTelegramBot() {
         } catch (_) {}
       }, 12000);
 
-      // Always use deleteWebhook (lowercase 'h') — the uppercase variant is deprecated
-      await bot.deleteWebhook().catch(() => {});
+      // Always clear existing webhook and pending updates before starting polling
+      await bot.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
 
-      bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
-    } catch (_) {
+      await bot.startPolling({ params: { timeout: 10 } }).catch((pollErr) => {
+        console.warn("[TELEGRAM] Polling start notice:", pollErr.message);
+      });
+    } catch (err) {
+      console.warn("[TELEGRAM] Fallback polling attempt:", err.message);
       bot.startPolling({ params: { timeout: 10 } }).catch(() => {});
     }
   };

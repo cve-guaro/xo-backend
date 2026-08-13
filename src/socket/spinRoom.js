@@ -246,8 +246,8 @@ async function lockRound(io, round) {
     pot,
   });
 
-  // Start spin after brief pause (1.5s)
-  setTimeout(() => startSpin(io, round), 1500);
+  // Start spin after 3-second readiness countdown (3000ms)
+  setTimeout(() => startSpin(io, round), 3000);
 }
 
 // ── Spin phase ─────────────────────────────────────────────────────────────
