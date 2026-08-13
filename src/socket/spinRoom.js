@@ -262,6 +262,7 @@ function startSpin(io, round) {
   broadcastToRound(io, round, "spin:start", {
     roundId: round.id,
     winningSlice: round.winningSlice,
+    winnerId: round.winnerId,
     spinDuration,
     playerCount: round.players.length,
   });
