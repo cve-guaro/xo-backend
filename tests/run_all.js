@@ -246,6 +246,95 @@ async function insertGame(ageMinutes, bonusX = 0, bonusO = 0) {
   return rows[0].id;
 }
 
+async function t12() {
+  console.log('\nT12: ghost cron — bucket-correct refund, rerun no-op, payout_failed untouched');
+  const ghostCallback = getGhostCallback();
+  if (!ghostCallback) { report('T12 ghost callback captured', false); return; }
+  await resetUsers();
+  await pool.query(`DELETE FROM games WHERE (player_x = $1 OR player_o = $1)`, [USER_X]);
+
+  // Game with mixed stakes: X used 40 bonus + 60 real; O all real
+  const g = await insertGame(31, 40, 0);
+  await ghostCallback();
+  const grow = (await pool.query(`SELECT status FROM games WHERE id = $1`, [g])).rows[0];
+  const wx = await walletOf(USER_X), wo = await walletOf(USER_O);
+  report('T12 game marked completed', grow.status === 'completed');
+  report('T12 X buckets restored: avail=100 bonus=40 wd=60 (not all-withdrawable)',
+    wx.available_balance === 100 && wx.bonus_balance === 40 && wx.withdrawable_balance === 60, JSON.stringify(wx));
+  report('T12 O buckets restored: avail=100 bonus=0 wd=100',
+    wo.available_balance === 100 && wo.bonus_balance === 0 && wo.withdrawable_balance === 100, JSON.stringify(wo));
+
+  await ghostCallback(); // rerun: status guard -> no double refund
+  const wx2 = await walletOf(USER_X), wo2 = await walletOf(USER_O);
+  const refunds = (await txsOf(USER_X)).filter(t => t.tx_type === 'REFUND').length;
+  report('T12 rerun is a no-op (no double refund)',
+    wx2.available_balance === 100 && wo2.available_balance === 100 && refunds === 1, `refunds=${refunds}`);
+
+  await pool.query(`DELETE FROM games WHERE id = $1`, [g]);
+  await checkInvariant('T12');
+}
+
+async function t13() {
+  console.log('\nT13: admin manual refund — keyed to original tx, double-click pays once');
+  // Extract the real POST /refund handler from the router stack
+  const adminRouter = require('../src/routes/admin');
+  let refundHandler = null;
+  for (const layer of adminRouter.stack) {
+    if (layer.route && layer.route.path === '/refund') {
+      const handles = layer.route.stack.filter(l => l.handle);
+      refundHandler = handles[handles.length - 1].handle;
+    }
+  }
+  if (!refundHandler) { report('T13 handler extracted', false); return; }
+
+  await resetUsers();
+  // A completed DEPOSIT tx to refund against
+  const dep = await pool.query(`SELECT fn_wallet_apply_tx($1, 'DEPOSIT', 200, 'COMPLETED', 'TEST_T13_ORIG', 'CHAPA', NULL, '{}'::jsonb) AS id`, [USER_X]);
+  const origTxId = dep.rows[0].id;
+
+  function callRefund() {
+    const res = {
+      statusCode: 0, _resolve: null,
+      status(c) { this.statusCode = c; return this; },
+      json(o) { this._body = o; if (this._resolve) this._resolve({ status: this.statusCode || 200, body: o }); return this; }
+    };
+    const req = {
+      body: { phoneOrUsername: '0900000099', amount: 50, reason: 'T13', target: 'available', originalTxId: origTxId },
+      user: { id: '00000000-0000-0000-0000-000000000001' }, params: {}, query: {}
+    };
+    return new Promise(resolve => {
+      res._resolve = resolve;
+      try { refundHandler(req, res, () => resolve({ status: 'next' })); }
+      catch (e) { resolve({ status: 'throw', body: { error: e.message } }); }
+    });
+  }
+
+  // Sequential: second call rejected with 409
+  const r1 = await callRefund();
+  const r2 = await callRefund();
+  const wx = await walletOf(USER_X);
+  const ledger = (await txsOf(USER_X)).filter(t => t.idempotency_key === `MANUAL_REFUND:${origTxId}`);
+  report('T13 first refund succeeds (200)', r1.status === 200, JSON.stringify(r1.body?.error || 'ok'));
+  report('T13 second refund rejected (409 already refunded)', r2.status === 409, JSON.stringify(r2.body));
+  report('T13 wallet credited exactly once (200 dep + 50 refund = 250)', wx.available_balance === 250, JSON.stringify(wx));
+  report('T13 exactly one MANUAL_REFUND ledger row', ledger.length === 1);
+
+  // Parallel: race two refunds of a fresh original tx
+  const dep2 = await pool.query(`SELECT fn_wallet_apply_tx($1, 'DEPOSIT', 200, 'COMPLETED', 'TEST_T13_ORIG2', 'CHAPA', NULL, '{}'::jsonb) AS id`, [USER_X]);
+  // T13 uses a closure over origTxId; emulate the parallel race with settle-level equivalent:
+  // two concurrent ledgerFirstCredit inserts with the same key inside withTx
+  const { withTx: withTxDb } = require('../src/db');
+  const { ledgerFirstCredit } = require('../src/models/ledgerFirstCredit');
+  const key = `MANUAL_REFUND:${dep2.rows[0].id}`;
+  const results = await Promise.all([
+    withTxDb(c => ledgerFirstCredit(c, { userId: USER_X, txType: 'REFUND', amount: 30, idempotencyKey: key, provider: 'ADMIN_REFUND' })),
+    withTxDb(c => ledgerFirstCredit(c, { userId: USER_X, txType: 'REFUND', amount: 30, idempotencyKey: key, provider: 'ADMIN_REFUND' }))
+  ]);
+  const insertedCount = results.filter(r => r.inserted).length;
+  report('T13 parallel same-key inserts -> exactly one winner', insertedCount === 1, `inserted=${insertedCount}`);
+  await checkInvariant('T13');
+}
+
 async function t11() {
   console.log('\nT11: finishAndPayout — happy path, forced failure -> payout_failed, ghost cron skips it');
   const ghostCallback = getGhostCallback();
@@ -310,7 +399,9 @@ async function main() {
   await t8(); await resetUsers();
   await t9(); await resetUsers();
   await t10(); await resetUsers();
-  await t11();
+  await t11(); await resetUsers();
+  await t12(); await resetUsers();
+  await t13();
 
   await checkInvariant('final');
   const ok = summary();
