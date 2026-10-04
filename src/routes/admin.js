@@ -14,7 +14,7 @@ const { sendSMS } = require('../utils/sms');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { emitToUserEvent } = require('../socket/game');
+const { emitToUserEvent, finishAndPayout } = require('../socket/game');
 
 
 const router = express.Router();
@@ -3190,6 +3190,80 @@ router.delete('/leaderboard/fake-users/:id', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] DELETE /leaderboard/fake-users/:id error:', err);
     res.status(500).json({ error: 'Failed to delete fake leaderboard user' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// PAYOUT_FAILED GAMES — stakes locked, admin resolves
+// ──────────────────────────────────────────────
+
+// GET /admin/games/payout-failed — list games whose payout failed 3x
+router.get('/games/payout-failed', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT g.id, g.player_x, g.player_o, g.bet_amount, g.status, g.created_at, g.finished_at,
+             px.username AS player_x_name, po.username AS player_o_name
+      FROM games g
+      LEFT JOIN users px ON px.id = g.player_x
+      LEFT JOIN users po ON po.id = g.player_o
+      WHERE g.status = 'payout_failed'
+      ORDER BY g.finished_at DESC
+      LIMIT 100
+    `);
+    return res.json({ ok: true, games: rows });
+  } catch (err) {
+    console.error('[ADMIN] /games/payout-failed error:', err);
+    res.status(500).json({ error: 'Failed to list payout-failed games' });
+  }
+});
+
+// POST /admin/games/:gameId/pay-winner — resolve a payout_failed game through the
+// SAME idempotent payout used by gameplay (finishAndPayout). Second clicks are
+// rejected because the game is no longer payout_failed; if the payout fails 3x
+// again the game returns to payout_failed with a fresh alert.
+router.post('/games/:gameId/pay-winner', async (req, res) => {
+  try {
+    const { gameId } = req.params;
+    const { winnerSymbol } = req.body;
+    if (!['X', 'O'].includes(winnerSymbol)) {
+      return res.status(400).json({ error: "winnerSymbol must be 'X' or 'O'" });
+    }
+
+    const { rows } = await pool.query(`SELECT * FROM games WHERE id = $1`, [gameId]);
+    if (!rows.length) return res.status(404).json({ error: 'Game not found' });
+    const game = rows[0];
+    if (game.status !== 'payout_failed') {
+      return res.status(409).json({ error: `Game status is '${game.status}', not 'payout_failed' (already resolved?)` });
+    }
+
+    const winnerUserId = winnerSymbol === 'X' ? game.player_x : game.player_o;
+    if (!winnerUserId) return res.status(400).json({ error: `Player ${winnerSymbol} not found on this game` });
+
+    // Same prize formula as gameplay
+    const prize = Math.floor(Number(game.bet_amount) * 2 * 0.9);
+
+    // Re-activate the row (finishAndPayout only pays 'ongoing' games). The claim
+    // UPDATE is the once-guard: a parallel second click claims 0 rows.
+    const claim = await pool.query(
+      `UPDATE games SET status = 'ongoing', finished_at = NULL WHERE id = $1 AND status = 'payout_failed' RETURNING id`,
+      [gameId]
+    );
+    if (!claim.rows.length) {
+      return res.status(409).json({ error: 'Game already being resolved or resolved' });
+    }
+
+    await finishAndPayout(gameId, winnerSymbol, winnerUserId, prize);
+
+    const after = (await pool.query(`SELECT status, winner::text AS winner FROM games WHERE id = $1`, [gameId])).rows[0];
+    await logAdminAction(req.user.id, 'payout_failed_pay_winner', winnerUserId, { gameId, winnerSymbol, prize, result: after.status });
+
+    if (after.status === 'completed') {
+      return res.json({ ok: true, message: `Winner paid ${prize} ETB (game completed)`, game: after });
+    }
+    return res.status(503).json({ error: 'Payout failed again — game returned to payout_failed; check system_alerts' });
+  } catch (err) {
+    console.error('[ADMIN] /games/:gameId/pay-winner error:', err);
+    res.status(err.status || 500).json({ error: err.message || 'Failed to pay winner' });
   }
 });
 

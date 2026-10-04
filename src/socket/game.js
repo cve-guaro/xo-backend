@@ -901,6 +901,9 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       `INSERT INTO system_alerts (event_type, details, severity) VALUES ($1, $2::jsonb, 'critical')`,
       ['PAYOUT_FAILED', JSON.stringify({ gameId, status, winnerUserId, prizeAmount, error: lastErr ? String(lastErr.message) : 'unknown' })]
     );
+    // Push notification to the operator channel (Telegram when configured; logs otherwise)
+    const { sendAdminAlert } = require('../utils/adminAlert');
+    sendAdminAlert('PAYOUT_FAILED', `Game ${gameId}: payout failed 3x — stakes locked, admin action required (pay winner from /admin/games/payout-failed)`, { gameId, status, winnerUserId, prizeAmount });
   } catch (markErr) {
     console.error(`[finishAndPayout] failed to mark game ${gameId} as payout_failed:`, markErr.message);
   }
