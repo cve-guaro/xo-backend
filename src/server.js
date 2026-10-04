@@ -407,6 +407,12 @@ initTelegramBot();
 const { initCron } = require('./cron');
 initCron();
 
+// ─── IDEMPOTENCY INDEX GUARD (fail closed) ─────────────────────────────────────
+// All ledgerFirstCredit credit paths depend on uq_wallet_tx_idem (migration 008).
+// If it is missing/invalid, credits are refused and a critical alert is raised.
+const { checkIdempotencyIndex } = require('./models/idempotencyIndex');
+checkIdempotencyIndex();
+
 // ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
 // Awaited on startup so the database schema is guaranteed to be ready before accepting requests.
 async function runMigrations() {
