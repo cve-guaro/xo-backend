@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const { pool } = require('./db'); // Assuming pool is exported from db/index.js
 const { verifyPendingPayouts } = require('./cron/verifyPendingPayouts');
 const { verifyPendingDeposits } = require('./cron/verifyPendingDeposits');
+const { ledgerFirstCredit } = require('./models/ledgerFirstCredit');
 
 function initCron() {
   console.log('[CRON] Initializing background scheduler...');
@@ -10,15 +11,15 @@ function initCron() {
   cron.schedule('*/10 * * * *', async () => {
     try {
       console.log('[CRON] Running Ghost Game Cleanup...');
-      
+
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-        
+
         const { rows: stuckGames } = await client.query(`
-          UPDATE games 
-          SET status = 'completed', winner = NULL, finished_at = NOW() 
-          WHERE status IN ('ongoing', 'live', 'countdown') 
+          UPDATE games
+          SET status = 'completed', winner = NULL, finished_at = NOW()
+          WHERE status IN ('ongoing', 'live', 'countdown')
             AND created_at < NOW() - INTERVAL '30 MINUTES'
           RETURNING id, player_x, player_o, bet_amount
         `);
@@ -27,41 +28,47 @@ function initCron() {
           const betAmount = Number(game.bet_amount || 0);
           if (betAmount > 0) {
             if (game.player_x) {
-              await client.query(`
-                UPDATE wallets 
-                SET available_balance = available_balance + $1,
-                    withdrawable_balance = withdrawable_balance + $1,
-                    updated_at = NOW()
-                WHERE user_id = $2
-              `, [betAmount, game.player_x]);
-              await client.query(`
-                INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-                VALUES ($1, 'REFUND', $2, 'COMPLETED', 'GHOST_CLEANUP', $3, $4)
-                ON CONFLICT (user_id, idempotency_key) DO NOTHING
-              `, [game.player_x, betAmount, JSON.stringify({ gameId: game.id, reason: 'Ghost game cleanup' }), `GHOST_REFUND_${game.id}_X`]);
+              // Ledger-first: the GHOST_REFUND ledger row is the double-refund guard.
+              // Credit the wallet only if the ledger row was actually inserted.
+              const { inserted: insX } = await ledgerFirstCredit(client, {
+                userId: game.player_x, txType: 'REFUND', amount: betAmount,
+                idempotencyKey: `GHOST_REFUND_${game.id}_X`, provider: 'GHOST_CLEANUP',
+                meta: { gameId: game.id, reason: 'Ghost game cleanup' }
+              });
+              if (insX) {
+                await client.query(`
+                  UPDATE wallets
+                  SET available_balance = available_balance + $1,
+                      withdrawable_balance = withdrawable_balance + $1,
+                      updated_at = NOW()
+                  WHERE user_id = $2
+                `, [betAmount, game.player_x]);
+              }
             }
             if (game.player_o) {
-              await client.query(`
-                UPDATE wallets 
-                SET available_balance = available_balance + $1,
-                    withdrawable_balance = withdrawable_balance + $1,
-                    updated_at = NOW()
-                WHERE user_id = $2
-              `, [betAmount, game.player_o]);
-              await client.query(`
-                INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-                VALUES ($1, 'REFUND', $2, 'COMPLETED', 'GHOST_CLEANUP', $3, $4)
-                ON CONFLICT (user_id, idempotency_key) DO NOTHING
-              `, [game.player_o, betAmount, JSON.stringify({ gameId: game.id, reason: 'Ghost game cleanup' }), `GHOST_REFUND_${game.id}_O`]);
+              const { inserted: insO } = await ledgerFirstCredit(client, {
+                userId: game.player_o, txType: 'REFUND', amount: betAmount,
+                idempotencyKey: `GHOST_REFUND_${game.id}_O`, provider: 'GHOST_CLEANUP',
+                meta: { gameId: game.id, reason: 'Ghost game cleanup' }
+              });
+              if (insO) {
+                await client.query(`
+                  UPDATE wallets
+                  SET available_balance = available_balance + $1,
+                      withdrawable_balance = withdrawable_balance + $1,
+                      updated_at = NOW()
+                  WHERE user_id = $2
+                `, [betAmount, game.player_o]);
+              }
             }
           }
         }
 
-        
+
         if (stuckGames.length > 0) {
           console.log(`[CRON] Cleaned up & refunded ${stuckGames.length} stuck games.`);
         }
-        
+
         await client.query('COMMIT');
       } catch (err) {
         await client.query('ROLLBACK');

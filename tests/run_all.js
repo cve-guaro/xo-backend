@@ -214,6 +214,26 @@ async function t9() {
   await checkInvariant('T9');
 }
 
+async function t10() {
+  console.log('\nT10: leaderboard Send & Snapshot double-click (real handler, 3 parallel iterations)');
+  const lb = require('./leaderboardHandler');
+  if (!lb.handlerAvailable) { report('T10 handler extracted', false); return; }
+  let doubleCredits = 0;
+  for (let i = 0; i < 3; i++) {
+    await lb.setupWeek();
+    await Promise.allSettled([lb.callHandler(), lb.callHandler()]);
+    const m = await lb.measureWeek();
+    if (m.avail > 500 || m.blogs > 1) doubleCredits++;
+    if (i === 0) console.log(`    sample state: avail=+${m.avail} snaps=${m.snaps} ledger=${m.ledger} bonus_logs=${m.blogs}`);
+  }
+  const m = await lb.measureWeek();
+  report('T10 no double credit across 3 parallel double-clicks', doubleCredits === 0, `doubleCredits=${doubleCredits}`);
+  report('T10 ledger row exists for the prize (never swallowed)', m.ledger >= 1);
+  report('T10 exactly one bonus_logs row', m.blogs === 1, `blogs=${m.blogs}`);
+  await lb.cleanupWeek();
+  await checkInvariant('T10');
+}
+
 async function main() {
   console.log('PREFLIGHT: checking dev server is stopped...');
   await assertServerStopped();
@@ -229,7 +249,8 @@ async function main() {
   await t6(); await resetUsers();
   await t7(); await resetUsers();
   await t8(); await resetUsers();
-  await t9();
+  await t9(); await resetUsers();
+  await t10();
 
   await checkInvariant('final');
   const ok = summary();

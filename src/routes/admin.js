@@ -2762,75 +2762,75 @@ router.post('/leaderboard/snapshot', async (req, res) => {
 
       // If auto-approve, add prize to bonus_balance
       if (autoApprove && prizeAmount > 0) {
-        await pool.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
-        await pool.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
-        
-        // Log transaction in wallet_transactions
-        try {
-          await pool.query(
-            `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-             VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
-             ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
-            [
-              user.id,
-              prizeAmount,
-              JSON.stringify({ rank: i + 1, weekStart: weekStartStr }),
-              `LEADERBOARD_PRIZE_${weekStartStr}_${i + 1}`
-            ]
-          );
-        } catch (txErr) {
-          console.error('[ADMIN SNAPSHOT] wallet_transactions insert failed:', txErr);
-        }
-        
-        try {
-          const weekStartMD = formatMonthDay(weekStartStr);
-          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
-          await pool.query(`
-            UPDATE users
-            SET raw_user_meta_data = jsonb_set(
-              COALESCE(raw_user_meta_data, '{}'::jsonb),
-              '{accomplishments}',
-              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
-            )
-            WHERE id = $2
-          `, [accomplishmentStr, user.id]);
-        } catch (err) {
-          console.error('[ADMIN SNAPSHOT] accomplishment update failed:', err);
-        }
+        // Ledger-first award: the LEADERBOARD_PRIZE ledger row is the double-credit
+        // guard — the wallet is credited only if the row was actually inserted.
+        const { inserted } = await withTx(async (txClient) => {
+          const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
+          const { inserted } = await ledgerFirstCredit(txClient, {
+            userId: user.id, txType: 'PRIZE', amount: prizeAmount,
+            idempotencyKey: `LEADERBOARD_PRIZE_${weekStartStr}_${i + 1}`, provider: 'LEADERBOARD_PRIZE',
+            meta: { rank: i + 1, weekStart: weekStartStr }
+          });
+          if (!inserted) return { inserted: false };
 
-        // Create customized in-app notification
-        const notifMsg = notificationTemplate
-          .replace('{username}', user.username || '')
-          .replace('{rank}', String(i + 1))
-          .replace('{wins}', String(user.wins))
-          .replace('{prize}', String(prizeAmount));
+          await txClient.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
+          await txClient.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
+          return { inserted: true };
+        });
 
-        const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
-        await pool.query(`
-          INSERT INTO notifications (user_id, type, title, message, meta)
-          VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
-        `, [
-          user.id,
-          rankLabels[i] || `#${i + 1} Weekly Award`,
-          notifMsg,
-          JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
-        ]).catch(err => console.error('[SNAPSHOT] notification failed:', err));
+        if (inserted) {
+          try {
+            const weekStartMD = formatMonthDay(weekStartStr);
+            const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
+            await pool.query(`
+              UPDATE users
+              SET raw_user_meta_data = jsonb_set(
+                COALESCE(raw_user_meta_data, '{}'::jsonb),
+                '{accomplishments}',
+                (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+              )
+              WHERE id = $2
+            `, [accomplishmentStr, user.id]);
+          } catch (err) {
+            console.error('[ADMIN SNAPSHOT] accomplishment update failed:', err);
+          }
 
-        // Send congratulations SMS
-        const { rows: uInfo } = await pool.query(`SELECT number FROM users WHERE id = $1`, [user.id]);
-        const phone = uInfo[0]?.number;
-        if (phone) {
-          const smsMsg = smsTemplate
+          // Create customized in-app notification
+          const notifMsg = notificationTemplate
             .replace('{username}', user.username || '')
             .replace('{rank}', String(i + 1))
+            .replace('{wins}', String(user.wins))
             .replace('{prize}', String(prizeAmount));
-          
-          try {
-            console.log(`[SNAPSHOT ADMIN] Sending SMS to ${user.username} (${phone})...`);
-            await sendSMS(phone, smsMsg).catch(() => false);
-          } catch (e) {
-            console.error(`[SNAPSHOT ADMIN] SMS error for ${user.username}:`, e.message);
+
+          const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+          await pool.query(`
+            INSERT INTO notifications (user_id, type, title, message, meta)
+            VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+          `, [
+            user.id,
+            rankLabels[i] || `#${i + 1} Weekly Award`,
+            notifMsg,
+            JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
+          ]).catch(err => console.error('[SNAPSHOT] notification failed:', err));
+
+          // Send congratulations SMS
+          const { rows: uInfo } = await pool.query(`SELECT number FROM users WHERE id = $1`, [user.id]);
+          const phone = uInfo[0]?.number;
+          if (phone) {
+            const smsMsg = smsTemplate
+              .replace('{username}', user.username || '')
+              .replace('{rank}', String(i + 1))
+              .replace('{prize}', String(prizeAmount));
+
+            try {
+              console.log(`[SNAPSHOT ADMIN] Sending SMS to ${user.username} (${phone})...`);
+              await sendSMS(phone, smsMsg).catch(() => false);
+            } catch (e) {
+              console.error(`[SNAPSHOT ADMIN] SMS error for ${user.username}:`, e.message);
+            }
           }
+        } else {
+          console.log(`[ADMIN SNAPSHOT] Rank #${i + 1} prize already awarded (ledger row exists) — skipping credit.`);
         }
       }
     }
@@ -2872,24 +2872,17 @@ router.post('/leaderboard/approve/:snapshotId', async (req, res) => {
 
       // Award prize if amount > 0
       if (prizeAmount > 0) {
-        await client.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snapshot.user_id]);
-        await client.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snapshot.user_id, prizeAmount, `Weekly Leaderboard #${snapshot.rank} Prize`]);
-        
-        // Log transaction in wallet_transactions
-        try {
-          await client.query(
-            `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-             VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
-             ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
-            [
-              snapshot.user_id,
-              prizeAmount,
-              JSON.stringify({ rank: snapshot.rank, weekStart: snapshot.week_start }),
-              `LEADERBOARD_PRIZE_${snapshot.id}`
-            ]
-          );
-        } catch (txErr) {
-          console.error('[ADMIN APPROVE] wallet_transactions insert failed:', txErr);
+        // Ledger-first: credit only if the LEADERBOARD_PRIZE ledger row inserted
+        const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
+        const { inserted } = await ledgerFirstCredit(client, {
+          userId: snapshot.user_id, txType: 'PRIZE', amount: prizeAmount,
+          idempotencyKey: `LEADERBOARD_PRIZE_${snapshot.id}`, provider: 'LEADERBOARD_PRIZE',
+          meta: { rank: snapshot.rank, weekStart: snapshot.week_start }
+        });
+
+        if (inserted) {
+          await client.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snapshot.user_id]);
+          await client.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snapshot.user_id, prizeAmount, `Weekly Leaderboard #${snapshot.rank} Prize`]);
         }
 
         try {
@@ -3001,28 +2994,22 @@ router.post('/leaderboard/approve-all', async (req, res) => {
         isApprovedInTx = true;
 
         if (prizeAmount > 0) {
-          // Credit wallet
-          await client.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snapItem.user_id]);
-          // Insert bonus log
-          await client.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snapItem.user_id, prizeAmount, `Weekly Leaderboard #${snapItem.rank} Prize`]);
-          
-          // Log transaction in wallet_transactions
-          try {
-            await client.query(
-              `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-               VALUES ($1, 'PRIZE', $2, 'COMPLETED', 'LEADERBOARD_PRIZE', $3, $4)
-               ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
-              [
-                snapItem.user_id,
-                prizeAmount,
-                JSON.stringify({ rank: snapItem.rank, weekStart: snapItem.week_start }),
-                `LEADERBOARD_PRIZE_${snapItem.id}`
-              ]
-            );
-          } catch (txErr) {
-            console.error('[ADMIN APPROVE ALL] wallet_transactions insert failed:', txErr);
+          // Ledger-first: credit only if the LEADERBOARD_PRIZE ledger row inserted
+          const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
+          const { inserted } = await ledgerFirstCredit(client, {
+            userId: snapItem.user_id, txType: 'PRIZE', amount: prizeAmount,
+            idempotencyKey: `LEADERBOARD_PRIZE_${snapItem.id}`, provider: 'LEADERBOARD_PRIZE',
+            meta: { rank: snapItem.rank, weekStart: snapItem.week_start }
+          });
+
+          if (inserted) {
+            await client.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, snapItem.user_id]);
+            await client.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [snapItem.user_id, prizeAmount, `Weekly Leaderboard #${snapItem.rank} Prize`]);
           }
-          
+          else {
+            console.log(`[ADMIN APPROVE ALL] snapshot ${snapItem.id} prize already awarded (ledger row exists) — skipping credit.`);
+          }
+
           try {
             const weekStartMD = formatMonthDay(snapItem.week_start);
             const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${snapItem.rank} - Awarded ${prizeAmount} ETB`;
