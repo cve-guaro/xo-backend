@@ -1589,6 +1589,15 @@ router.patch('/transactions/:id/reject', async (req, res) => {
     if (!txnRows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
 
     if (txnRows[0].tx_type === 'WITHDRAW_REQUEST') {
+      // POLICY: only PENDING_MANUAL withdrawals can be admin-rejected. A PENDING
+      // row has already been submitted to Chapa and is verified by reference by
+      // the cron — rejecting it here would refund a transfer that may still be
+      // delivered. (Old behaviour: any PENDING row could be rejected — KNOWN BUG
+      // marked todo in the test suite.)
+      const stRes = await pool.query(`SELECT status FROM wallet_transactions WHERE id = $1`, [req.params.id]);
+      if (stRes.rows[0]?.status === 'PENDING') {
+        throw Object.assign(new Error('PENDING withdrawals are verified by the payout cron — only PENDING_MANUAL can be admin-rejected'), { status: 409 });
+      }
       // settleWithdrawal runs its own guarded transaction: locks the row, only
       // settles PENDING/PENDING_MANUAL, writes the WITHDRAW_REFUND:{txId} ledger
       // row and updates withdraw_requests — same path as the cron refunds.
@@ -3321,14 +3330,22 @@ router.post('/refund', async (req, res) => {
     await withTx(async (client) => {
       // Lock the original transaction row — serializes concurrent refunds of it
       const { rows: origRows } = await client.query(
-        `SELECT id, user_id FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
+        `SELECT id, user_id, amount, tx_type FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
         [originalTxId]
       );
       if (!origRows.length) {
         throw Object.assign(new Error('Original transaction not found'), { status: 404 });
       }
-      if (String(origRows[0].user_id) !== String(userId)) {
+      const original = origRows[0];
+      if (String(original.user_id) !== String(userId)) {
         throw Object.assign(new Error('Original transaction belongs to a different user'), { status: 400 });
+      }
+      if (amountEtb > Math.round(Number(original.amount))) {
+        throw Object.assign(new Error(`Refund amount (${amountEtb}) exceeds the original transaction amount (${Math.round(Number(original.amount))})`), { status: 400 });
+      }
+      const REFUNDABLE_TYPES = ['DEPOSIT', 'PRIZE', 'WITHDRAW_REQUEST'];
+      if (!REFUNDABLE_TYPES.includes(original.tx_type)) {
+        throw Object.assign(new Error(`Refunds are only allowed for ${REFUNDABLE_TYPES.join('/')} transactions — the original is ${original.tx_type}`), { status: 400 });
       }
 
       // Ledger-first: MANUAL_REFUND:{originalTxId} is the once-only guard.
