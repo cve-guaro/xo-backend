@@ -316,48 +316,42 @@ async function requestWithdraw({ userId, phoneNumber, amount, payoutMethod, payo
     const chapaMsg = String(chapaErr?.response?.message || chapaErr?.message || '');
     console.error('[WITHDRAW] Chapa payout failed:', chapaErr?.response || chapaErr?.message);
 
-    const isInsufficient = chapaMsg.toLowerCase().includes('insufficient') || chapaMsg.toLowerCase().includes('balance');
-    const isInvalid = chapaMsg.toLowerCase().includes('invalid account') || chapaMsg.toLowerCase().includes('account not found');
+    const { classifyChapaInitError } = require('./classifyChapaInitError');
+    const { settleWithdrawal } = require('./settleWithdrawal');
+    const { classification, alert, reason } = classifyChapaInitError(chapaErr);
 
-    if (isInsufficient || isInvalid) {
-      // 🚨 COMPENSATION FIX: Refund the wallet and mark as FAILED
-      await withTx(async (client) => {
-        // Refund the deducted amount
-        await client.query(`
-          UPDATE wallets 
-          SET available_balance = available_balance + $1, 
-              withdrawable_balance = withdrawable_balance + $1
-          WHERE user_id = $2
-        `, [amountEtb, userId]);
-
-        // Mark the primary transaction as FAILED
-        await client.query(`
-          UPDATE transactions
-          SET status = 'FAILED'
-          WHERE tx_id = $1
-        `, [reserveTxId]);
-
-        // Mark the withdrawal request as FAILED
-        await client.query(`
-          UPDATE withdraw_requests
-          SET status = 'FAILED'
-          WHERE tx_id = $1
-        `, [reserveTxId]);
-      });
-
-      // Now throw the error to the frontend so it shows the alert
-      if (isInsufficient) {
-        const e = new Error('CHAPA_INSUFFICIENT_BALANCE');
-        e.status = 503;
-        throw e;
-      } else {
-        const e = new Error('CHAPA_INVALID_ACCOUNT');
-        e.status = 422;
-        throw e;
-      }
+    // Write system alert for auth errors (affects all payouts)
+    if (alert === 'CHAPA_AUTH') {
+      try {
+        await pool.query(
+          `INSERT INTO system_alerts (event_type, details, severity)
+           VALUES ($1, $2::jsonb, 'critical')`,
+          ['CHAPA_AUTH', JSON.stringify({ reason, userId, amount: amountEtb })]
+        );
+      } catch (_) { /* system_alerts table may not exist yet */ }
     }
 
-    // Non-critical: log but continue — DB committed, admin manually processes
+    if (classification === 'definitive') {
+      // Chapa explicitly rejected — safe to refund immediately
+      const result = await settleWithdrawal(reserveTxId, 'FAILED', {
+        reason,
+        provider: 'SYSTEM_AUTO_REFUND',
+        meta: { chapa_error: chapaMsg.slice(0, 200) }
+      });
+
+      if (!result.settled) {
+        console.warn('[WITHDRAW] settleWithdrawal did not settle (already processed?):', reserveTxId);
+      }
+
+      // Throw to the frontend so it shows the error
+      const isInsufficient = chapaMsg.toLowerCase().includes('insufficient') || chapaMsg.toLowerCase().includes('balance');
+      const e = new Error(isInsufficient ? 'CHAPA_INSUFFICIENT_BALANCE' : 'CHAPA_INVALID_ACCOUNT');
+      e.status = isInsufficient ? 503 : 422;
+      throw e;
+    }
+
+    // Ambiguous: leave PENDING, let the cron verify by reference
+    console.warn(`[WITHDRAW] Ambiguous Chapa error for TX ${reserveTxId} — leaving PENDING for cron. Reason: ${reason}`);
     chapaStatus = 'pending_manual';
   }
 

@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const { pool, withTx, redis, invalidateGlobalSettingCache } = require('../db/index');
 const { adminAuth, superAdminAuth } = require('../middleware/Auth');
 const { getChapaBalance } = require('../models/Chapa');
+const { settleWithdrawal } = require('../models/settleWithdrawal');
 const { CHAPA } = require('../env');
 const { sendSMS } = require('../utils/sms');
 const multer = require('multer');
@@ -1577,10 +1578,31 @@ router.patch('/transactions/:id/approve', async (req, res) => {
 // ──────────────────────────────────────────────
 // PATCH /admin/transactions/:id/reject
 // Marks a pending transaction as 'failed'
-// For withdrawals: refund balance
+// For withdrawals: refund balance via settleWithdrawal (guarded + ledger row)
 // ──────────────────────────────────────────────
 router.patch('/transactions/:id/reject', async (req, res) => {
   try {
+    const { rows: txnRows } = await pool.query(
+      `SELECT tx_type FROM wallet_transactions WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!txnRows.length) throw Object.assign(new Error('Transaction not found'), { status: 404 });
+
+    if (txnRows[0].tx_type === 'WITHDRAW_REQUEST') {
+      // settleWithdrawal runs its own guarded transaction: locks the row, only
+      // settles PENDING/PENDING_MANUAL, writes the WITHDRAW_REFUND:{txId} ledger
+      // row and updates withdraw_requests — same path as the cron refunds.
+      const result = await settleWithdrawal(req.params.id, 'FAILED', {
+        reason: 'Rejected by admin',
+        provider: 'ADMIN'
+      });
+      if (!result.settled) {
+        throw Object.assign(new Error('Transaction was already settled'), { status: 409 });
+      }
+      await logAdminAction(req.user.id, 'rejected_transaction', null, { tx_id: req.params.id, type: 'WITHDRAW_REQUEST', refunded: result.refunded });
+      return res.json({ ok: true });
+    }
+
     await withTx(async (client) => {
       const { rows } = await client.query(
         `SELECT * FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
