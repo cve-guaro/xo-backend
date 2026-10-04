@@ -32,6 +32,8 @@ const { pool, USER_X, USER_O, assertNoForeignDbClients, resetUsers, checkInvaria
 const { verifyPendingPayouts } = require('../src/cron/verifyPendingPayouts');
 const { settleWithdrawal } = require('../src/models/settleWithdrawal');
 const { classifyChapaInitError, DEFINITIVE_PATTERNS } = require('../src/models/classifyChapaInitError');
+const { getGhostCallback } = require('./cronCapture');
+const { finishAndPayout, activeGames } = require('../src/socket/game');
 
 function mkErr({ status, body, message, code }) {
   const e = new Error(message || 'err');
@@ -235,6 +237,62 @@ async function t10() {
   await checkInvariant('T10');
 }
 
+async function insertGame(ageMinutes, bonusX = 0, bonusO = 0) {
+  const { rows } = await pool.query(`
+    INSERT INTO games (player_x, player_o, bet_amount, status, winner, prize_amount, created_at, finished_at, moves, bonus_used_x, bonus_used_o)
+    VALUES ($1, $2, 100, 'ongoing', NULL, 0, now() - ($3 || ' minutes')::interval, NULL, '[]'::jsonb, $4, $5)
+    RETURNING id::text AS id
+  `, [USER_X, USER_O, String(ageMinutes), bonusX, bonusO]);
+  return rows[0].id;
+}
+
+async function t11() {
+  console.log('\nT11: finishAndPayout — happy path, forced failure -> payout_failed, ghost cron skips it');
+  const ghostCallback = getGhostCallback();
+  if (!ghostCallback) { report('T11 ghost callback captured', false); return; }
+  await resetUsers();
+  await pool.query(`DELETE FROM system_alerts WHERE event_type = 'PAYOUT_FAILED'`);
+  await pool.query(`DELETE FROM games WHERE (player_x = $1 OR player_o = $1)`, [USER_X]);
+
+  // 11a happy path: winner credited, game completed
+  const g1 = await insertGame(0);
+  activeGames.set(g1, { players: { X: USER_X, O: USER_O }, finished: false, moves: [] });
+  await finishAndPayout(g1, 'X', USER_X, 180);
+  const g1row = (await pool.query(`SELECT status, winner::text AS w, prize_amount::int AS p FROM games WHERE id = $1`, [g1])).rows[0];
+  const wx = await walletOf(USER_X);
+  report('T11a game completed with winner + prize', g1row.status === 'completed' && g1row.w === USER_X && g1row.p === 180, JSON.stringify(g1row));
+  report('T11a winner credited 180 (available & withdrawable, bonus_used=0)', wx.available_balance === 180 && wx.withdrawable_balance === 180 && wx.bonus_balance === 0, JSON.stringify(wx));
+  activeGames.delete(g1);
+
+  // 11b forced DB failure: all 3 attempts fail -> payout_failed + alert, no credit
+  const g2 = await insertGame(0);
+  activeGames.set(g2, { players: { X: USER_X, O: USER_O }, finished: false, moves: [] });
+  await pool.query('ALTER TABLE wallets RENAME TO wallets_t11_bak');
+  let markStatus = null;
+  try {
+    await finishAndPayout(g2, 'X', USER_X, 180);
+  } finally {
+    await pool.query('ALTER TABLE wallets_t11_bak RENAME TO wallets');
+  }
+  const g2row = (await pool.query(`SELECT status FROM games WHERE id = $1`, [g2])).rows[0];
+  const { rows: alerts } = await pool.query(`SELECT id FROM system_alerts WHERE event_type = 'PAYOUT_FAILED' AND details->>'gameId' = $1`, [g2]);
+  markStatus = g2row?.status;
+  report('T11b 3 failed attempts -> game marked payout_failed', markStatus === 'payout_failed', `status=${markStatus}`);
+  report('T11b PAYOUT_FAILED system alert written', alerts.length === 1);
+  report('T11b winner NOT credited beyond T11a (no silent refund)', (await walletOf(USER_X)).available_balance === 180);
+  activeGames.delete(g2);
+
+  // 11c ghost cron must NOT refund payout_failed games
+  await pool.query(`UPDATE games SET created_at = now() - interval '31 minutes' WHERE id = $1`, [g2]);
+  await ghostCallback();
+  const g2after = (await pool.query(`SELECT status FROM games WHERE id = $1`, [g2])).rows[0];
+  report('T11c ghost cron skips payout_failed (stakes left for admin)',
+    g2after.status === 'payout_failed' && (await walletOf(USER_X)).available_balance === 180 && (await walletOf(USER_O)).available_balance === 0);
+  await pool.query(`DELETE FROM games WHERE id IN ($1, $2)`, [g1, g2]);
+  await pool.query(`DELETE FROM system_alerts WHERE event_type = 'PAYOUT_FAILED'`);
+  await checkInvariant('T11');
+}
+
 async function main() {
   console.log('PREFLIGHT: checking dev server is stopped...');
   await assertServerStopped();
@@ -251,7 +309,8 @@ async function main() {
   await t7(); await resetUsers();
   await t8(); await resetUsers();
   await t9(); await resetUsers();
-  await t10();
+  await t10(); await resetUsers();
+  await t11();
 
   await checkInvariant('final');
   const ok = summary();

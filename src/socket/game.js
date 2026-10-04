@@ -690,8 +690,11 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
     gameObj.finished = true;
   }
 
-  // Fire-and-forget background transaction
-  tx(async (client) => {
+  // Awaited + retried payout. The tx body is idempotent (FOR UPDATE + status check),
+  // so replays after a failed attempt are safe. On final failure the game is marked
+  // 'payout_failed' for admin attention — the ghost cron must NOT refund these games.
+  let winnerUsername = null;
+  const runPayoutTx = () => tx(async (client) => {
     // Get game details to determine room and bonus used, with row lock
     const gameRes = await client.query(`SELECT status, bet_amount, player_x, player_o, bonus_used_x, bonus_used_o FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
     const game = gameRes.rows[0];
@@ -734,16 +737,9 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         WHERE user_id = $4
       `, [prizeAmount, bonusUsed, prizeWithdrawable, winnerUserId]);
 
-      // Fetch winner username and emit global win event
+      // Fetch winner username; the global win event is emitted only AFTER commit
       const userRes = await client.query(`SELECT username FROM users WHERE id = $1`, [winnerUserId]);
-      const username = userRes.rows[0]?.username || 'User';
-      if (globalIo) {
-        globalIo.emit("global_win", {
-          username: username,
-          amount: prizeAmount,
-          timestamp: Date.now()
-        });
-      }
+      winnerUsername = userRes.rows[0]?.username || 'User';
 
 
       // NOTE: Victory/loss notifications removed — already tracked by History page.
@@ -861,7 +857,36 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         ).catch(err => console.error('[finishAndPayout] O refund ledger failed:', err));
       }
     }
-  }).catch(err => console.error('[finishAndPayout] Background transaction failed:', err));
+  });
+
+  const MAX_ATTEMPTS = 3;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await runPayoutTx();
+
+      // Global win event only after a successful commit
+      if (winnerUsername && globalIo) {
+        globalIo.emit("global_win", { username: winnerUsername, amount: prizeAmount, timestamp: Date.now() });
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.error(`[finishAndPayout] payout attempt ${attempt}/${MAX_ATTEMPTS} failed for game ${gameId}:`, err.message);
+      await new Promise(r => setTimeout(r, 200 * attempt));
+    }
+  }
+
+  console.error(`[finishAndPayout] ALL ${MAX_ATTEMPTS} attempts failed for game ${gameId} — marking payout_failed`);
+  try {
+    await pool.query(`UPDATE games SET status = 'payout_failed', finished_at = NOW() WHERE id = $1 AND status = 'ongoing'`, [gameId]);
+    await pool.query(
+      `INSERT INTO system_alerts (event_type, details, severity) VALUES ($1, $2::jsonb, 'critical')`,
+      ['PAYOUT_FAILED', JSON.stringify({ gameId, status, winnerUserId, prizeAmount, error: lastErr ? String(lastErr.message) : 'unknown' })]
+    );
+  } catch (markErr) {
+    console.error(`[finishAndPayout] failed to mark game ${gameId} as payout_failed:`, markErr.message);
+  }
 }
 
 // ---------------- Game helpers ----------------
@@ -938,7 +963,7 @@ function scheduleGameStart(io, matchId, delayMs = PRE_MATCH_DELAY_MS) {
   });
 
   if (game.startTimeout) clearTimeout(game.startTimeout);
-  game.startTimeout = setTimeout(() => {
+  game.startTimeout = setTimeout(async () => {
     const g = activeGames.get(matchId);
     if (!g) return;
 
@@ -954,9 +979,7 @@ function scheduleGameStart(io, matchId, delayMs = PRE_MATCH_DELAY_MS) {
       const { prize } = calculatePrize(g.betAmount);
 
       if (winnerId) {
-        finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
-          console.error("Ghost cleanup payout err:", err)
-        );
+        await finishAndPayout(matchId, winnerSymbol, winnerId, prize);
         io.to(matchId).emit("game_won", {
           winnerSymbol,
           winnerId,
@@ -993,7 +1016,7 @@ function startTimer(io, matchId) {
   }
 
   if (game.timerInterval) clearInterval(game.timerInterval);
-  game.timerInterval = setInterval(() => {
+  game.timerInterval = setInterval(async () => {
     const g = activeGames.get(matchId);
     if (!g) return clearInterval(game.timerInterval);
     g.timers[g.turn]--;
@@ -1008,9 +1031,7 @@ function startTimer(io, matchId) {
       const prizeBirr = Number(prize); // TRANSLATOR: Send Birr
 
       if (winnerId) {
-        finishAndPayout(matchId, winnerSymbol, winnerId, prize).catch(err =>
-          console.error("finishAndPayout win err:", err)
-        );
+        await finishAndPayout(matchId, winnerSymbol, winnerId, prize);
         io.to(matchId).emit("game_won", { winnerSymbol, winnerId, reason: "win", prizeAmount: prizeBirr });
       }
       cleanupGame(matchId);
@@ -2522,9 +2543,7 @@ function setupGameSocket(io) {
         clearInterval(game.timerInterval);
         const { prize } = calculatePrize(game.betAmount); // use room-specific cut
         const prizeBirr = Number(prize); // TRANSLATOR: Send Birr to client
-        finishAndPayout(matchId, symbol, userId, prize).catch(err =>
-          console.error("finishAndPayout win err:", err)
-        );
+        await finishAndPayout(matchId, symbol, userId, prize);
         io.to(matchId).emit("game_won", { winnerSymbol: symbol, winnerId: userId, reason: "win", prizeAmount: prizeBirr });
         cleanupGame(matchId);
         return;
@@ -2847,10 +2866,11 @@ const emitToUserEvent = (userId, event, payload) => {
   }
 };
 
-module.exports = { 
-  setupGameSocket, 
-  ROOMS_CONFIG, 
-  determineRoomByBetAmount, 
+module.exports = {
+  setupGameSocket,
+  ROOMS_CONFIG,
+  determineRoomByBetAmount,
   activeGames,
-  emitToUserEvent
+  emitToUserEvent,
+  finishAndPayout
 };
