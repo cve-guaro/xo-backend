@@ -3194,14 +3194,18 @@ router.delete('/leaderboard/fake-users/:id', async (req, res) => {
 });
 
 // POST /admin/refund — Manual refund issuance
+// Requires the ORIGINAL transaction id: the refund is keyed to it
+// (MANUAL_REFUND:{origTxId}), the original row is locked, and a second refund of
+// the same original transaction is rejected — a double-click can only ever pay once.
 router.post('/refund', async (req, res) => {
   try {
-    const { phoneOrUsername, amount, reason, target = 'available' } = req.body;
+    const { phoneOrUsername, amount, reason, target = 'available', originalTxId } = req.body;
     if (!phoneOrUsername || !amount) return res.status(400).json({ error: 'phoneOrUsername and amount are required' });
+    if (!originalTxId) return res.status(400).json({ error: 'originalTxId is required — refunds must reference the transaction being refunded' });
     if (!['available', 'withdrawable', 'both'].includes(target)) {
       return res.status(400).json({ error: 'Invalid target wallet' });
     }
-    
+
     const amountEtb = Math.round(Number(amount)); // Amount in ETB
     if (!Number.isFinite(amountEtb) || amountEtb <= 0) {
       return res.status(400).json({ error: 'Invalid amount' });
@@ -3237,62 +3241,90 @@ router.post('/refund', async (req, res) => {
     const user = userRes.rows[0];
     const userId = user.id;
 
-    // Credit user's wallet based on target
-    if (target === 'withdrawable') {
-      await pool.query(
-        `INSERT INTO wallets (user_id, withdrawable_balance) VALUES ($1, $2)
-         ON CONFLICT (user_id) DO UPDATE 
-         SET withdrawable_balance = wallets.withdrawable_balance + EXCLUDED.withdrawable_balance, updated_at = now()`,
-        [userId, amountEtb]
+    let resultTx = null;
+    let alreadyRefunded = false;
+
+    await withTx(async (client) => {
+      // Lock the original transaction row — serializes concurrent refunds of it
+      const { rows: origRows } = await client.query(
+        `SELECT id, user_id FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
+        [originalTxId]
       );
-    } else if (target === 'both') {
-      await pool.query(
-        `INSERT INTO wallets (user_id, available_balance, withdrawable_balance) VALUES ($1, $2, $2)
-         ON CONFLICT (user_id) DO UPDATE 
-         SET available_balance = wallets.available_balance + EXCLUDED.available_balance,
-             withdrawable_balance = wallets.withdrawable_balance + EXCLUDED.withdrawable_balance,
-             updated_at = now()`,
-        [userId, amountEtb]
+      if (!origRows.length) {
+        throw Object.assign(new Error('Original transaction not found'), { status: 404 });
+      }
+      if (String(origRows[0].user_id) !== String(userId)) {
+        throw Object.assign(new Error('Original transaction belongs to a different user'), { status: 400 });
+      }
+
+      // Ledger-first: MANUAL_REFUND:{originalTxId} is the once-only guard.
+      // A repeat (double-click, second admin) inserts nothing and credits nothing.
+      const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
+      const { inserted } = await ledgerFirstCredit(client, {
+        userId, txType: 'REFUND', amount: amountEtb,
+        idempotencyKey: `MANUAL_REFUND:${originalTxId}`, provider: 'ADMIN_REFUND',
+        meta: {
+          reason: reason || 'Manual Admin Refund',
+          adminId: req.user.id,
+          targetBalance: target,
+          originalTxId
+        }
+      });
+
+      if (!inserted) {
+        alreadyRefunded = true;
+        return;
+      }
+
+      // Credit user's wallet based on target — same tx as the ledger row
+      if (target === 'withdrawable') {
+        await client.query(
+          `INSERT INTO wallets (user_id, withdrawable_balance) VALUES ($1, $2)
+           ON CONFLICT (user_id) DO UPDATE
+           SET withdrawable_balance = wallets.withdrawable_balance + EXCLUDED.withdrawable_balance, updated_at = now()`,
+          [userId, amountEtb]
+        );
+      } else if (target === 'both') {
+        await client.query(
+          `INSERT INTO wallets (user_id, available_balance, withdrawable_balance) VALUES ($1, $2, $2)
+           ON CONFLICT (user_id) DO UPDATE
+           SET available_balance = wallets.available_balance + EXCLUDED.available_balance,
+               withdrawable_balance = wallets.withdrawable_balance + EXCLUDED.withdrawable_balance,
+               updated_at = now()`,
+          [userId, amountEtb]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO wallets (user_id, available_balance) VALUES ($1, $2)
+           ON CONFLICT (user_id) DO UPDATE
+           SET available_balance = wallets.available_balance + EXCLUDED.available_balance, updated_at = now()`,
+          [userId, amountEtb]
+        );
+      }
+
+      // Send Notification to user
+      await client.query(
+        `INSERT INTO notifications (user_id, type, title, message)
+         VALUES ($1, 'REFUND', 'Refund Processed', $2)`,
+        [userId, `A refund of ${amountEtb} ETB has been credited to your account. Reason: ${reason || 'Manual Admin Refund'}`]
       );
-    } else {
-      await pool.query(
-        `INSERT INTO wallets (user_id, available_balance) VALUES ($1, $2)
-         ON CONFLICT (user_id) DO UPDATE 
-         SET available_balance = wallets.available_balance + EXCLUDED.available_balance, updated_at = now()`,
-        [userId, amountEtb]
+
+      resultTx = await client.query(
+        `SELECT * FROM wallet_transactions WHERE idempotency_key = $1`,
+        [`MANUAL_REFUND:${originalTxId}`]
       );
+    });
+
+    if (alreadyRefunded) {
+      return res.status(409).json({ error: `Original transaction ${originalTxId} has already been refunded` });
     }
 
-    // Insert transaction
-    const { rows: txRows } = await pool.query(
-      `INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, meta, idempotency_key)
-       VALUES ($1, 'REFUND', $2, 'COMPLETED', 'ADMIN_REFUND', $3, $4)
-       RETURNING *`,
-      [
-        userId,
-        amountEtb,
-        JSON.stringify({ 
-          reason: reason || 'Manual Admin Refund', 
-          adminId: req.user.id,
-          targetBalance: target
-        }),
-        `MANUAL_REFUND_${Date.now()}_${userId.slice(0, 8)}`
-      ]
-    );
+    await logAdminAction(req.user.id, 'manual_refund', userId, { amount: amountEtb, reason, target, originalTxId });
 
-    // Send Notification to user
-    await pool.query(
-      `INSERT INTO notifications (user_id, type, title, message) 
-       VALUES ($1, 'REFUND', 'Refund Processed', $2)`,
-      [userId, `A refund of ${amountEtb} ETB has been credited to your account. Reason: ${reason || 'Manual Admin Refund'}`]
-    );
-
-    await logAdminAction(req.user.id, 'manual_refund', userId, { amount: amountEtb, reason, target });
-
-    return res.json({ ok: true, message: `Successfully refunded ${amount} ETB to ${user.username}`, transaction: txRows[0] });
+    return res.json({ ok: true, message: `Successfully refunded ${amount} ETB to ${user.username}`, transaction: resultTx.rows[0] });
   } catch (err) {
     console.error('[ADMIN] POST /refund error:', err);
-    res.status(500).json({ error: 'Failed to issue refund: ' + err.message });
+    res.status(err.status || 500).json({ error: 'Failed to issue refund: ' + err.message });
   }
 });
 
