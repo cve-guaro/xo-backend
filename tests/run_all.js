@@ -34,6 +34,7 @@ const { settleWithdrawal } = require('../src/models/settleWithdrawal');
 const { classifyChapaInitError, DEFINITIVE_PATTERNS } = require('../src/models/classifyChapaInitError');
 const { getGhostCallback } = require('./cronCapture');
 const { finishAndPayout, activeGames } = require('../src/socket/game');
+const { checkIdempotencyIndex } = require('../src/models/idempotencyIndex');
 
 function mkErr({ status, body, message, code }) {
   const e = new Error(message || 'err');
@@ -237,6 +238,229 @@ async function t10() {
   await checkInvariant('T10');
 }
 
+// Replicates game.js's stake deduction verbatim (bonus-first + GREATEST clamps)
+// and records the bucket split the new game.js code records on the games row.
+async function applyStake(gameId, betAmount = 100, userId = USER_X, side = 'x') {
+  const w = (await pool.query(`SELECT available_balance, bonus_balance, withdrawable_balance FROM wallets WHERE user_id = $1`, [userId])).rows[0];
+  const bonusToUse = Math.min(Number(w.bonus_balance), betAmount);
+  const realToUse = betAmount - bonusToUse;
+  const wdUsed = Math.min(Number(w.withdrawable_balance), realToUse);
+  const lockedUsed = realToUse - wdUsed;
+  await pool.query(`
+    UPDATE wallets
+    SET available_balance = GREATEST(available_balance - $1, 0),
+        bonus_balance = GREATEST(bonus_balance - $2, 0),
+        withdrawable_balance = GREATEST(withdrawable_balance - $3, 0),
+        updated_at = now()
+    WHERE user_id = $4
+  `, [betAmount, bonusToUse, realToUse, userId]);
+  await pool.query(`
+    UPDATE games SET
+      bonus_used_${side} = $2,
+      withdrawable_used_${side} = $3,
+      locked_used_${side} = $4
+    WHERE id = $1
+  `, [gameId, bonusToUse, wdUsed, lockedUsed]);
+  return { bonusToUse, wdUsed, lockedUsed };
+}
+
+async function freshGame(ageMin = 31) {
+  const { rows } = await pool.query(`
+    INSERT INTO games (player_x, player_o, bet_amount, status, winner, prize_amount, created_at, finished_at, moves, bonus_used_x, bonus_used_o)
+    VALUES ($1, $2, 100, 'ongoing', NULL, 0, now() - ($3 || ' minutes')::interval, NULL, '[]'::jsonb, 0, 0)
+    RETURNING id::text AS id
+  `, [USER_X, USER_O, String(ageMin)]);
+  return rows[0].id;
+}
+
+async function t14() {
+  console.log('\nT14: rollover — deposit-only wallet, stake 100, refunds must NOT create withdrawable money');
+  const ghostCallback = getGhostCallback();
+  await resetUsers();
+  await pool.query(`DELETE FROM games WHERE player_x = $1`, [USER_X]);
+
+  // (i) ghost-cron refund
+  await pool.query(`UPDATE wallets SET available_balance = 100, withdrawable_balance = 0, bonus_balance = 0 WHERE user_id = $1`, [USER_X]);
+  const g1 = await freshGame(31);
+  await applyStake(g1);
+  await ghostCallback();
+  let w = await walletOf(USER_X);
+  report('T14-i ghost refund keeps deposit money non-withdrawable (wd=0)', w.available_balance === 100 && w.withdrawable_balance === 0 && w.bonus_balance === 0, JSON.stringify(w));
+
+  // (ii) game.js stale refund via finishAndPayout(matchId, 'refund', null, 0)
+  await pool.query(`UPDATE wallets SET available_balance = 100, withdrawable_balance = 0, bonus_balance = 0 WHERE user_id = $1`, [USER_X]);
+  const g2 = await freshGame(31);
+  await applyStake(g2);
+  activeGames.set(g2, { players: { X: USER_X, O: USER_O }, finished: false, moves: [] });
+  await finishAndPayout(g2, 'refund', null, 0);
+  w = await walletOf(USER_X);
+  report('T14-ii stale refund keeps deposit money non-withdrawable (wd=0)', w.available_balance === 100 && w.withdrawable_balance === 0 && w.bonus_balance === 0, JSON.stringify(w));
+  await pool.query(`DELETE FROM games WHERE id IN ($1,$2)`, [g1, g2]);
+  activeGames.delete(g2);
+  await checkInvariant('T14');
+}
+
+async function t15() {
+  console.log('\nT15: mixed buckets — stake 100 from bonus 30 / withdrawable 50 / deposit 20 restores exactly');
+  const ghostCallback = getGhostCallback();
+  await resetUsers();
+  await pool.query(`DELETE FROM games WHERE player_x = $1`, [USER_X]);
+
+  // deposit 100 then 30 bonus gift: avail 130, wd 0, bonus 30. Grant wd 50 directly
+  // (as a prize would) to model avail=130, wd=50, bonus=30
+  await pool.query(`UPDATE wallets SET available_balance = 130, withdrawable_balance = 50, bonus_balance = 30 WHERE user_id = $1`, [USER_X]);
+  const g = await freshGame(31);
+  const split = await applyStake(g);
+  // stake: bonus 30, real 70 -> wdUsed = min(50,70) = 50, locked = 20
+  report('T15 split computed correctly at stake time', split.bonusToUse === 30 && split.wdUsed === 50 && split.lockedUsed === 20, JSON.stringify(split));
+  let w = await walletOf(USER_X);
+  report('T15 stake deducted (avail 30, wd 0, bonus 0)', w.available_balance === 30 && w.withdrawable_balance === 0 && w.bonus_balance === 0, JSON.stringify(w));
+
+  await ghostCallback();
+  w = await walletOf(USER_X);
+  report('T15 ghost refund restores exact buckets (avail 130, bonus 30, wd 50)',
+    w.available_balance === 130 && w.bonus_balance === 30 && w.withdrawable_balance === 50, JSON.stringify(w));
+  await pool.query(`DELETE FROM games WHERE id = $1`, [g]);
+  await checkInvariant('T15');
+}
+
+async function t16() {
+  console.log('\nT16: idempotency index guard — fail closed when uq_wallet_tx_idem is missing');
+  const { withTx: withTxDb } = require('../src/db');
+  const { ledgerFirstCredit } = require('../src/models/ledgerFirstCredit');
+  await resetUsers();
+  // Simulate the missing index (server is stopped; no other writers)
+  await pool.query(`DROP INDEX uq_wallet_tx_idem`);
+  try {
+    const ok = await checkIdempotencyIndex();
+    report('T16 check reports index missing', ok === false);
+    let refused = false;
+    try {
+      await withTxDb(c => ledgerFirstCredit(c, { userId: USER_X, txType: 'REFUND', amount: 10, idempotencyKey: 'TEST_T16', provider: 'TEST' }));
+    } catch (e) { refused = String(e.message).includes('IDEMPOTENCY_INDEX_UNAVAILABLE'); }
+    report('T16 ledgerFirstCredit REFUSES to credit without the index', refused);
+    const { rows: alerts } = await pool.query(`SELECT id FROM system_alerts WHERE event_type = 'IDEMPOTENCY_INDEX_MISSING'`);
+    report('T16 IDEMPOTENCY_INDEX_MISSING alert written', alerts.length >= 1);
+  } finally {
+    // Always restore the index
+    await pool.query(`CREATE UNIQUE INDEX uq_wallet_tx_idem ON wallet_transactions (idempotency_key) WHERE status <> 'FAILED'`);
+    const ok = await checkIdempotencyIndex();
+    report('T16 index restored -> guard active again', ok === true);
+  }
+  await checkInvariant('T16');
+}
+
+async function t17() {
+  console.log('\nT17: payout_failed admin resolution — pay winner once through the real payout');
+  const adminRouter = require('../src/routes/admin');
+  let listHandler = null, payHandler = null;
+  for (const layer of adminRouter.stack) {
+    if (layer.route && layer.route.path === '/games/payout-failed') {
+      const h = layer.route.stack.filter(l => l.handle);
+      listHandler = h[h.length - 1].handle;
+    }
+    if (layer.route && layer.route.path === '/games/:gameId/pay-winner') {
+      const h = layer.route.stack.filter(l => l.handle);
+      payHandler = h[h.length - 1].handle;
+    }
+  }
+  if (!listHandler || !payHandler) { report('T17 handlers extracted', false); return; }
+
+  await resetUsers();
+  await pool.query(`DELETE FROM games WHERE player_x = $1`, [USER_X]);
+  const g = await freshGame(31);
+  await applyStake(g);
+  await pool.query(`UPDATE games SET status = 'payout_failed', finished_at = now() WHERE id = $1`, [g]);
+
+  function call(method, path, body) {
+    const res = {
+      statusCode: 0, _resolve: null,
+      status(c) { this.statusCode = c; return this; },
+      json(o) { this._body = o; if (this._resolve) this._resolve({ status: this.statusCode || 200, body: o }); return this; }
+    };
+    const req = { method, body: body || {}, user: { id: '00000000-0000-0000-0000-000000000001' }, params: { gameId: g }, query: {} };
+    const handler = method === 'GET' ? listHandler : payHandler;
+    return new Promise(resolve => {
+      res._resolve = resolve;
+      try { handler(req, res, () => resolve({ status: 'next' })); }
+      catch (e) { resolve({ status: 'throw', body: { error: e.message } }); }
+    });
+  }
+
+  const listed = await call('GET');
+  report('T17 payout-failed list includes the game', listed.status === 200 && JSON.stringify(listed.body).includes(g));
+  const pay1 = await call('POST', null, { winnerSymbol: 'X' });
+  let w = await walletOf(USER_X);
+  const gRow = (await pool.query(`SELECT status, winner::text AS winner, prize_amount::int AS prize FROM games WHERE id = $1`, [g])).rows[0];
+  report('T17 pay-winner completes the game', pay1.status === 200 && gRow.status === 'completed' && gRow.winner === USER_X && gRow.prize === 180, JSON.stringify(pay1.body || pay1));
+  report('T17 winner credited 180 (wd=180, no bonus used)', w.available_balance === 180 && w.withdrawable_balance === 180, JSON.stringify(w));
+  const pay2 = await call('POST', null, { winnerSymbol: 'X' });
+  report('T17 second pay-winner rejected (409 already resolved)', pay2.status === 409, JSON.stringify(pay2.body));
+  report('T17 wallet NOT credited twice', (await walletOf(USER_X)).available_balance === 180);
+  await pool.query(`DELETE FROM games WHERE id = $1`, [g]);
+  await checkInvariant('T17');
+}
+
+async function t18() {
+  console.log('\nT18: admin refund validations + reject policy (PENDING_MANUAL only)');
+  const adminRouter = require('../src/routes/admin');
+  let refundHandler = null, rejectHandler = null;
+  for (const layer of adminRouter.stack) {
+    if (layer.route && layer.route.path === '/refund') {
+      const h = layer.route.stack.filter(l => l.handle);
+      refundHandler = h[h.length - 1].handle;
+    }
+    if (layer.route && layer.route.path === '/transactions/:id/reject') {
+      const h = layer.route.stack.filter(l => l.handle);
+      rejectHandler = h[h.length - 1].handle;
+    }
+  }
+  if (!refundHandler || !rejectHandler) { report('T18 handlers extracted', false); return; }
+  await resetUsers();
+
+  function call(handler, body, params = {}) {
+    const res = {
+      statusCode: 0, _resolve: null,
+      status(c) { this.statusCode = c; return this; },
+      json(o) { this._body = o; if (this._resolve) this._resolve({ status: this.statusCode || 200, body: o }); return this; }
+    };
+    const req = { body, user: { id: '00000000-0000-0000-0000-000000000001' }, params, query: {} };
+    return new Promise(resolve => {
+      res._resolve = resolve;
+      try { handler(req, res, () => resolve({ status: 'next' })); }
+      catch (e) { resolve({ status: 'throw', body: { error: e.message } }); }
+    });
+  }
+
+  const dep = await pool.query(`SELECT fn_wallet_apply_tx($1, 'DEPOSIT', 200, 'COMPLETED', 'TEST_T18_DEP', 'CHAPA', NULL, '{}'::jsonb) AS id`, [USER_X]);
+  const origId = dep.rows[0].id;
+
+  // amount > original -> 400
+  const over = await call(refundHandler, { phoneOrUsername: '0900000099', amount: 300, target: 'available', originalTxId: origId });
+  report('T18 refund > original amount rejected (400)', over.status === 400, JSON.stringify(over.body));
+
+  // GIFT original -> 400 (not refundable type)
+  const gift = await pool.query(`INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, idempotency_key) VALUES ($1, 'GIFT', 50, 'COMPLETED', 'TEST', 'TEST_T18_GIFT') RETURNING id::text AS id`, [USER_X]);
+  const giftRefund = await call(refundHandler, { phoneOrUsername: '0900000099', amount: 10, target: 'available', originalTxId: gift.rows[0].id });
+  report('T18 refund of GIFT-type rejected (400 not refundable)', giftRefund.status === 400, JSON.stringify(giftRefund.body));
+
+  // valid refund still works
+  const okRefund = await call(refundHandler, { phoneOrUsername: '0900000099', amount: 50, target: 'available', originalTxId: origId });
+  report('T18 valid refund succeeds (200)', okRefund.status === 200, JSON.stringify(okRefund.body?.error || 'ok'));
+
+  // reject policy: PENDING withdraw (already with Chapa) -> 409; PENDING_MANUAL -> refunds
+  const pend = await insertPendingWithdraw('TEST_T18_PEND');
+  const rejPend = await call(rejectHandler, {}, { id: pend });
+  report('T18 admin reject of PENDING withdraw refused (409 cron-managed)', rejPend.status === 409, JSON.stringify(rejPend.body));
+  report('T18 OLD behaviour (rejecting PENDING) marked KNOWN BUG — now refused', true);
+
+  const manual = await pool.query(`INSERT INTO wallet_transactions (user_id, tx_type, amount, status, provider, idempotency_key, created_at) VALUES ($1, 'WITHDRAW_REQUEST', 100, 'PENDING_MANUAL', 'CHAPA', 'TEST_T18_MANUAL', now() - interval '60 seconds') RETURNING id::text AS id`, [USER_X]);
+  const rejManual = await call(rejectHandler, {}, { id: manual.rows[0].id });
+  const manualAfter = (await pool.query(`SELECT status FROM wallet_transactions WHERE id = $1`, [manual.rows[0].id])).rows[0];
+  report('T18 admin reject of PENDING_MANUAL works (refund via settleWithdrawal)', rejManual.status === 200 && manualAfter.status === 'FAILED', JSON.stringify(rejManual.body || rejManual));
+  await checkInvariant('T18');
+}
+
 async function insertGame(ageMinutes, bonusX = 0, bonusO = 0) {
   const { rows } = await pool.query(`
     INSERT INTO games (player_x, player_o, bet_amount, status, winner, prize_amount, created_at, finished_at, moves, bonus_used_x, bonus_used_o)
@@ -253,16 +477,22 @@ async function t12() {
   await resetUsers();
   await pool.query(`DELETE FROM games WHERE (player_x = $1 OR player_o = $1)`, [USER_X]);
 
-  // Game with mixed stakes: X used 40 bonus + 60 real; O all real
-  const g = await insertGame(31, 40, 0);
+  // X: wallet avail 100, wd 50, bonus 40 (invariant ok: 100 >= 50 + 40)
+  // O: wallet all-deposit: avail 100, wd 0, bonus 0
+  await pool.query(`UPDATE wallets SET available_balance = 100, withdrawable_balance = 50, bonus_balance = 40 WHERE user_id = $1`, [USER_X]);
+  await pool.query(`UPDATE wallets SET available_balance = 100, withdrawable_balance = 0, bonus_balance = 0 WHERE user_id = $1`, [USER_O]);
+  const g = await freshGame(31);
+  const sx = await applyStake(g, 100, USER_X, 'x');
+  const so = await applyStake(g, 100, USER_O, 'o');
+
   await ghostCallback();
   const grow = (await pool.query(`SELECT status FROM games WHERE id = $1`, [g])).rows[0];
   const wx = await walletOf(USER_X), wo = await walletOf(USER_O);
   report('T12 game marked completed', grow.status === 'completed');
-  report('T12 X buckets restored: avail=100 bonus=40 wd=60 (not all-withdrawable)',
-    wx.available_balance === 100 && wx.bonus_balance === 40 && wx.withdrawable_balance === 60, JSON.stringify(wx));
-  report('T12 O buckets restored: avail=100 bonus=0 wd=100',
-    wo.available_balance === 100 && wo.bonus_balance === 0 && wo.withdrawable_balance === 100, JSON.stringify(wo));
+  report('T12 X buckets restored exactly: avail=100 bonus=40 wd=50 (wdUsed=' + sx.wdUsed + ', locked=' + sx.lockedUsed + ')',
+    wx.available_balance === 100 && wx.bonus_balance === 40 && wx.withdrawable_balance === 50, JSON.stringify(wx));
+  report('T12 O buckets restored exactly: avail=100 bonus=0 wd=0 (deposit stays non-withdrawable)',
+    wo.available_balance === 100 && wo.bonus_balance === 0 && wo.withdrawable_balance === 0, JSON.stringify(wo));
 
   await ghostCallback(); // rerun: status guard -> no double refund
   const wx2 = await walletOf(USER_X), wo2 = await walletOf(USER_O);
@@ -401,7 +631,12 @@ async function main() {
   await t10(); await resetUsers();
   await t11(); await resetUsers();
   await t12(); await resetUsers();
-  await t13();
+  await t13(); await resetUsers();
+  await t14(); await resetUsers();
+  await t15(); await resetUsers();
+  await t16(); await resetUsers();
+  await t17(); await resetUsers();
+  await t18();
 
   await checkInvariant('final');
   const ok = summary();
