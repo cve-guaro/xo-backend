@@ -619,9 +619,12 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
 
     // For each player, apply bonus-first deduction and enforce win locks
     const playerBonusUsed = {};
+    const playerWdUsed = {};
+    const playerLockedUsed = {};
     for (const wallet of walletRes.rows) {
       const avail = Number(wallet.available_balance);
       const bonus = Number(wallet.bonus_balance);
+      const wd = Number(wallet.withdrawable_balance);
       const userId = wallet.user_id;
 
       const bonusToUse = Math.min(bonus, betAmount);
@@ -638,8 +641,15 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
         throw new Error("TIER_LOCKED");
       }
 
-      // Store pre-deduction bonus used amount for this player
+      // Record exactly which buckets the stake came from, so refunds can restore
+      // them without turning deposit-only money into withdrawable cash (AML 1x
+      // rollover). withdrawable money is consumed first, the rest is "locked"
+      // (deposit-only, stays non-withdrawable after a refund).
+      const wdUsed = Math.min(wd, realToUse);
+      const lockedUsed = realToUse - wdUsed;
       playerBonusUsed[userId] = bonusToUse;
+      playerWdUsed[userId] = wdUsed;
+      playerLockedUsed[userId] = lockedUsed;
 
       // Unified deduction:
       // - available_balance always drops by the full betAmount
@@ -657,11 +667,15 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
     }
 
     await client.query(
-      `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at, bonus_used_x, bonus_used_o)
-       VALUES ($1, $2, $3, $4, 'ongoing', '[]'::jsonb, NOW(), $5, $6)`,
+      `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at, bonus_used_x, bonus_used_o, withdrawable_used_x, withdrawable_used_o, locked_used_x, locked_used_o)
+       VALUES ($1, $2, $3, $4, 'ongoing', '[]'::jsonb, NOW(), $5, $6, $7, $8, $9, $10)`,
       [matchId, playerXId, playerOId, betAmount,
         playerBonusUsed[playerXId],
-        playerBonusUsed[playerOId]
+        playerBonusUsed[playerOId],
+        playerWdUsed[playerXId] || 0,
+        playerWdUsed[playerOId] || 0,
+        playerLockedUsed[playerXId] || 0,
+        playerLockedUsed[playerOId] || 0
       ]
     );
     return { id: matchId, player_x: playerXId, player_o: playerOId, bet_amount: betAmount, status: "ongoing" };
@@ -696,7 +710,7 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
   let winnerUsername = null;
   const runPayoutTx = () => tx(async (client) => {
     // Get game details to determine room and bonus used, with row lock
-    const gameRes = await client.query(`SELECT status, bet_amount, player_x, player_o, bonus_used_x, bonus_used_o FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
+    const gameRes = await client.query(`SELECT status, bet_amount, player_x, player_o, bonus_used_x, bonus_used_o, withdrawable_used_x, withdrawable_used_o FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
     const game = gameRes.rows[0];
     if (!game) return;
     if (game.status !== 'ongoing') {
@@ -814,21 +828,24 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
         const loserConsKey = `cooldown:wins:${loserUserId}:${finalLoserRangeKey}`;
         await redis.del(loserConsKey).catch(() => { });
     } else {
-      // Option A: Refund both players fully
+      // Option A: Refund both players — restoring the EXACT buckets the stake
+      // came from (bonus → bonus_balance, withdrawable money → withdrawable,
+      // deposit-only "locked" money stays available-only). Crediting the full
+      // real stake to withdrawable would bypass the AML 1x rollover rule.
       const betCents = Number(game.bet_amount || 0);
 
       // Refund Player X
       if (game.player_x) {
         const bonusX = Number(game.bonus_used_x || 0);
-        const realX = Math.max(0, betCents - bonusX);
+        const wdUsedX = Number(game.withdrawable_used_x || 0);
         await client.query(`
-          UPDATE wallets 
+          UPDATE wallets
           SET available_balance = available_balance + $1,
               bonus_balance = bonus_balance + $2,
               withdrawable_balance = withdrawable_balance + $3,
               updated_at = NOW()
           WHERE user_id = $4
-        `, [betCents, bonusX, realX, game.player_x]);
+        `, [betCents, bonusX, wdUsedX, game.player_x]);
 
         await pool.query(`
           INSERT INTO payment_transactions (id, user_id, type, status, amount, bank, tx_ref, provider_payload)
@@ -840,15 +857,15 @@ async function finishAndPayout(gameId, status, winnerUserId, prizeAmount) {
       // Refund Player O
       if (game.player_o) {
         const bonusO = Number(game.bonus_used_o || 0);
-        const realO = Math.max(0, betCents - bonusO);
+        const wdUsedO = Number(game.withdrawable_used_o || 0);
         await client.query(`
-          UPDATE wallets 
+          UPDATE wallets
           SET available_balance = available_balance + $1,
               bonus_balance = bonus_balance + $2,
               withdrawable_balance = withdrawable_balance + $3,
               updated_at = NOW()
           WHERE user_id = $4
-        `, [betCents, bonusO, realO, game.player_o]);
+        `, [betCents, bonusO, wdUsedO, game.player_o]);
 
         await pool.query(`
           INSERT INTO payment_transactions (id, user_id, type, status, amount, bank, tx_ref, provider_payload)

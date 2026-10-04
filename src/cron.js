@@ -33,7 +33,7 @@ function initCron() {
               UPDATE games
               SET status = 'completed', winner = NULL, finished_at = NOW()
               WHERE id = $1 AND status IN ('ongoing', 'live', 'countdown')
-              RETURNING id, player_x, player_o, bet_amount, bonus_used_x, bonus_used_o
+              RETURNING id, player_x, player_o, bet_amount, bonus_used_x, bonus_used_o, withdrawable_used_x, withdrawable_used_o
             `, [id]);
             if (!rows.length) return false;
             const game = rows[0];
@@ -42,8 +42,8 @@ function initCron() {
             if (betAmount <= 0) return true;
 
             const players = [
-              { userId: game.player_x, bonus: Number(game.bonus_used_x || 0), key: `GHOST_REFUND_${game.id}_X` },
-              { userId: game.player_o, bonus: Number(game.bonus_used_o || 0), key: `GHOST_REFUND_${game.id}_O` }
+              { userId: game.player_x, bonus: Number(game.bonus_used_x || 0), wdUsed: Number(game.withdrawable_used_x || 0), key: `GHOST_REFUND_${game.id}_X` },
+              { userId: game.player_o, bonus: Number(game.bonus_used_o || 0), wdUsed: Number(game.withdrawable_used_o || 0), key: `GHOST_REFUND_${game.id}_O` }
             ];
             for (const p of players) {
               if (!p.userId) continue;
@@ -54,10 +54,10 @@ function initCron() {
                 meta: { gameId: game.id, reason: 'Ghost game cleanup' }
               });
               if (!inserted) continue;
-              // Restore the ORIGINAL buckets, same semantics as finishAndPayout's
-              // refund path: bonus part back to bonus, real cash back to
-              // withdrawable, everything back to available. Never all-withdrawable.
-              const real = Math.max(0, betAmount - p.bonus);
+              // Restore the EXACT buckets the stake came from: bonus part back to
+              // bonus_balance, withdrawable money back to withdrawable, deposit-only
+              // "locked" money stays available-only. Crediting the full real stake to
+              // withdrawable would bypass the AML 1x rollover rule.
               await client.query(`
                 UPDATE wallets
                 SET available_balance = available_balance + $1,
@@ -65,7 +65,7 @@ function initCron() {
                     withdrawable_balance = withdrawable_balance + $3,
                     updated_at = NOW()
                 WHERE user_id = $4
-              `, [betAmount, p.bonus, real, p.userId]);
+              `, [betAmount, p.bonus, p.wdUsed, p.userId]);
             }
             return true;
           });
