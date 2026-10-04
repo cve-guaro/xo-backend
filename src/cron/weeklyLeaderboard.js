@@ -1,5 +1,6 @@
 const { pool, withTx } = require('../db/index');
 const { sendSMS } = require('../utils/sms');
+const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
 
 function getPrevWeekBounds() {
   const now = new Date();
@@ -87,86 +88,95 @@ async function runWeeklyLeaderboardSnapshot() {
   for (let i = 0; i < winners.length; i++) {
     const user = winners[i];
     const prizeAmount = prizes[i] || 0;
+    const status = autoApprove ? 'approved' : 'pending';
 
     console.log(`[LEADERBOARD CRON] Rank #${i + 1}: ${user.username} with ${user.wins} wins. Prize: ${prizeAmount} ETB.`);
 
-    // Insert snapshot
-    await pool.query(`
-      INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `, [weekStartStr, weekEndStr, user.id, user.username, Number(user.wins), i + 1, prizeAmount, status]);
+    // One transaction per winner: snapshot + credit + ledger + bonus_log together.
+    // The UNIQUE (week_start, rank) index (migration 009) is the hard guard against
+    // concurrent duplicate snapshots; the ledger row is the double-credit guard.
+    const outcome = await withTx(async (client) => {
+      const { rows: existing } = await client.query(
+        `SELECT 1 FROM leaderboard_snapshots WHERE week_start = $1 AND rank = $2`,
+        [weekStartStr, i + 1]
+      );
+      if (existing.length > 0) return { created: false, credited: false };
 
-    // If auto-approve is active, credit wallet, log bonus, and send SMS
-    if (autoApprove && prizeAmount > 0) {
-      // Ledger-first award in one transaction: the LEADERBOARD_PRIZE ledger row is
-      // the double-credit guard — the wallet is credited only if the row inserted.
-      const { inserted } = await withTx(async (client) => {
-        const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
+      await client.query(`
+        INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `, [weekStartStr, weekEndStr, user.id, user.username, Number(user.wins), i + 1, prizeAmount, status]);
+
+      let credited = false;
+      if (autoApprove && prizeAmount > 0) {
         const { inserted } = await ledgerFirstCredit(client, {
           userId: user.id, txType: 'PRIZE', amount: prizeAmount,
           idempotencyKey: `LEADERBOARD_PRIZE_${weekStartStr}_${i + 1}`, provider: 'LEADERBOARD_PRIZE',
           meta: { rank: i + 1, weekStart: weekStartStr }
         });
-        if (!inserted) return { inserted: false };
-
-        await client.query(
-          `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
-          [prizeAmount, user.id]
-        );
-        await client.query(
-          `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
-          [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]
-        );
-        return { inserted: true };
-      });
-
-      if (inserted) {
-        // 2b) Record accomplishment
-        try {
-          const weekStartMD = formatMonthDay(weekStartStr);
-          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
-          await pool.query(`
-            UPDATE users
-            SET raw_user_meta_data = jsonb_set(
-              COALESCE(raw_user_meta_data, '{}'::jsonb),
-              '{accomplishments}',
-              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
-            )
-            WHERE id = $2
-          `, [accomplishmentStr, user.id]);
-        } catch (err) {
-          console.error('[LEADERBOARD CRON] accomplishment update failed:', err);
+        if (inserted) {
+          await client.query(
+            `UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`,
+            [prizeAmount, user.id]
+          );
+          await client.query(
+            `INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`,
+            [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]
+          );
+          credited = true;
         }
+      }
+      return { created: true, credited };
+    });
 
-        // 3) Create in-app leaderboard award notification
-        const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
-        await pool.query(`
-          INSERT INTO notifications (user_id, type, title, message, meta)
-          VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
-        `, [
-          user.id,
-          rankLabels[i] || `#${i + 1} Weekly Award`,
-          `🏆 Congratulations! You ranked #${i + 1} on this week's leaderboard with ${user.wins} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`,
-          JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
-        ]).catch(err => console.error('[LEADERBOARD CRON] notification insert failed (non-fatal):', err));
+    if (!outcome.created) {
+      console.log(`[LEADERBOARD CRON] Snapshot for rank #${i + 1} already exists — skipping.`);
+      continue;
+    }
+    if (!outcome.credited) continue; // pending approval or already-credited — nothing else to do
 
-        // 4) Send congratulations SMS
-        if (user.number) {
-          const smsMsg = smsTemplate
-            .replace('{username}', user.username || '')
-            .replace('{rank}', String(i + 1))
-            .replace('{prize}', String(prizeAmount));
+    // 2b) Record accomplishment
+    try {
+      const weekStartMD = formatMonthDay(weekStartStr);
+      const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
+      await pool.query(`
+        UPDATE users
+        SET raw_user_meta_data = jsonb_set(
+          COALESCE(raw_user_meta_data, '{}'::jsonb),
+          '{accomplishments}',
+          (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+        )
+        WHERE id = $2
+      `, [accomplishmentStr, user.id]);
+    } catch (err) {
+      console.error('[LEADERBOARD CRON] accomplishment update failed:', err);
+    }
 
-          try {
-            console.log(`[LEADERBOARD CRON] Sending SMS to ${user.username} (${user.number})...`);
-            const success = await sendSMS(user.number, smsMsg).catch(() => false);
-            console.log(`[LEADERBOARD CRON] SMS status: ${success ? 'sent' : 'failed'}`);
-          } catch (e) {
-            console.error(`[LEADERBOARD CRON] SMS error for ${user.username}:`, e.message);
-          }
-        }
-      } else {
-        console.log(`[LEADERBOARD CRON] Rank #${i + 1} prize already awarded (ledger row exists) — skipping credit.`);
+    // 3) Create in-app leaderboard award notification
+    const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+    await pool.query(`
+      INSERT INTO notifications (user_id, type, title, message, meta)
+      VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+    `, [
+      user.id,
+      rankLabels[i] || `#${i + 1} Weekly Award`,
+      `🏆 Congratulations! You ranked #${i + 1} on this week's leaderboard with ${user.wins} wins and earned ${prizeAmount} ETB! The prize has been added to your balance.`,
+      JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
+    ]).catch(err => console.error('[LEADERBOARD CRON] notification insert failed (non-fatal):', err));
+
+    // 4) Send congratulations SMS
+    if (user.number) {
+      const smsMsg = smsTemplate
+        .replace('{username}', user.username || '')
+        .replace('{rank}', String(i + 1))
+        .replace('{prize}', String(prizeAmount));
+
+      try {
+        console.log(`[LEADERBOARD CRON] Sending SMS to ${user.username} (${user.number})...`);
+        const success = await sendSMS(user.number, smsMsg).catch(() => false);
+        console.log(`[LEADERBOARD CRON] SMS status: ${success ? 'sent' : 'failed'}`);
+      } catch (e) {
+        console.error(`[LEADERBOARD CRON] SMS error for ${user.username}:`, e.message);
       }
     }
   }

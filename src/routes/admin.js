@@ -2755,82 +2755,93 @@ router.post('/leaderboard/snapshot', async (req, res) => {
       const prizeAmount = Number(prizes[i]) || 0;
       const status = autoApprove ? 'approved' : 'pending';
 
-      await pool.query(`
-        INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      `, [weekStartStr, weekEndStr, user.id, user.username, Number(user.wins), i + 1, prizeAmount, status]);
+      // One transaction per winner: snapshot + credit + ledger + bonus_log together.
+      // UNIQUE (week_start, rank) (migration 009) is the hard guard against the
+      // double-click duplicate-snapshot race; the ledger row guards double credit.
+      const outcome = await withTx(async (txClient) => {
+        const { rows: existing } = await txClient.query(
+          `SELECT 1 FROM leaderboard_snapshots WHERE week_start = $1 AND rank = $2`,
+          [weekStartStr, i + 1]
+        );
+        if (existing.length > 0) return { created: false, credited: false };
 
-      // If auto-approve, add prize to bonus_balance
-      if (autoApprove && prizeAmount > 0) {
-        // Ledger-first award: the LEADERBOARD_PRIZE ledger row is the double-credit
-        // guard — the wallet is credited only if the row was actually inserted.
-        const { inserted } = await withTx(async (txClient) => {
+        await txClient.query(`
+          INSERT INTO leaderboard_snapshots (week_start, week_end, user_id, username, wins, rank, prize_amount, prize_status)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `, [weekStartStr, weekEndStr, user.id, user.username, Number(user.wins), i + 1, prizeAmount, status]);
+
+        let credited = false;
+        if (autoApprove && prizeAmount > 0) {
           const { ledgerFirstCredit } = require('../models/ledgerFirstCredit');
           const { inserted } = await ledgerFirstCredit(txClient, {
             userId: user.id, txType: 'PRIZE', amount: prizeAmount,
             idempotencyKey: `LEADERBOARD_PRIZE_${weekStartStr}_${i + 1}`, provider: 'LEADERBOARD_PRIZE',
             meta: { rank: i + 1, weekStart: weekStartStr }
           });
-          if (!inserted) return { inserted: false };
-
-          await txClient.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
-          await txClient.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
-          return { inserted: true };
-        });
-
-        if (inserted) {
-          try {
-            const weekStartMD = formatMonthDay(weekStartStr);
-            const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
-            await pool.query(`
-              UPDATE users
-              SET raw_user_meta_data = jsonb_set(
-                COALESCE(raw_user_meta_data, '{}'::jsonb),
-                '{accomplishments}',
-                (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
-              )
-              WHERE id = $2
-            `, [accomplishmentStr, user.id]);
-          } catch (err) {
-            console.error('[ADMIN SNAPSHOT] accomplishment update failed:', err);
+          if (inserted) {
+            await txClient.query(`UPDATE wallets SET bonus_balance = bonus_balance + $1, available_balance = available_balance + $1 WHERE user_id = $2`, [prizeAmount, user.id]);
+            await txClient.query(`INSERT INTO bonus_logs (user_id, amount, reason) VALUES ($1, $2, $3)`, [user.id, prizeAmount, `Weekly Leaderboard #${i + 1} Prize`]);
+            credited = true;
           }
+        }
+        return { created: true, credited };
+      });
 
-          // Create customized in-app notification
-          const notifMsg = notificationTemplate
+      if (!outcome.created) {
+        console.log(`[ADMIN SNAPSHOT] Snapshot for rank #${i + 1} already exists — skipping.`);
+        continue;
+      }
+
+      if (outcome.credited) {
+        try {
+          const weekStartMD = formatMonthDay(weekStartStr);
+          const accomplishmentStr = `Week of ${weekStartMD}: Ranked #${i + 1} - Awarded ${prizeAmount} ETB`;
+          await pool.query(`
+            UPDATE users
+            SET raw_user_meta_data = jsonb_set(
+              COALESCE(raw_user_meta_data, '{}'::jsonb),
+              '{accomplishments}',
+              (COALESCE(raw_user_meta_data->'accomplishments', '[]'::jsonb) || jsonb_build_array($1::text))
+            )
+            WHERE id = $2
+          `, [accomplishmentStr, user.id]);
+        } catch (err) {
+          console.error('[ADMIN SNAPSHOT] accomplishment update failed:', err);
+        }
+
+        // Create customized in-app notification
+        const notifMsg = notificationTemplate
+          .replace('{username}', user.username || '')
+          .replace('{rank}', String(i + 1))
+          .replace('{wins}', String(user.wins))
+          .replace('{prize}', String(prizeAmount));
+
+        const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
+        await pool.query(`
+          INSERT INTO notifications (user_id, type, title, message, meta)
+          VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
+        `, [
+          user.id,
+          rankLabels[i] || `#${i + 1} Weekly Award`,
+          notifMsg,
+          JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
+        ]).catch(err => console.error('[SNAPSHOT] notification failed:', err));
+
+        // Send congratulations SMS
+        const { rows: uInfo } = await pool.query(`SELECT number FROM users WHERE id = $1`, [user.id]);
+        const phone = uInfo[0]?.number;
+        if (phone) {
+          const smsMsg = smsTemplate
             .replace('{username}', user.username || '')
             .replace('{rank}', String(i + 1))
-            .replace('{wins}', String(user.wins))
             .replace('{prize}', String(prizeAmount));
 
-          const rankLabels = ['🥇 1st Place Champion', '🥈 2nd Place', '🥉 3rd Place'];
-          await pool.query(`
-            INSERT INTO notifications (user_id, type, title, message, meta)
-            VALUES ($1, 'leaderboard_award', $2, $3, $4::jsonb)
-          `, [
-            user.id,
-            rankLabels[i] || `#${i + 1} Weekly Award`,
-            notifMsg,
-            JSON.stringify({ rank: i + 1, prize: prizeAmount, wins: Number(user.wins), weekStart: weekStartStr, weekEnd: weekEndStr })
-          ]).catch(err => console.error('[SNAPSHOT] notification failed:', err));
-
-          // Send congratulations SMS
-          const { rows: uInfo } = await pool.query(`SELECT number FROM users WHERE id = $1`, [user.id]);
-          const phone = uInfo[0]?.number;
-          if (phone) {
-            const smsMsg = smsTemplate
-              .replace('{username}', user.username || '')
-              .replace('{rank}', String(i + 1))
-              .replace('{prize}', String(prizeAmount));
-
-            try {
-              console.log(`[SNAPSHOT ADMIN] Sending SMS to ${user.username} (${phone})...`);
-              await sendSMS(phone, smsMsg).catch(() => false);
-            } catch (e) {
-              console.error(`[SNAPSHOT ADMIN] SMS error for ${user.username}:`, e.message);
-            }
+          try {
+            console.log(`[SNAPSHOT ADMIN] Sending SMS to ${user.username} (${phone})...`);
+            await sendSMS(phone, smsMsg).catch(() => false);
+          } catch (e) {
+            console.error(`[SNAPSHOT ADMIN] SMS error for ${user.username}:`, e.message);
           }
-        } else {
-          console.log(`[ADMIN SNAPSHOT] Rank #${i + 1} prize already awarded (ledger row exists) — skipping credit.`);
         }
       }
     }
@@ -2839,6 +2850,10 @@ router.post('/leaderboard/snapshot', async (req, res) => {
 
     res.json({ ok: true, message: autoApprove ? 'Snapshot created and prizes awarded' : 'Snapshot created (pending approval)' });
   } catch (err) {
+    if (err.code === '23505') {
+      // Lost the UNIQUE (week_start, rank) race against a concurrent identical request
+      return res.status(409).json({ error: 'Snapshot for this week already exists' });
+    }
     console.error('[ADMIN] /leaderboard/snapshot error:', err);
     res.status(500).json({ error: 'Failed to create snapshot' });
   }

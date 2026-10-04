@@ -228,6 +228,7 @@ async function t10() {
   }
   const m = await lb.measureWeek();
   report('T10 no double credit across 3 parallel double-clicks', doubleCredits === 0, `doubleCredits=${doubleCredits}`);
+  report('T10 no duplicate snapshots (UNIQUE week_start,rank)', m.snaps === 1, `snaps=${m.snaps}`);
   report('T10 ledger row exists for the prize (never swallowed)', m.ledger >= 1);
   report('T10 exactly one bonus_logs row', m.blogs === 1, `blogs=${m.blogs}`);
   await lb.cleanupWeek();
