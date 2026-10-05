@@ -2,6 +2,7 @@
 const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
 const { pool, getGlobalSetting, redis } = require("../db/index");
+const { deductStake } = require("../models/stake");
 require('dotenv').config();
 const { creditPrize } = require('../models/payments.service')
 
@@ -603,79 +604,23 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
   }
 
   return tx(async (client) => {
-    const ids = [playerXId, playerOId];
-
-    // Lock both wallet rows and fetch wins defensively
-    const walletRes = await client.query(
-      `SELECT w.user_id, w.available_balance, w.bonus_balance,
-              u.r1_10_wins, u.r1_15_wins
-       FROM wallets w
-       JOIN users u ON w.user_id = u.id
-       WHERE w.user_id = ANY($1::uuid[]) FOR UPDATE`,
-      [ids]
-    );
-
-    if (walletRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
-
-    // For each player, apply bonus-first deduction and enforce win locks
-    const playerBonusUsed = {};
-    const playerWdUsed = {};
-    const playerLockedUsed = {};
-    for (const wallet of walletRes.rows) {
-      const avail = Number(wallet.available_balance);
-      const bonus = Number(wallet.bonus_balance);
-      const wd = Number(wallet.withdrawable_balance);
-      const userId = wallet.user_id;
-
-      const bonusToUse = Math.min(bonus, betAmount);
-      const realToUse = betAmount - bonusToUse;
-
-      // Check TOTAL effective balance (available + bonus), not just available
-      if ((avail + bonus) < betAmount) throw new Error("INSUFFICIENT_BALANCE");
-
-      // Validate win locks (15-win cap for 10 and 15 Birr)
-      if (betAmount === 10 && Number(wallet.r1_10_wins || 0) >= 15) {
-        throw new Error("TIER_LOCKED");
-      }
-      if (betAmount === 15 && Number(wallet.r1_15_wins || 0) >= 15) {
-        throw new Error("TIER_LOCKED");
-      }
-
-      // Record exactly which buckets the stake came from, so refunds can restore
-      // them without turning deposit-only money into withdrawable cash (AML 1x
-      // rollover). withdrawable money is consumed first, the rest is "locked"
-      // (deposit-only, stays non-withdrawable after a refund).
-      const wdUsed = Math.min(wd, realToUse);
-      const lockedUsed = realToUse - wdUsed;
-      playerBonusUsed[userId] = bonusToUse;
-      playerWdUsed[userId] = wdUsed;
-      playerLockedUsed[userId] = lockedUsed;
-
-      // Unified deduction:
-      // - available_balance always drops by the full betAmount
-      // - bonus_balance drops by bonusToUse
-      // - withdrawable_balance ONLY drops by the real cash portion (realToUse)
-      await client.query(
-        `UPDATE wallets
-         SET available_balance    = GREATEST(available_balance  - $1, 0),
-             bonus_balance        = GREATEST(bonus_balance - $2, 0),
-             withdrawable_balance = GREATEST(withdrawable_balance - $3, 0),
-             updated_at           = now()
-         WHERE user_id = $4`,
-        [betAmount, bonusToUse, realToUse, userId]
-      );
-    }
+    // Single stake-deduction primitive (src/models/stake.js): locks both wallet
+    // rows FOR UPDATE in this transaction, applies the bonus-first deduction and
+    // returns each player's bucket split (bonus / withdrawable / locked).
+    const stakes = await deductStake(client, { playerXId, playerOId, betAmount });
+    const sx = stakes[playerXId] || { bonusUsed: 0, wdUsed: 0, lockedUsed: 0 };
+    const so = stakes[playerOId] || { bonusUsed: 0, wdUsed: 0, lockedUsed: 0 };
 
     await client.query(
       `INSERT INTO games (id, player_x, player_o, bet_amount, status, moves, created_at, bonus_used_x, bonus_used_o, withdrawable_used_x, withdrawable_used_o, locked_used_x, locked_used_o)
        VALUES ($1, $2, $3, $4, 'ongoing', '[]'::jsonb, NOW(), $5, $6, $7, $8, $9, $10)`,
       [matchId, playerXId, playerOId, betAmount,
-        playerBonusUsed[playerXId],
-        playerBonusUsed[playerOId],
-        playerWdUsed[playerXId] || 0,
-        playerWdUsed[playerOId] || 0,
-        playerLockedUsed[playerXId] || 0,
-        playerLockedUsed[playerOId] || 0
+        sx.bonusUsed,
+        so.bonusUsed,
+        sx.wdUsed,
+        so.wdUsed,
+        sx.lockedUsed,
+        so.lockedUsed
       ]
     );
     return { id: matchId, player_x: playerXId, player_o: playerOId, bet_amount: betAmount, status: "ongoing" };
