@@ -41,6 +41,9 @@ async function setupWeek() {
   await pool.query(`DELETE FROM bonus_logs WHERE reason LIKE 'Weekly Leaderboard%'`);
   await pool.query(`UPDATE wallets SET available_balance = 0, withdrawable_balance = 0, bonus_balance = 0 WHERE user_id = $1`, [USER_X]);
   await pool.query(`DELETE FROM games WHERE player_x = $1 AND status = 'completed' AND winner = $1`, [USER_X]);
+  // Hermetic: the top-3 query scans the whole week — remove OTHER users' recent
+  // wins (e.g. from the e2e socket test) so the podium is exactly our test user.
+  await pool.query(`DELETE FROM games WHERE status = 'completed' AND winner IS NOT NULL AND winner NOT IN ($1, $2) AND created_at > now() - interval '8 days'`, [USER_X, USER_O]);
   for (let i = 0; i < 2; i++) {
     await pool.query(`
       INSERT INTO games (player_x, player_o, bet_amount, status, winner, prize_amount, created_at, finished_at)

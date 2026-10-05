@@ -1,0 +1,219 @@
+
+> xo-full-backend@1.0.0 test
+> node tests/run_all.js && node tests/e2e_socket_game.js
+
+[CRON] Initializing background scheduler...
+[CRON] Scheduler active.
+PREFLIGHT: checking dev server is stopped...
+  port 2000 free — OK
+
+T1: classification table (empty allow-list — ambiguous by default)
+  PASS | T1.0 allow-list is empty — patterns=[]
+  PASS | T1 400 insufficient balance — -> ambiguous
+  PASS | T1 422 invalid account — -> ambiguous
+  PASS | T1 400 unknown body — -> ambiguous
+  PASS | T1 400 reference already used — -> ambiguous
+  PASS | T1 401 auth — -> ambiguous+CHAPA_AUTH
+  PASS | T1 403 auth — -> ambiguous+CHAPA_AUTH
+  PASS | T1 500 with "insufficient balance" text — -> ambiguous
+  PASS | T1 timeout ECONNRESET — -> ambiguous
+  PASS | T1 no status, plain message — -> ambiguous
+
+T2: settle FAILED twice -> refund exactly once
+[settleWithdrawal] TX 58dfecbc-ac0c-424d-aeb2-5e39f551e59a FAILED → refunded 100 ETB to 00000000-0000-0000-0000-000000000099 (first)
+[settleWithdrawal] TX 58dfecbc-ac0c-424d-aeb2-5e39f551e59a already FAILED, skipping
+  PASS | T2 first settles + refunds
+  PASS | T2 second call skipped
+  PASS | T2 wallet credited once (100/100)
+  PASS | T2 exactly one refund ledger row with WITHDRAW_REFUND key
+  PASS | T2 withdrawal marked FAILED
+
+T3: ambiguous -> PENDING; cron success -> COMPLETED/no refund; cron failed -> one refund
+[CRON] Checking 1 pending payout(s)...
+[CRON VERIFY] TX fb737b60-0bcd-463b-96d9-3fddf951eae5 | Amount: 100.00 ETB | Chapa status: pending
+[CRON] ⏳ TX fb737b60-0bcd-463b-96d9-3fddf951eae5 still pending in Chapa (status: pending, age: 1 mins)
+[CRON] Payout verification cycle complete.
+  PASS | T3a status=pending leaves row PENDING, no refund
+[CRON] Checking 1 pending payout(s)...
+[CRON VERIFY] TX fb737b60-0bcd-463b-96d9-3fddf951eae5 | Amount: 100.00 ETB | Chapa status: success
+[settleWithdrawal] TX fb737b60-0bcd-463b-96d9-3fddf951eae5 COMPLETED (Chapa transfer success)
+[CRON] ✅ TX fb737b60-0bcd-463b-96d9-3fddf951eae5 confirmed DELIVERED — marked COMPLETED
+[CRON] Payout verification cycle complete.
+  PASS | T3b cron success -> COMPLETED, no refund, wallet untouched
+[CRON] Checking 1 pending payout(s)...
+[CRON VERIFY] TX a414db02-61a4-4502-83f0-cd282c7e002f | Amount: 100.00 ETB | Chapa status: failed
+[settleWithdrawal] TX a414db02-61a4-4502-83f0-cd282c7e002f FAILED → refunded 100 ETB to 00000000-0000-0000-0000-000000000099 (Chapa transfer failed)
+[CRON] ❌ TX a414db02-61a4-4502-83f0-cd282c7e002f FAILED in Chapa — refunded 100.00 ETB to user 00000000-0000-0000-0000-000000000099
+[CRON] Payout verification cycle complete.
+  PASS | T3c cron failed -> exactly one refund; rerun no-op
+
+T4: 3 parallel cron runs -> exactly one refund
+[CRON] verifyPendingPayouts already running, skipping
+[CRON] verifyPendingPayouts already running, skipping
+[CRON] Checking 1 pending payout(s)...
+[CRON VERIFY] TX 2f57e290-ad45-49b6-898f-0139ad2d7a64 | Amount: 100.00 ETB | Chapa status: failed
+[settleWithdrawal] TX 2f57e290-ad45-49b6-898f-0139ad2d7a64 FAILED → refunded 100 ETB to 00000000-0000-0000-0000-000000000099 (Chapa transfer failed)
+[CRON] ❌ TX 2f57e290-ad45-49b6-898f-0139ad2d7a64 FAILED in Chapa — refunded 100.00 ETB to user 00000000-0000-0000-0000-000000000099
+[CRON] Payout verification cycle complete.
+  PASS | T4 exactly one refund from 3 parallel runs — refunds=1
+
+T5: cron + admin reject race -> exactly one refund
+[CRON] Checking 1 pending payout(s)...
+[CRON VERIFY] TX 872f06a0-cd90-4f98-a633-335509fb4b07 | Amount: 100.00 ETB | Chapa status: failed
+[settleWithdrawal] TX 872f06a0-cd90-4f98-a633-335509fb4b07 FAILED → refunded 100 ETB to 00000000-0000-0000-0000-000000000099 (Chapa transfer failed)
+[CRON] ❌ TX 872f06a0-cd90-4f98-a633-335509fb4b07 FAILED in Chapa — refunded 100.00 ETB to user 00000000-0000-0000-0000-000000000099
+[settleWithdrawal] TX 872f06a0-cd90-4f98-a633-335509fb4b07 already FAILED, skipping
+[CRON] Payout verification cycle complete.
+  PASS | T5 exactly one refund (cron vs admin reject) — refunds=1
+
+T6: late success after refund -> no double credit, no SMS, one alert (no duplicates)
+[settleWithdrawal] TX 8c2ce83c-ef12-4a45-8480-f41aa74dc274 FAILED → refunded 100 ETB to 00000000-0000-0000-0000-000000000099 (3x404 refund)
+[CRON] ⚠️ TX 8c2ce83c-ef12-4a45-8480-f41aa74dc274: refunded but Chapa reports "success" — raising PAYOUT_LATE_SUCCESS alert
+[CRON] Payout verification cycle complete.
+  PASS | T6 wallet NOT credited again
+  PASS | T6 row stays FAILED
+  PASS | T6 no success SMS sent — smsCalls=0
+  PASS | T6 exactly one PAYOUT_LATE_SUCCESS alert (deduped by late_success_checked) — alerts=1
+
+T7: unique partial index blocks duplicate keys
+  PASS | T7 raw duplicate INSERT blocked — code=23505
+  PASS | T7 fn_wallet_apply_tx same key -> same tx id, no error
+
+T8: success run once -> exactly one SMS, no double settle
+[CRON] Checking 1 pending payout(s)...
+[CRON VERIFY] TX 3ae50f24-4f6a-4841-a54e-8d90e61a71a3 | Amount: 100.00 ETB | Chapa status: success
+[settleWithdrawal] TX 3ae50f24-4f6a-4841-a54e-8d90e61a71a3 COMPLETED (Chapa transfer success)
+[CRON] ✅ TX 3ae50f24-4f6a-4841-a54e-8d90e61a71a3 confirmed DELIVERED — marked COMPLETED
+[CRON] Payout verification cycle complete.
+  PASS | T8 first run sends exactly one SMS — sms=1
+  PASS | T8 second run sends no SMS — sms total=1
+  PASS | T8 row COMPLETED once, no refund rows
+
+T9: deposit flow with bare-UUID keys under the unique index
+  PASS | T9 deposit retry with same UUID key returns existing tx (no violation)
+  PASS | T9 deposit credited once (available=100, withdrawable=0)
+  PASS | T9 exactly one DEPOSIT ledger row
+
+T10: leaderboard Send & Snapshot double-click (real handler, 3 parallel iterations)
+[SNAPSHOT ADMIN] Sending SMS to test_path5 (0900000099)...
+    sample state: avail=+500 snaps=1 ledger=1 bonus_logs=1
+[SNAPSHOT ADMIN] Sending SMS to test_path5 (0900000099)...
+[SNAPSHOT ADMIN] Sending SMS to test_path5 (0900000099)...
+  PASS | T10 no double credit across 3 parallel double-clicks — doubleCredits=0
+  PASS | T10 no duplicate snapshots (UNIQUE week_start,rank) — snaps=1
+  PASS | T10 ledger row exists for the prize (never swallowed)
+  PASS | T10 exactly one bonus_logs row — blogs=1
+
+T11: finishAndPayout — happy path, forced failure -> payout_failed, ghost cron skips it
+[ACHIEVEMENT] Win recorded: User=00000000-0000-0000-0000-000000000099 Bet=100 Birr=100 Room=1
+  PASS | T11a game completed with winner + prize — {"status":"completed","w":"00000000-0000-0000-0000-000000000099","p":180}
+  PASS | T11a winner credited 180 (available & withdrawable, bonus_used=0) — {"available_balance":180,"withdrawable_balance":180,"bonus_balance":0}
+[finishAndPayout] payout attempt 1/3 failed for game 539f35b7-ccbf-4c1a-a12e-b87c9bbab7f1: relation "wallets" does not exist
+[finishAndPayout] payout attempt 2/3 failed for game 539f35b7-ccbf-4c1a-a12e-b87c9bbab7f1: relation "wallets" does not exist
+[finishAndPayout] payout attempt 3/3 failed for game 539f35b7-ccbf-4c1a-a12e-b87c9bbab7f1: relation "wallets" does not exist
+[finishAndPayout] ALL 3 attempts failed for game 539f35b7-ccbf-4c1a-a12e-b87c9bbab7f1 — marking payout_failed
+[ADMIN ALERT] ⚠️ [PAYOUT_FAILED] Game 539f35b7-ccbf-4c1a-a12e-b87c9bbab7f1: payout failed 3x — stakes locked, admin action required (pay winner from /admin/games/payout-failed)
+{"gameId":"539f35b7-ccbf-4c1a-a12e-b87c9bbab7f1","status":"X","winnerUserId":"00000000-0000-0000-0000-000000000099","prizeAmount":180}
+  PASS | T11b 3 failed attempts -> game marked payout_failed — status=payout_failed
+  PASS | T11b PAYOUT_FAILED system alert written
+  PASS | T11b winner NOT credited beyond T11a (no silent refund)
+[CRON] Running Ghost Game Cleanup...
+  PASS | T11c ghost cron skips payout_failed (stakes left for admin)
+
+T12: ghost cron — bucket-correct refund, rerun no-op, payout_failed untouched
+[CRON] Running Ghost Game Cleanup...
+[CRON] Cleaned up & refunded 1 stuck game(s).
+  PASS | T12 game marked completed
+  PASS | T12 X buckets restored exactly: avail=100 bonus=40 wd=50 (wdUsed=50, locked=10) — {"available_balance":100,"withdrawable_balance":50,"bonus_balance":40}
+  PASS | T12 O buckets restored exactly: avail=100 bonus=0 wd=0 (deposit stays non-withdrawable) — {"available_balance":100,"withdrawable_balance":0,"bonus_balance":0}
+[CRON] Running Ghost Game Cleanup...
+  PASS | T12 rerun is a no-op (no double refund) — refunds=1
+
+T13: admin manual refund — keyed to original tx, double-click pays once
+  PASS | T13 first refund succeeds (200) — "ok"
+  PASS | T13 second refund rejected (409 already refunded) — {"error":"Original transaction 2fe901db-3c55-4b1a-abe3-25152a569de9 has already been refunded"}
+  PASS | T13 wallet credited exactly once (200 dep + 50 refund = 250) — {"available_balance":250,"withdrawable_balance":0,"bonus_balance":0}
+  PASS | T13 exactly one MANUAL_REFUND ledger row
+  PASS | T13 parallel same-key inserts -> exactly one winner — inserted=1
+
+T14: rollover — deposit-only wallet, stake 100, refunds must NOT create withdrawable money
+[CRON] Running Ghost Game Cleanup...
+[CRON] Cleaned up & refunded 1 stuck game(s).
+  PASS | T14-i ghost refund keeps deposit money non-withdrawable (wd=0) — {"available_balance":100,"withdrawable_balance":0,"bonus_balance":0}
+  PASS | T14-ii stale refund keeps deposit money non-withdrawable (wd=0) — {"available_balance":100,"withdrawable_balance":0,"bonus_balance":0}
+
+T15: mixed buckets — stake 100 from bonus 30 / withdrawable 50 / deposit 20 restores exactly
+  PASS | T15 split computed correctly at stake time — {"bonusToUse":30,"wdUsed":50,"lockedUsed":20}
+  PASS | T15 stake deducted (avail 30, wd 0, bonus 0) — {"available_balance":30,"withdrawable_balance":0,"bonus_balance":0}
+[CRON] Running Ghost Game Cleanup...
+[CRON] Cleaned up & refunded 1 stuck game(s).
+  PASS | T15 ghost refund restores exact buckets (avail 130, bonus 30, wd 50) — {"available_balance":130,"withdrawable_balance":50,"bonus_balance":30}
+
+T16: idempotency index guard — fail closed when uq_wallet_tx_idem is missing
+[IDEMPOTENCY] uq_wallet_tx_idem MISSING or INVALID — ledgerFirstCredit will REFUSE all credits (fail closed). Apply db/migrations/008_unique_idempotency_key.sql.
+  PASS | T16 check reports index missing
+  PASS | T16 ledgerFirstCredit REFUSES to credit without the index
+  PASS | T16 IDEMPOTENCY_INDEX_MISSING alert written
+[IDEMPOTENCY] uq_wallet_tx_idem present and valid — ledger-first guards active
+  PASS | T16 index restored -> guard active again
+
+T17: payout_failed admin resolution — pay winner once through the real payout
+  PASS | T17 payout-failed list includes the game
+[ACHIEVEMENT] Win recorded: User=00000000-0000-0000-0000-000000000099 Bet=100 Birr=100 Room=1
+[COOLDOWN] User 00000000-0000-0000-0000-000000000099 hit 3 consecutive wins in range 50-100 → 3min shadow ban activated
+  PASS | T17 pay-winner completes the game — {"ok":true,"message":"Winner paid 180 ETB (game completed)","game":{"status":"completed","winner":"00000000-0000-0000-0000-000000000099"}}
+  PASS | T17 winner credited 180 (wd=180, no bonus used) — {"available_balance":180,"withdrawable_balance":180,"bonus_balance":0}
+  PASS | T17 second pay-winner rejected (409 already resolved) — {"error":"Game status is 'completed', not 'payout_failed' (already resolved?)"}
+  PASS | T17 wallet NOT credited twice
+
+T18: admin refund validations + reject policy (PENDING_MANUAL only)
+[ADMIN] POST /refund error: Error: Refund amount (300) exceeds the original transaction amount (200)
+    at C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\routes\admin.js:3358:29
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async withTx (C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\db\index.js:30:19)
+    at async C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\routes\admin.js:3344:5 {
+  status: 400
+}
+  PASS | T18 refund > original amount rejected (400) — {"error":"Failed to issue refund: Refund amount (300) exceeds the original transaction amount (200)"}
+[ADMIN] POST /refund error: Error: Refunds are only allowed for DEPOSIT/PRIZE/WITHDRAW_REQUEST transactions — the original is GIFT
+    at C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\routes\admin.js:3362:29
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async withTx (C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\db\index.js:30:19)
+    at async C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\routes\admin.js:3344:5 {
+  status: 400
+}
+  PASS | T18 refund of GIFT-type rejected (400 not refundable) — {"error":"Failed to issue refund: Refunds are only allowed for DEPOSIT/PRIZE/WITHDRAW_REQUEST transactions — the original is GIFT"}
+  PASS | T18 valid refund succeeds (200) — "ok"
+[ADMIN] /transactions/:id/reject error Error: PENDING withdrawals are verified by the payout cron — only PENDING_MANUAL can be admin-rejected
+    at C:\Users\ThinkPad 14\OneDrive\Desktop\new vertion\Xoet\xoet_backend\src\routes\admin.js:1599:29
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5) {
+  status: 409
+}
+  PASS | T18 admin reject of PENDING withdraw refused (409 cron-managed) — {"error":"PENDING withdrawals are verified by the payout cron — only PENDING_MANUAL can be admin-rejected"}
+  PASS | T18 OLD behaviour (rejecting PENDING) marked KNOWN BUG — now refused
+[settleWithdrawal] TX 298df4a0-67ff-4357-9d15-f5e082ea6619 FAILED → refunded 100 ETB to 00000000-0000-0000-0000-000000000099 (Rejected by admin)
+  PASS | T18 admin reject of PENDING_MANUAL works (refund via settleWithdrawal) — {"ok":true}
+
+==== SUITE SUMMARY: 71 passed, 0 failed ====
+STEP 1: starting backend child on port 2100
+[SENTRY] No SENTRY_DSN configured — error tracking disabled.
+[REDIS] ⚡ Circuit breaker OPEN — skipping Redis for 60s (level 0). Reason: Stream isn't writeable and enableOfflineQueue options is false
+  backend healthy on 2100
+STEP 2: authenticating two test accounts via OTP flow
+  users: a0bba4f9-1781-4db5-a3f8-eb53b9c11f0c 0d1cc93d-1794-482b-9653-968d58f49e7a
+STEP 3: snapshot wallets before the game
+  a0bba4f9… {"available_balance":"26607","withdrawable_balance":"11993","bonus_balance":"1500"}
+  0d1cc93d… {"available_balance":"100","withdrawable_balance":"100","bonus_balance":"0"}
+STEP 4: connect sockets and find a match
+  find_match ack A: {"ok":true,"data":{"queued":true,"ttlMs":120000,"room":1,"roomName":"Room 1 - Beginner","betAmount":10,"timerDuration":30,"houseCutPercent":10}}
+  find_match ack B: {"ok":true,"data":{"queued":true,"ttlMs":120000,"room":1,"roomName":"Room 1 - Beginner","betAmount":10,"timerDuration":30,"houseCutPercent":10}}
+  match_found: matchId=af01c4da… A=X B=O
+STEP 5: play to a win (X: 0,1,2 — O: 3,4)
+  game_won: winner=a0bba4f9… symbol=X prize=16
+STEP 6: assert DB state
+  games row: {"status":"completed","winner":"a0bba4f9-1781-4db5-a3f8-eb53b9c11f0c","prize":16,"bonus_used_x":"10.00","withdrawable_used_x":0,"locked_used_x":0,"moves":[{"ts":"2026-10-05T11:03:09.290Z","user":"a0bba4f9-1781-4db5-a3f8-eb53b9c11f0c","index":0,"symbol":"X","timers":{"O":30,"X":29}},{"ts":"2026-10-05T11:03:09.690Z","user":"0d1cc93d-1794-482b-9653-968d58f49e7a","index":3,"symbol":"O","timers":{"O":30,"X":29}},{"ts":"2026-10-05T11:03:10.095Z","user":"a0bba4f9-1781-4db5-a3f8-eb53b9c11f0c","index":1,"symbol":"X","timers":{"O":30,"X":29}},{"ts":"2026-10-05T11:03:10.498Z","user":"0d1cc93d-1794-482b-9653-968d58f49e7a","index":4,"symbol":"O","timers":{"O":30,"X":29}},{"ts":"2026-10-05T11:03:10.910Z","user":"a0bba4f9-1781-4db5-a3f8-eb53b9c11f0c","index":2,"symbol":"X","timers":{"O":30,"X":29}}]}
+  winner wallet: {"available_balance":"26613","withdrawable_balance":"11999","bonus_balance":"1500"} (before: {"available_balance":"26607","withdrawable_balance":"11993","bonus_balance":"1500"} )
+  loser  wallet: {"available_balance":"90","withdrawable_balance":"90","bonus_balance":"0"} (before: {"available_balance":"100","withdrawable_balance":"100","bonus_balance":"0"} )
+  winner prize ledger rows: 1
+
+✅ E2E PASS: game row, wallets and ledger all consistent

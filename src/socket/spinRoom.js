@@ -630,17 +630,18 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
 
   console.log(`${LOG_PREFIX} Player joined: ${username}${isBot ? ' (BOT)' : ''} seat=${seatIndex} stake=${finalStake} round=${round.id} (${round.players.length}/${round.maxPlayers})`);
 
-  // If 5_PLAYER room is full, lock immediately
+  // If 5_PLAYER room is full, start a short visible "get ready" countdown instead
+  // of locking instantly — an instant lock mid-timer felt like the wheel randomly
+  // started spinning on its own (user report: "suddenly starts again at ~1 minute").
   if (round.mode === "5_PLAYER" && round.players.length >= round.maxPlayers) {
-    if (round.countdownInterval) {
-      clearInterval(round.countdownInterval);
-      round.countdownInterval = null;
-    }
     if (round.botCancelFn) {
       round.botCancelFn();
       round.botCancelFn = null;
     }
-    lockRound(io, round);
+    if (!round.countdownInterval) {
+      round.countdown = 5;
+      startCountdown(io, round);
+    }
   }
 
   return { seatIndex, roundId: round.id };

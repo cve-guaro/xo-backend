@@ -18,17 +18,30 @@
 async function deductStake(client, { playerXId, playerOId, betAmount }) {
   const ids = [playerXId, playerOId];
 
-  // Lock both wallet rows and fetch everything the split needs
+  // Lock both wallet rows in a DETERMINISTIC order (sorted by user id) so two
+  // concurrent games sharing the same player pair can never deadlock — the lock
+  // order is global, not seat order. Rows are then already locked for the read.
+  const sortedIds = [...ids].sort();
+  for (const id of sortedIds) {
+    await client.query(`SELECT user_id FROM wallets WHERE user_id = $1::uuid FOR UPDATE`, [id]);
+  }
+
+  // Lock both wallet rows and fetch everything the split needs (rows already locked)
   const walletRes = await client.query(
     `SELECT w.user_id, w.available_balance, w.bonus_balance, w.withdrawable_balance,
             u.r1_10_wins, u.r1_15_wins
      FROM wallets w
      JOIN users u ON w.user_id = u.id
-     WHERE w.user_id = ANY($1::uuid[]) FOR UPDATE`,
+     WHERE w.user_id = ANY($1::uuid[])`,
     [ids]
   );
 
-  if (walletRes.rowCount !== 2) throw new Error("INSUFFICIENT_BALANCE");
+  if (walletRes.rowCount !== 2) {
+    // Diagnostic: this should be impossible while both users exist — log what the
+    // locked read actually saw before failing loudly.
+    console.error(`[deductStake] expected 2 wallet rows, got ${walletRes.rowCount} for ids ${JSON.stringify(ids)}: ${JSON.stringify(walletRes.rows)}`);
+    throw new Error("INSUFFICIENT_BALANCE");
+  }
 
   const result = {};
   for (const wallet of walletRes.rows) {
