@@ -428,18 +428,33 @@ async function redeemPromoCode({ userId, code }) {
  */
 async function applyNewUserGiveaways(userId) {
   return withTx(async (client) => {
-    // 🔒 Lock the user's wallet row FIRST to prevent race conditions
+    // 0) Ensure wallet row exists before locking
+    await client.query(`INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, [userId]);
+
+    // 🔒 Lock the user's wallet row to prevent race conditions
     await client.query(`SELECT 1 FROM wallets WHERE user_id = $1 FOR UPDATE`, [userId]);
 
     // Check if they already claimed the current global giveaway version
     const settingsRes = await client.query(`
       SELECT key, value FROM global_settings 
       WHERE key IN ('current_giveaway_version', 'welcome_bonus_amount', 'welcome_bonus_active')
-    `);
-    const config = {};
-    for (const r of settingsRes.rows) config[r.key] = r.value;
+    `).catch(() => ({ rows: [] }));
 
-    if (config.welcome_bonus_active !== 'true' && config.welcome_bonus_active !== true) {
+    const config = {};
+    for (const r of settingsRes.rows) {
+      let val = r.value;
+      if (typeof val === 'string') {
+        try { val = JSON.parse(val); } catch (_) {}
+      }
+      config[r.key] = val;
+    }
+
+    // Default to active unless explicitly disabled ('false' / false / 0)
+    const isBonusActive = config.welcome_bonus_active === undefined 
+      ? true 
+      : (config.welcome_bonus_active === 'true' || config.welcome_bonus_active === true || config.welcome_bonus_active === '1' || config.welcome_bonus_active === 1);
+
+    if (!isBonusActive) {
       return;
     }
 
@@ -466,18 +481,28 @@ async function applyNewUserGiveaways(userId) {
     const idem = makeIdempotencyKey("GIVEAWAY_AUTO", userId, currentVersion);
 
     // Apply to wallet transaction ledger
-    await client.query(SQL.applyTx, [
-      userId,
-      "GIFT",
-      amount,
-      "COMPLETED",
-      idem,
-      "GIVEAWAY",
-      "Welcome Bonus",
-      { version: currentVersion, type: 'AUTO_NEW_USER' }
-    ]);
+    try {
+      await client.query(SQL.applyTx, [
+        userId,
+        "GIFT",
+        amount,
+        "COMPLETED",
+        idem,
+        "GIVEAWAY",
+        "Welcome Bonus",
+        { version: currentVersion, type: 'AUTO_NEW_USER' }
+      ]);
+    } catch (applyErr) {
+      console.warn('[GIVEAWAY] fn_wallet_apply_tx fallback:', applyErr.message);
+      await client.query(`
+        UPDATE wallets 
+        SET available_balance = COALESCE(available_balance, 0) + $1,
+            updated_at        = now()
+        WHERE user_id = $2
+      `, [amount, userId]);
+    }
 
-    // Update ONLY bonus_balance because available_balance is already incremented by fn_wallet_apply_tx
+    // Update ONLY bonus_balance because available_balance is already incremented by fn_wallet_apply_tx / fallback
     await client.query(`
       UPDATE wallets 
       SET bonus_balance     = COALESCE(bonus_balance, 0) + $1,
@@ -489,7 +514,7 @@ async function applyNewUserGiveaways(userId) {
     await client.query(`
       INSERT INTO bonus_logs (user_id, amount, reason)
       VALUES ($1, $2, $3)
-    `, [userId, amount, 'New User Welcome Bonus']);
+    `, [userId, amount, 'New User Welcome Bonus']).catch(e => console.warn('[GIVEAWAY] bonus_logs insert notice:', e.message));
 
     console.log(`[GIVEAWAY] Auto-applied Welcome Bonus (${amount} ETB) to user ${userId}`);
   });

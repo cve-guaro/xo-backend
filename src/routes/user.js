@@ -78,7 +78,21 @@ router.get('/me', auth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const user = rows[0];
+    let user = rows[0];
+
+    // Auto-heal missing welcome bonus if never claimed
+    if (Number(user.claimed_giveaway_version || 0) < 1) {
+      try {
+        const { applyNewUserGiveaways } = require('../models/payments.service');
+        await applyNewUserGiveaways(userId);
+        const refetch = await pool.query(query, [userId]);
+        if (refetch.rows.length) {
+          user = refetch.rows[0];
+        }
+      } catch (giveawayErr) {
+        console.warn('[AUTO_GIVEAWAY_HEAL_ERR]', giveawayErr.message);
+      }
+    }
 
     const { rows: gameCountRows } = await pool.query(`SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, [userId]);
     const totalGames = gameCountRows[0]?.total || 0;

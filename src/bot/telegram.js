@@ -399,7 +399,10 @@ function initTelegramBot() {
       if (customReturn && typeof customReturn === 'string' && customReturn.startsWith('http')) {
         try {
           const parsed = new URL(customReturn);
-          const path = (parsed.pathname && parsed.pathname !== '/') ? parsed.pathname : '/home/gameplay';
+          let path = parsed.pathname;
+          if (!path || path === '/' || path.includes('login') || path.includes('account')) {
+            path = '/home/gameplay';
+          }
           returnUrl = `${parsed.origin}${path}`;
         } catch (_) {
           returnUrl = customReturn;
@@ -431,19 +434,17 @@ function initTelegramBot() {
         }
       ).catch(() => {});
 
-      // 10) FIRE-AND-FORGET: Apply welcome bonuses for new users
-      if (isNewUser) {
-        setImmediate(async () => {
-          try {
-            console.log(`[TELEGRAM_BONUS] Processing bonuses for new user ${user.id}...`);
-            await applyNewUserGiveaways(user.id).catch(err =>
-              console.error('[TELEGRAM_GIVEAWAY_ERR]', err.message)
-            );
-          } catch (bonusErr) {
-            console.error('[TELEGRAM_BONUS] Failed:', bonusErr.message);
-          }
-        });
-      }
+      // 10) FIRE-AND-FORGET: Ensure welcome bonus for new or uncredited users
+      setImmediate(async () => {
+        try {
+          console.log(`[TELEGRAM_BONUS] Ensuring welcome bonus for user ${user.id}...`);
+          await applyNewUserGiveaways(user.id).catch(err =>
+            console.error('[TELEGRAM_GIVEAWAY_ERR]', err.message)
+          );
+        } catch (bonusErr) {
+          console.error('[TELEGRAM_BONUS] Failed:', bonusErr.message);
+        }
+      });
 
     } catch (err) {
       console.error('[TELEGRAM] Contact handler error:', err);

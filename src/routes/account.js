@@ -46,7 +46,7 @@ router.patch(
 
       values.push(userId); // final placeholder for WHERE
 
-      const query = `
+      let query = `
         UPDATE users
         SET ${fields.join(", ")}, updated_at = NOW()
         WHERE id = $${idx}
@@ -54,7 +54,24 @@ router.patch(
       `;
 
       console.log("Executing query:", query, "with values:", values);
-      const result = await pool.query(query, values);
+      let result;
+      try {
+        result = await pool.query(query, values);
+      } catch (dbErr) {
+        if (dbErr.code === '42703' && dbErr.message && dbErr.message.includes('updated_at')) {
+          console.warn('[ACCOUNT] users.updated_at not present, falling back without updated_at');
+          const fallbackQuery = `
+            UPDATE users
+            SET ${fields.join(", ")}
+            WHERE id = $${idx}
+            RETURNING id, username, display_name, avatar;
+          `;
+          result = await pool.query(fallbackQuery, values);
+        } else {
+          throw dbErr;
+        }
+      }
+
       if (result.rowCount === 0) return res.status(404).json({ message: "User not found" });
 
       res.json({ ok: true, user: result.rows[0] });

@@ -494,9 +494,46 @@ async function ensureUserSchema() {
         ADD COLUMN IF NOT EXISTS display_name TEXT,
         ADD COLUMN IF NOT EXISTS avatar TEXT,
         ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT false,
-        ADD COLUMN IF NOT EXISTS new_user BOOLEAN DEFAULT true;
+        ADD COLUMN IF NOT EXISTS new_user BOOLEAN DEFAULT true,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+      ALTER TABLE wallets
+        ADD COLUMN IF NOT EXISTS available_balance NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS withdrawable_balance NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS bonus_balance NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+      ALTER TABLE games
+        ADD COLUMN IF NOT EXISTS bonus_used_x NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS bonus_used_o NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS withdrawable_used_x NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS withdrawable_used_o NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS locked_used_x NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS locked_used_o NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS prize_amount NUMERIC DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS moves JSONB DEFAULT '[]'::jsonb;
+
+      CREATE TABLE IF NOT EXISTS bonus_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        amount NUMERIC NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS global_settings (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      INSERT INTO global_settings (key, value) VALUES 
+        ('welcome_bonus_active', 'true'::jsonb),
+        ('welcome_bonus_amount', '10'::jsonb),
+        ('current_giveaway_version', '1'::jsonb)
+      ON CONFLICT (key) DO NOTHING;
     `);
-    console.log('[DB] ✅ Users table schema verified with all room & tier win columns.');
+    console.log('[DB] ✅ Users, Wallets, Games, and Giveaway settings schema verified successfully.');
   } catch (err) {
     console.warn('[DB] ⚠️ ensureUserSchema notice:', err.message);
   }
