@@ -467,6 +467,18 @@ checkIdempotencyIndex();
 // Awaited on startup so the database schema is guaranteed to be ready before accepting requests.
 async function runMigrations() {
   try {
+    // 0. Skip if migrations already completed to avoid lock contention on every restart
+    try {
+      const guard = await pool.query("SELECT value FROM global_settings WHERE key = 'migrations_v4_completed'");
+      if (guard.rows.length && (guard.rows[0].value === true || guard.rows[0].value === 'true')) {
+        console.log('[DB] Migrations already applied (v4 guard active) — skipping startup schema execution.');
+        return;
+      }
+    } catch (_) {}
+
+    // Set short lock timeout so queries fail fast rather than hanging indefinitely
+    try { await pool.query("SET lock_timeout = '4s';"); } catch (_) {}
+
     // ── Spin Game tables ──
     await pool.query(`
       CREATE TABLE IF NOT EXISTS spin_room_configs (
@@ -511,14 +523,18 @@ async function runMigrations() {
 
     // Seed default spin room configs (exactly 5_PLAYER and RAIL with 20% house cut)
     console.log('[DB] Seeding exactly two spin room configs: 5_PLAYER and RAIL...');
-    await pool.query('TRUNCATE TABLE spin_room_configs CASCADE');
-    await pool.query(
-      `INSERT INTO spin_room_configs (id, name, bet_amount, max_players, house_cut_percent, is_active)
-       VALUES 
-         (1, '5_PLAYER', 100, 5, 20, true),
-         (2, 'RAIL', 0, 9999, 20, true)
-       ON CONFLICT (id) DO UPDATE SET house_cut_percent = 20`
-    );
+    try {
+      await pool.query(
+        `INSERT INTO spin_room_configs (id, name, bet_amount, max_players, house_cut_percent, is_active)
+         VALUES 
+           (1, '5_PLAYER', 100, 5, 20, true),
+           (2, 'RAIL', 0, 9999, 20, true)
+         ON CONFLICT (id) DO UPDATE SET house_cut_percent = 20`
+      );
+    } catch (scErr) {
+      console.warn('[DB] Non-fatal spin config seed warning:', scErr.message);
+    }
+
     // Seed spin_5p_entry_amount in global_settings
     await pool.query(
       `INSERT INTO global_settings (key, value)
@@ -538,19 +554,21 @@ async function runMigrations() {
       "player123", "newuser5", "guest22", "justme_1"
     ];
     for (const name of BOT_NICKNAMES) {
-      const botRes = await pool.query(
-        `INSERT INTO users (username, number, is_bot)
-         VALUES ($1, $2, true)
-         ON CONFLICT (username) DO UPDATE SET is_bot = true
-         RETURNING id`,
-        [name, `BOT_${name}`]
-      );
-      if (botRes.rows[0]?.id) {
-        await pool.query(
-          `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
-          [botRes.rows[0].id]
+      try {
+        const botRes = await pool.query(
+          `INSERT INTO users (username, number, is_bot)
+           VALUES ($1, $2, true)
+           ON CONFLICT DO NOTHING
+           RETURNING id`,
+          [name, `BOT_${name}`]
         );
-      }
+        if (botRes.rows[0]?.id) {
+          await pool.query(
+            `INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+            [botRes.rows[0].id]
+          );
+        }
+      } catch (_) {}
     }
     console.log('[DB] Seeded realistic Ethiopian bot users in DB.');
 
