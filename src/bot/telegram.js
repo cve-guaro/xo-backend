@@ -245,8 +245,8 @@ function initTelegramBot() {
       '🎮 *XO Ethiopia Bot*\n\n' +
       'ይህ ቦት ወደ XO ET ለመግባት ይጠቅማል።\n' +
       'This bot is used to log in to XO ET.\n\n' +
-      '👉 xoethiopia.com ላይ "Login with Telegram" ይጫኑ።\n' +
-      '👉 Tap "Login with Telegram" on xoethiopia.com.',
+      '👉 xo-frontend-gamma.vercel.app ላይ "Login with Telegram" ይጫኑ።\n' +
+      '👉 Tap "Login with Telegram" on https://xo-frontend-gamma.vercel.app.',
       { parse_mode: 'Markdown' }
     ).catch(() => {});
   });
@@ -290,6 +290,11 @@ function initTelegramBot() {
           { reply_markup: { remove_keyboard: true } }
         );
       }
+
+      let parsedSession = {};
+      try {
+        parsedSession = typeof sessionCheck === 'string' ? JSON.parse(sessionCheck) : (sessionCheck || {});
+      } catch (e) {}
 
       const telegramId = msg.from.id;
       const telegramUsername = msg.from.username || null;
@@ -389,8 +394,24 @@ function initTelegramBot() {
       console.log(`[TELEGRAM] Login completed INSTANTLY: user=${user.id} phone=${normalizedPhone} isNew=${isNewUser}`);
 
       // 8) Send success message back to user on Telegram without blocking the login polling
-      const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'https://xo-frontend-gamma.vercel.app';
-      const returnUrl = `${baseUrl}/home/account`;
+      let customReturn = parsedSession?.returnUrl;
+      let returnUrl = 'https://xo-frontend-gamma.vercel.app/home/account';
+      if (customReturn && typeof customReturn === 'string' && customReturn.startsWith('http')) {
+        try {
+          const parsedOrigin = new URL(customReturn).origin;
+          returnUrl = `${parsedOrigin}/home/account`;
+        } catch (_) {
+          returnUrl = customReturn;
+        }
+      } else {
+        const baseUrl = (process.env.APP_URL && !process.env.APP_URL.includes('xoethiopia.com'))
+          ? process.env.APP_URL
+          : (process.env.FRONTEND_URL && !process.env.FRONTEND_URL.includes('xoethiopia.com'))
+            ? process.env.FRONTEND_URL
+            : 'https://xo-frontend-gamma.vercel.app';
+        returnUrl = `${baseUrl}/home/account`;
+      }
+
       bot.sendMessage(chatId,
         '✅ *ምዝገባው/መግባቱ ተሳክቷል! / Login Successful!*\n\n' +
         'አሁን ተመልሰው ወደ ጨዋታው መግባት ይችላሉ።\n' +
@@ -464,9 +485,12 @@ function initTelegramBot() {
 /**
  * Create a new login session. Returns { sessionToken, deepLink }.
  */
-async function createTelegramLoginSession() {
+async function createTelegramLoginSession(options = {}) {
   const sessionToken = crypto.randomUUID();
-  const sessionObj = { status: 'waiting' };
+  const sessionObj = { 
+    status: 'waiting',
+    returnUrl: options.returnUrl || null,
+  };
 
   memoryTgSessions.set(sessionToken, {
     data: JSON.stringify(sessionObj),

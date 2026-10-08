@@ -33,9 +33,10 @@ const pollLimiter = rateLimit({
  */
 router.post('/telegram-init', initLimiter, async (req, res) => {
   try {
-    const { sessionToken, deepLink } = await createTelegramLoginSession();
+    const returnUrl = req.body?.returnUrl || req.headers?.referer || req.headers?.origin;
+    const { sessionToken, deepLink } = await createTelegramLoginSession({ returnUrl });
 
-    console.log(`[TG_AUTH] Session created: ${sessionToken}`);
+    console.log(`[TG_AUTH] Session created: ${sessionToken}, returnUrl: ${returnUrl || 'none'}`);
 
     return res.json({
       ok: true,
