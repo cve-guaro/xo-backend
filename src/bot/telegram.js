@@ -299,6 +299,8 @@ function initTelegramBot() {
 
       // ── Replicate the same login flow as otp.js verify-otp ──────────────
       const result = await withTx(async (client) => {
+        // Ensure new_user column exists in database
+        await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS new_user BOOLEAN DEFAULT true;`).catch(() => {});
         // 1) Find or create user by phone number & store telegram_id in ONE query
         const { rows: userRows } = await client.query(
           `INSERT INTO users (number, telegram_id, telegram_username)
@@ -387,7 +389,7 @@ function initTelegramBot() {
       console.log(`[TELEGRAM] Login completed INSTANTLY: user=${user.id} phone=${normalizedPhone} isNew=${isNewUser}`);
 
       // 8) Send success message back to user on Telegram without blocking the login polling
-      const baseUrl = process.env.APP_URL || (process.env.NODE_ENV === 'production' ? 'https://xoethiopia.com' : 'http://localhost:8081');
+      const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'https://xo-frontend-gamma.vercel.app';
       const returnUrl = `${baseUrl}/home/account`;
       bot.sendMessage(chatId,
         '✅ *ምዝገባው/መግባቱ ተሳክቷል! / Login Successful!*\n\n' +
