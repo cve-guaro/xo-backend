@@ -966,28 +966,39 @@ process.on('unhandledRejection', (reason) => {
 });
 
 async function startServer() {
-  let PORT = parseInt(process.env.PORT, 10);
-  if (isNaN(PORT)) PORT = process.env.NODE_ENV === 'production' ? 8080 : 2000;
+  // Railway Public Networking is mapped specifically to Port 2000 (as shown in dashboard settings)
+  const PORT_2000 = 2000;
 
-  // 1. Listen IMMEDIATELY so Railway reverse proxy and health checks succeed instantly
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[BOOT] Server running and listening immediately on port ${PORT} (0.0.0.0)`);
+  // 1. Listen on Port 2000 as primary listener
+  server.listen(PORT_2000, '0.0.0.0', () => {
+    console.log(`[BOOT] Server listening immediately on Port 2000 (0.0.0.0) — Railway Public Domain match`);
     
-    // 2. Run migrations asynchronously in background without blocking port listening
+    // Run migrations in background without blocking port listening
     runMigrations().catch(err => {
       console.error('[STARTUP] Migrations failed (non-fatal, server continues):', err.message);
     });
   });
 
-  // 3. Fallback listener on port 8080 if primary PORT is different (e.g. 2000), guaranteeing Railway connectivity
-  if (PORT !== 8080) {
+  // 2. Also listen on process.env.PORT if specified and different from 2000
+  const envPort = parseInt(process.env.PORT, 10);
+  if (!isNaN(envPort) && envPort !== PORT_2000) {
     try {
-      const fallbackServer = http.createServer(app);
-      fallbackServer.listen(8080, '0.0.0.0', () => {
-        console.log('[BOOT] Fallback listener active on port 8080 (0.0.0.0)');
+      const envServer = http.createServer(app);
+      envServer.listen(envPort, '0.0.0.0', () => {
+        console.log(`[BOOT] Auxiliary listener active on env port ${envPort} (0.0.0.0)`);
       }).on('error', (err) => {
-        // Normal if port 8080 is not available in environment
+        console.warn(`[BOOT] Non-fatal auxiliary port ${envPort} warning:`, err.message);
       });
+    } catch (_) {}
+  }
+
+  // 3. Fallback listener on port 8080 if neither is 8080
+  if (envPort !== 8080 && PORT_2000 !== 8080) {
+    try {
+      const fallback8080 = http.createServer(app);
+      fallback8080.listen(8080, '0.0.0.0', () => {
+        console.log('[BOOT] Auxiliary listener active on port 8080 (0.0.0.0)');
+      }).on('error', () => {});
     } catch (_) {}
   }
 }
