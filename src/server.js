@@ -25,16 +25,21 @@ const path = require('path');
 require('dotenv').config();
 
 // ─── DEV ↔ PROD SAFETY GUARD ─────────────────────────────────────────────────
-// Refuse to start if a non-production environment points at production services.
-// This prevents dev from sharing Redis queues, reading prod DB, or sending real SMS.
-if (process.env.NODE_ENV !== 'production') {
+// Refuse to start only if a local developer environment accidentally points at production services.
+const isHosted = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID || process.env.NODE_ENV === 'production';
+if (!isHosted && process.env.NODE_ENV === 'development') {
   const combined = `${process.env.REDIS_URL || ''}|${process.env.DATABASE_URL || ''}`;
   if (/upstash|supabase\.com|pooler\.supabase|railway/i.test(combined)) {
-    console.error('\n🛑 SAFETY GUARD: Refusing to start — dev environment points at production services.');
+    console.error('\n🛑 SAFETY GUARD: Refusing to start — local dev environment points at production services.');
     console.error('   REDIS_URL or DATABASE_URL contains upstash/supabase/railway.');
     console.error('   Fix your .env before running locally.\n');
     process.exit(1);
   }
+}
+
+// Auto-default NODE_ENV to production in hosted container environments
+if (!process.env.NODE_ENV && (process.env.RAILWAY_ENVIRONMENT || process.env.PORT)) {
+  process.env.NODE_ENV = 'production';
 }
 
 const rateLimit = require('express-rate-limit');
