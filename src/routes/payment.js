@@ -74,9 +74,10 @@ router.get('/chapa-return', async (req, res) => {
       console.log('[DEV MOCK DEPOSIT COMPLETE LOG]', e.message);
     }
   }
-  const homeUrl = process.env.NODE_ENV === 'production'
-    ? 'https://xoethiopia.com/home/gameplay'
-    : 'http://localhost:8081/home/gameplay';
+  const frontendBase = process.env.APP_URL || process.env.FRONTEND_URL || (process.env.NODE_ENV === 'production'
+    ? 'https://xo-frontend-gamma.vercel.app'
+    : 'http://localhost:8081');
+  const homeUrl = `${frontendBase}/home/gameplay`;
 
   return res.redirect(homeUrl);
 });

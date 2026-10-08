@@ -169,7 +169,8 @@ router.get('/referral-link', auth, async (req, res) => {
     const userId = req.user.id;
     // Use first 8 chars of UUID as referral code
     const refCode = userId.slice(0, 8).toUpperCase();
-    const referralUrl = `https://xoethiopia.com/?ref=${refCode}`;
+    const frontendBase = process.env.APP_URL || process.env.FRONTEND_URL || 'https://xo-frontend-gamma.vercel.app';
+    const referralUrl = `${frontendBase}/?ref=${refCode}`;
     
     // Check if referral system is enabled (cached in Redis)
     const enabled = await getGlobalSetting('referral_enabled', true);
