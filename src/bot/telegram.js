@@ -352,7 +352,7 @@ function initTelegramBot() {
           role: user.role || 'user',
         },
         JWT_SECRET,
-        { expiresIn: '7d' }
+        { algorithm: 'HS256', expiresIn: '7d' }
       );
 
       // 6) Generate refresh token
@@ -395,11 +395,12 @@ function initTelegramBot() {
 
       // 8) Send success message back to user on Telegram without blocking the login polling
       let customReturn = parsedSession?.returnUrl;
-      let returnUrl = 'https://xo-frontend-gamma.vercel.app/home/account';
+      let returnUrl = 'https://xo-frontend-gamma.vercel.app/home/gameplay';
       if (customReturn && typeof customReturn === 'string' && customReturn.startsWith('http')) {
         try {
-          const parsedOrigin = new URL(customReturn).origin;
-          returnUrl = `${parsedOrigin}/home/account`;
+          const parsed = new URL(customReturn);
+          const path = (parsed.pathname && parsed.pathname !== '/') ? parsed.pathname : '/home/gameplay';
+          returnUrl = `${parsed.origin}${path}`;
         } catch (_) {
           returnUrl = customReturn;
         }
@@ -409,8 +410,12 @@ function initTelegramBot() {
           : (process.env.FRONTEND_URL && !process.env.FRONTEND_URL.includes('xoethiopia.com'))
             ? process.env.FRONTEND_URL
             : 'https://xo-frontend-gamma.vercel.app';
-        returnUrl = `${baseUrl}/home/account`;
+        returnUrl = `${baseUrl.replace(/\/+$/, '')}/home/gameplay`;
       }
+
+      // Append authentication tokens so newly opened webviews/tabs are automatically authenticated
+      const sep = returnUrl.includes('?') ? '&' : '?';
+      returnUrl = `${returnUrl}${sep}token=${encodeURIComponent(token)}${refreshToken ? `&refresh=${encodeURIComponent(refreshToken)}` : ''}`;
 
       bot.sendMessage(chatId,
         '✅ *ምዝገባው/መግባቱ ተሳክቷል! / Login Successful!*\n\n' +
