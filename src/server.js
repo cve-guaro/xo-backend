@@ -908,17 +908,34 @@ app.use((err, req, res, next) => {
 });
 
 // ─── PROCESS-LEVEL SAFETY NETS ─────────────────────────────────────────────────
-// Prevent Redis/ioredis errors from crashing the whole server
+// Prevent Redis/ioredis/network errors from crashing the whole server
 process.on('uncaughtException', (err) => {
-  console.error('[UNCAUGHT EXCEPTION]', err.message);
-  console.error(err.stack);
-  // Only exit for truly fatal non-Redis errors
-  if (!err.message?.includes('rate-limited') && !err.message?.includes('ECONNREFUSED') && !err.message?.includes('psubscribe')) {
-    console.error('[FATAL] Non-recoverable error. Exiting in 3s...');
-    setTimeout(() => process.exit(1), 3000);
-  } else {
-    console.warn('[RECOVERED] Redis-related error caught. Server continues running.');
+  console.error('[UNCAUGHT EXCEPTION]', err?.message || err);
+  if (err?.stack) console.error(err.stack);
+  
+  const msg = (err?.message || '').toLowerCase();
+  const name = (err?.name || '').toLowerCase();
+  const isRecoverable = 
+    msg.includes('rate-limited') ||
+    msg.includes('econnrefused') ||
+    msg.includes('psubscribe') ||
+    msg.includes('redis') ||
+    msg.includes('enotfound') ||
+    msg.includes('connection is closed') ||
+    msg.includes("stream isn't writeable") ||
+    msg.includes('closed') ||
+    msg.includes('reset') ||
+    msg.includes('etimedout') ||
+    name.includes('redis') ||
+    name.includes('maxretriesperrequest');
+
+  if (isRecoverable) {
+    console.warn('[RECOVERED] Non-fatal network/Redis error caught safely. Server continues running.');
+    return;
   }
+  
+  console.error('[FATAL] Non-recoverable error. Exiting in 3s...');
+  setTimeout(() => process.exit(1), 3000);
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -926,15 +943,30 @@ process.on('unhandledRejection', (reason) => {
 });
 
 async function startServer() {
-  try {
-    await runMigrations();
-  } catch (err) {
-    console.error('[STARTUP] Migrations failed (non-fatal, starting server anyway):', err.message);
-  }
-
   let PORT = parseInt(process.env.PORT, 10);
-  if (isNaN(PORT)) PORT = 2000;
-  server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+  if (isNaN(PORT)) PORT = process.env.NODE_ENV === 'production' ? 8080 : 2000;
+
+  // 1. Listen IMMEDIATELY so Railway reverse proxy and health checks succeed instantly
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[BOOT] Server running and listening immediately on port ${PORT} (0.0.0.0)`);
+    
+    // 2. Run migrations asynchronously in background without blocking port listening
+    runMigrations().catch(err => {
+      console.error('[STARTUP] Migrations failed (non-fatal, server continues):', err.message);
+    });
+  });
+
+  // 3. Fallback listener on port 8080 if primary PORT is different (e.g. 2000), guaranteeing Railway connectivity
+  if (PORT !== 8080) {
+    try {
+      const fallbackServer = http.createServer(app);
+      fallbackServer.listen(8080, '0.0.0.0', () => {
+        console.log('[BOOT] Fallback listener active on port 8080 (0.0.0.0)');
+      }).on('error', (err) => {
+        // Normal if port 8080 is not available in environment
+      });
+    } catch (_) {}
+  }
 }
 
 startServer();
