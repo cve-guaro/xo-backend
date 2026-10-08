@@ -468,6 +468,40 @@ initCron();
 const { checkIdempotencyIndex } = require('./models/idempotencyIndex');
 checkIdempotencyIndex();
 
+// ─── ENSURE USER SCHEMA ────────────────────────────────────────────────────────
+// Unconditionally ensure all core & win tracker columns exist on the users table.
+// In Postgres 11+, ADD COLUMN with constant default is an instant, lock-free metadata-only update.
+async function ensureUserSchema() {
+  try {
+    await pool.query(`
+      ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS room_1_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS room_2_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS room_3_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r1_10_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r1_15_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r1_25_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r1_50_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r1_99_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r2_100_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS r3_1000_wins INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS claimed_giveaway_version INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS raw_user_meta_data JSONB DEFAULT '{}'::jsonb,
+        ADD COLUMN IF NOT EXISTS telegram_id BIGINT,
+        ADD COLUMN IF NOT EXISTS telegram_username TEXT,
+        ADD COLUMN IF NOT EXISTS is_bot BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS sound_muted BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS display_name TEXT,
+        ADD COLUMN IF NOT EXISTS avatar TEXT,
+        ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS new_user BOOLEAN DEFAULT true;
+    `);
+    console.log('[DB] ✅ Users table schema verified with all room & tier win columns.');
+  } catch (err) {
+    console.warn('[DB] ⚠️ ensureUserSchema notice:', err.message);
+  }
+}
+
 // ─── STARTUP MIGRATIONS ────────────────────────────────────────────────────────
 // Awaited on startup so the database schema is guaranteed to be ready before accepting requests.
 async function runMigrations() {
@@ -973,9 +1007,11 @@ async function startServer() {
   server.listen(PORT_2000, '0.0.0.0', () => {
     console.log(`[BOOT] Server listening immediately on Port 2000 (0.0.0.0) — Railway Public Domain match`);
     
-    // Run migrations in background without blocking port listening
-    runMigrations().catch(err => {
-      console.error('[STARTUP] Migrations failed (non-fatal, server continues):', err.message);
+    // Ensure critical user schema first, then run full migrations in background
+    ensureUserSchema().then(() => {
+      runMigrations().catch(err => {
+        console.error('[STARTUP] Migrations failed (non-fatal, server continues):', err.message);
+      });
     });
   });
 

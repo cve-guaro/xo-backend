@@ -63,27 +63,7 @@ router.get('/me', auth, async (req, res) => {
 
     const query = `
       SELECT 
-        u.id,
-        u.username,
-        u.number,
-        u.avatar,
-        u.new_user,
-        u.display_name,
-        u.role,
-        u.room_1_wins,
-        u.room_2_wins,
-        u.room_3_wins,
-        u.r1_10_wins,
-        u.r1_15_wins,
-        u.r1_25_wins,
-        u.r1_50_wins,
-        u.r1_99_wins,
-        u.r2_100_wins,
-        u.r3_1000_wins,
-        u.banned,
-        u.created_at,
-        u.claimed_giveaway_version,
-        COALESCE(u.raw_user_meta_data->'accomplishments', '[]'::jsonb) AS accomplishments,
+        u.*,
         COALESCE(w.available_balance, 0)    AS available_balance,
         COALESCE(w.withdrawable_balance, 0) AS withdrawable_balance,
         COALESCE(w.bonus_balance, 0)        AS bonus_balance
@@ -106,33 +86,42 @@ router.get('/me', auth, async (req, res) => {
     const { rows: winCountRows } = await pool.query(`SELECT COUNT(*) AS wins FROM games WHERE winner = $1`, [userId]);
     const totalWins = winCountRows[0]?.wins || 0;
 
+    let accomplishments = [];
+    try {
+      if (user.raw_user_meta_data) {
+        accomplishments = typeof user.raw_user_meta_data === 'string'
+          ? (JSON.parse(user.raw_user_meta_data)?.accomplishments || [])
+          : (user.raw_user_meta_data.accomplishments || []);
+      }
+    } catch (_) {}
+
     return res.json({
       id: user.id,
       username: user.username,
       number: user.number,
       avatar: user.avatar,
-      new_user: user.new_user,
+      new_user: user.new_user ?? true,
       display_name: user.display_name,
       role: user.role || 'user',
-      room_1_wins: user.room_1_wins || 0,
-      room_2_wins: user.room_2_wins || 0,
-      room_3_wins: user.room_3_wins || 0,
-      r1_10_wins: user.r1_10_wins || 0,
-      r1_15_wins: user.r1_15_wins || 0,
-      r1_25_wins: user.r1_25_wins || 0,
-      r1_50_wins: user.r1_50_wins || 0,
-      r1_99_wins: user.r1_99_wins || 0,
-      r2_100_wins: user.r2_100_wins || 0,
-      r3_1000_wins: user.r3_1000_wins || 0,
+      room_1_wins: Number(user.room_1_wins || 0),
+      room_2_wins: Number(user.room_2_wins || 0),
+      room_3_wins: Number(user.room_3_wins || 0),
+      r1_10_wins: Number(user.r1_10_wins || 0),
+      r1_15_wins: Number(user.r1_15_wins || 0),
+      r1_25_wins: Number(user.r1_25_wins || 0),
+      r1_50_wins: Number(user.r1_50_wins || 0),
+      r1_99_wins: Number(user.r1_99_wins || 0),
+      r2_100_wins: Number(user.r2_100_wins || 0),
+      r3_1000_wins: Number(user.r3_1000_wins || 0),
       banned: user.banned || false,
       created_at: user.created_at,
-      claimed_giveaway_version: user.claimed_giveaway_version || 0,
-      accomplishments: user.accomplishments || [],
-      available_balance: Number(user.available_balance),
-      withdrawable_balance: Number(user.withdrawable_balance),
-      bonus_balance: Number(user.bonus_balance),
-      total_games: totalGames,
-      total_wins: totalWins,
+      claimed_giveaway_version: Number(user.claimed_giveaway_version || 0),
+      accomplishments,
+      available_balance: Number(user.available_balance || 0),
+      withdrawable_balance: Number(user.withdrawable_balance || 0),
+      bonus_balance: Number(user.bonus_balance || 0),
+      total_games: Number(totalGames),
+      total_wins: Number(totalWins),
     });
   } catch (err) {
     console.error(err);
