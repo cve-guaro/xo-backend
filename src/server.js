@@ -128,6 +128,7 @@ app.use((req, res, next) => {
 const ALLOWED_ORIGINS = [
   "https://xoethiopia.com",
   "https://www.xoethiopia.com",
+  "https://xo-frontend-gamma.vercel.app",
   "https://xo-et-frontend.vercel.app",
   "https://xoet-pro-frontend.vercel.app",
   // Local dev origins (Expo web)
@@ -154,17 +155,47 @@ const corsOptions = {
                     origin.startsWith('http://10.') || 
                     origin.startsWith('http://172.');
 
-    const isVercel = /\.vercel\.app$/.test(origin);
+    const isVercel = origin.endsWith('.vercel.app') || /\.vercel\.app$/.test(origin);
 
-    if (ALLOWED_ORIGINS.includes(origin) || isVercel || (process.env.NODE_ENV !== 'production' && isLocal)) {
+    if (ALLOWED_ORIGINS.includes(origin) || isVercel || isLocal) {
       return callback(null, true);
     }
-    return callback(new Error('CORS: Origin not allowed'));
+    return callback(null, false);
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-access-token", "x-platform", "Idempotency-Key"],
+  allowedHeaders: [
+    "Content-Type", 
+    "Authorization", 
+    "x-access-token", 
+    "x-platform", 
+    "Idempotency-Key",
+    "sentry-trace",
+    "baggage",
+    "Accept",
+    "Origin",
+    "X-Requested-With",
+    "Cache-Control",
+    "Pragma",
+    "Expires"
+  ],
   credentials: true,
 };
+
+// Global CORS preflight handler ensuring headers are always injected
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (origin.endsWith('.vercel.app') || ALLOWED_ORIGINS.includes(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-access-token,x-platform,Idempotency-Key,sentry-trace,baggage,Accept,Origin,X-Requested-With,Cache-Control,Pragma,Expires');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all OPTIONS preflight requests globally
 
