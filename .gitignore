@@ -25,6 +25,7 @@ yarn-error.log*
 
 # Temporary debug/patch/migration scripts
 scratch/
+scratch_*.js
 patch_*.js
 fix_*.js
 check_*.js

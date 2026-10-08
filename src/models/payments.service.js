@@ -389,13 +389,14 @@ async function redeemPromoCode({ userId, code }) {
         if (Number(rows[0].total) > 0) throw new Error("ONLY_FOR_NEW_USERS");
       }
 
-      // 4) Apply balance to BONUS_BALANCE (requested for giveaways)
+      // 4) Apply balance: BONUS type adds available +N and bonus +N atomically
+      //    (no separate wallet UPDATE needed — fn_wallet_apply_tx handles both)
       const amount = Number(giveaway.amount);
-      const idem = makeIdempotencyKey("GIVEAWAY", userId, giveaway.id);
+      const idem = `promo:${giveaway.id}:${userId}`;
 
       await client.query(SQL.applyTx, [
         userId,
-        "PRIZE",
+        "BONUS",
         amount,
         "COMPLETED",
         idem,
@@ -403,15 +404,6 @@ async function redeemPromoCode({ userId, code }) {
         giveaway.title || `Promocode: ${cleanCode}`,
         { giveawayId: giveaway.id, code: cleanCode }
       ]);
-
-      // ✅ Update BOTH available_balance and bonus_balance to keep wallet in sync
-      await client.query(`
-        UPDATE wallets 
-        SET available_balance = available_balance + $1,
-            bonus_balance     = bonus_balance + $1,
-            updated_at        = now()
-        WHERE user_id = $2
-      `, [amount, userId]);
 
       // 5) Update claim log
       await client.query(`INSERT INTO giveaway_claims (giveaway_id, user_id, amount) VALUES ($1, $2, $3)`, [giveaway.id, userId, amount]);

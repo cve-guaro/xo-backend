@@ -23,6 +23,20 @@ const bodyParser = require("body-parser");
 const cors = require('cors');
 const path = require('path');
 require('dotenv').config();
+
+// ─── DEV ↔ PROD SAFETY GUARD ─────────────────────────────────────────────────
+// Refuse to start if a non-production environment points at production services.
+// This prevents dev from sharing Redis queues, reading prod DB, or sending real SMS.
+if (process.env.NODE_ENV !== 'production') {
+  const combined = `${process.env.REDIS_URL || ''}|${process.env.DATABASE_URL || ''}`;
+  if (/upstash|supabase\.com|pooler\.supabase|railway/i.test(combined)) {
+    console.error('\n🛑 SAFETY GUARD: Refusing to start — dev environment points at production services.');
+    console.error('   REDIS_URL or DATABASE_URL contains upstash/supabase/railway.');
+    console.error('   Fix your .env before running locally.\n');
+    process.exit(1);
+  }
+}
+
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const txRoutes = require("./routes/transactions");
@@ -33,6 +47,7 @@ const accountRoutes = require('./routes/account');
 const otpAuthRoutes = require('./routes/otp');
 const adminRoutes = require('./routes/admin');
 const telegramAuthRoutes = require('./routes/telegram-auth');
+const miniAppApiRoutes = require('./routes/miniapp-api');
 
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
@@ -117,6 +132,9 @@ const ALLOWED_ORIGINS = [
   "https://xoet-pro-frontend.vercel.app",
   // Local dev origins (Expo web)
   "http://localhost:8081",
+  "http://localhost:8082",
+  "http://127.0.0.1:8081",
+  "http://127.0.0.1:8082",
   "http://localhost:19006",
   "http://localhost:3000",
 ];
@@ -332,6 +350,7 @@ app.use('/leaderboard', require('./routes/leaderboard'));
 app.use('/spin', require('./routes/spin'));
 app.use('/voice', require('./routes/voice'));
 app.use('/api/voice', require('./routes/voice'));
+app.use('/miniapp/v1', miniAppApiRoutes);
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
   const CACHE_KEY = 'cache:api_features';
@@ -543,12 +562,48 @@ async function runMigrations() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip TEXT;`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;`);
 
+    // ── Mini-App Platform tables & schema enhancements (unconditional) ──
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_apps (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        api_key TEXT NOT NULL UNIQUE,
+        api_secret_hash TEXT NOT NULL,
+        permissions TEXT[] DEFAULT '{}',
+        rate_limit INT DEFAULT 100,
+        is_active BOOLEAN DEFAULT true,
+        webhook_url TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS mini_app_api_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        mini_app_id UUID REFERENCES mini_apps(id),
+        endpoint TEXT NOT NULL,
+        method TEXT NOT NULL,
+        target_user_id UUID,
+        request_body JSONB,
+        response_status INT,
+        ip_address TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_miniapp_logs_app ON mini_app_api_logs(mini_app_id);
+      CREATE INDEX IF NOT EXISTS idx_miniapp_logs_time ON mini_app_api_logs(created_at);
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS icon_url TEXT;
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS ip_whitelist TEXT[] DEFAULT '{}';
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS is_locked BOOLEAN DEFAULT false;
+    `);
+    console.log('[DB] Mini-App platform tables & columns verified.');
+
     // Check if migrations already completed (skip on subsequent deploys)
     const guardRes = await pool.query(
-      `SELECT value FROM global_settings WHERE key = 'migrations_v3_completed'`
+      `SELECT value FROM global_settings WHERE key = 'migrations_v4_completed'`
     );
     if (guardRes.rows.length > 0 && (guardRes.rows[0].value === true || guardRes.rows[0].value === 'true')) {
-      console.log('[DB] Migrations already completed (v3). Skipping.');
+      console.log('[DB] Migrations already completed (v4). Skipping.');
       return;
     }
 
@@ -737,9 +792,61 @@ async function runMigrations() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id) WHERE read = false;`);
 
+    // ── Mini-App Platform tables (Super App) ──
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_apps (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        api_key TEXT NOT NULL UNIQUE,
+        api_secret_hash TEXT NOT NULL,
+        permissions TEXT[] DEFAULT '{}',
+        rate_limit INT DEFAULT 100,
+        is_active BOOLEAN DEFAULT true,
+        webhook_url TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_app_api_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        mini_app_id UUID REFERENCES mini_apps(id),
+        endpoint TEXT NOT NULL,
+        method TEXT NOT NULL,
+        target_user_id UUID,
+        request_body JSONB,
+        response_status INT,
+        ip_address TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_miniapp_logs_app ON mini_app_api_logs(mini_app_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_miniapp_logs_time ON mini_app_api_logs(created_at);`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_app_user_data (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        mini_app_id UUID REFERENCES mini_apps(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        data_key TEXT NOT NULL,
+        data_value JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(mini_app_id, user_id, data_key)
+      );
+    `);
+    await pool.query(`
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS icon_url TEXT;
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS ip_whitelist TEXT[] DEFAULT '{}';
+      ALTER TABLE mini_apps ADD COLUMN IF NOT EXISTS is_locked BOOLEAN DEFAULT false;
+    `);
+    console.log('[DB] Mini-App platform tables created/verified.');
+
     // Mark migrations as completed so subsequent deploys skip this block
     await pool.query(`
-      INSERT INTO global_settings (key, value) VALUES ('migrations_v3_completed', 'true'::jsonb)
+      INSERT INTO global_settings (key, value) VALUES ('migrations_v4_completed', 'true'::jsonb)
       ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb;
     `);
 

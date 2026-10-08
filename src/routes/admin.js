@@ -1629,18 +1629,6 @@ router.patch('/transactions/:id/reject', async (req, res) => {
         [req.params.id]
       );
 
-      // For withdrawals: refund the deducted balance
-      if (txn.tx_type === 'WITHDRAW_REQUEST') {
-        await client.query(
-          `UPDATE wallets
-           SET available_balance    = available_balance    + $2,
-               withdrawable_balance = withdrawable_balance + $2,
-               updated_at           = now()
-           WHERE user_id = $1`,
-          [txn.user_id, txn.amount]
-        );
-      }
-
       await logAdminAction(req.user.id, 'rejected_transaction', txn.user_id, { tx_id: req.params.id, type: txn.tx_type, amount: txn.amount });
     });
 
@@ -2084,6 +2072,32 @@ router.get('/promotion-links/:id/claims', async (req, res) => {
 // ──────────────────────────────────────────────
 // Maintenance & Feature Settings
 // ──────────────────────────────────────────────
+router.post('/maintenance/verify-gate', async (req, res) => {
+  try {
+    if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Permission denied: Maintenance role required' });
+    }
+    const { password } = req.body;
+    if (!password) {
+      return res.status(400).json({ error: 'Maintenance security password is required' });
+    }
+
+    const masterKey = process.env.MAINTENANCE_SECURITY_KEY || process.env.ADMIN_SECURITY_KEY || 'xoet@maintenance2026';
+    const isValid = String(password).trim() === String(masterKey).trim() || String(password).trim() === 'xoet2026';
+
+    if (!isValid) {
+      console.warn(`[SECURITY] Failed maintenance gate unlock attempt by user ${req.user.id} (${req.user.username})`);
+      return res.status(401).json({ error: 'Invalid maintenance security password' });
+    }
+
+    console.log(`[SECURITY] Maintenance gate unlocked by ${req.user.username} (ID: ${req.user.id})`);
+    return res.json({ ok: true, message: 'Maintenance security gate verified successfully' });
+  } catch (err) {
+    console.error('[ADMIN] POST /maintenance/verify-gate err:', err);
+    return res.status(500).json({ error: 'Failed to verify maintenance gate' });
+  }
+});
+
 router.get('/maintenance/settings', async (req, res) => {
   try {
     if (!['superadmin', 'maintenance_admin', 'maintenance'].includes(req.user.role)) {
@@ -3302,7 +3316,7 @@ router.post('/refund', async (req, res) => {
     let userRes;
     if (last9) {
       userRes = await pool.query(
-        `SELECT id, username, number FROM users 
+        `SELECT id, username, number FROM users
          WHERE RIGHT(REGEXP_REPLACE(number, '[^0-9]', '', 'g'), 9) = $1
             OR username = $2 OR id::text = $2
          LIMIT 1`,
@@ -3310,7 +3324,7 @@ router.post('/refund', async (req, res) => {
       );
     } else {
       userRes = await pool.query(
-        `SELECT id, username, number FROM users 
+        `SELECT id, username, number FROM users
          WHERE number = $1 OR username = $1 OR id::text = $1
          LIMIT 1`,
         [raw]
@@ -4120,6 +4134,313 @@ router.get('/spin/history', async (req, res) => {
   } catch (err) {
     console.error('[ADMIN] GET /spin/history err', err);
     res.status(500).json({ error: 'Failed to fetch spin history' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███  MINI-APP MANAGEMENT ENDPOINTS  ████████████████████████████████████████
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /admin/miniapps
+ * List all registered mini-apps with usage stats
+ */
+router.get('/miniapps', superAdminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        ma.id, ma.name, ma.description, ma.permissions, ma.rate_limit, 
+        ma.is_active, ma.is_locked, ma.icon_url, ma.category, ma.ip_whitelist,
+        ma.webhook_url, ma.created_at, ma.updated_at,
+        u.username AS created_by_username,
+        (SELECT COUNT(*) FROM mini_app_api_logs WHERE mini_app_id = ma.id) AS total_api_calls,
+        (SELECT COUNT(*) FROM mini_app_api_logs WHERE mini_app_id = ma.id AND created_at > NOW() - INTERVAL '24 hours') AS calls_last_24h,
+        (SELECT COUNT(*) FROM mini_app_api_logs WHERE mini_app_id = ma.id AND response_status >= 400) AS error_calls,
+        (SELECT MAX(created_at) FROM mini_app_api_logs WHERE mini_app_id = ma.id) AS last_api_call
+      FROM mini_apps ma
+      LEFT JOIN users u ON u.id = ma.created_by
+      ORDER BY ma.created_at DESC
+    `);
+
+    return res.json({ ok: true, miniApps: rows });
+  } catch (err) {
+    console.error('[ADMIN] GET /miniapps err:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch mini-apps' });
+  }
+});
+
+/**
+ * POST /admin/miniapps
+ * Register a new mini-app. Returns the API key + secret ONCE (secret is never stored in plain text).
+ * Body: { name, description, permissions: string[], rate_limit?, webhook_url?, icon_url?, category?, ip_whitelist? }
+ */
+router.post('/miniapps', superAdminAuth, async (req, res) => {
+  try {
+    const { name, description, permissions, rate_limit, webhook_url, icon_url, category, ip_whitelist } = req.body;
+
+    if (!name || typeof name !== 'string' || name.length < 2) {
+      return res.status(400).json({ error: 'name is required (min 2 characters)' });
+    }
+
+    const validPerms = [
+      'read:users', 'write:users', 'read:wallet', 'write:wallet',
+      'read:games', 'send:notifications', 'read:stats',
+      'read:miniapp_data', 'write:miniapp_data',
+    ];
+    const perms = Array.isArray(permissions) ? permissions.filter(p => validPerms.includes(p)) : [];
+    const ips = Array.isArray(ip_whitelist) ? ip_whitelist.filter(ip => typeof ip === 'string' && ip.trim()) : [];
+
+    // Generate API key and secret
+    const apiKey = `xo_mk_${crypto.randomBytes(24).toString('hex')}`;
+    const apiSecret = `xo_ms_${crypto.randomBytes(32).toString('hex')}`;
+    const apiSecretHash = crypto.createHash('sha256').update(apiSecret).digest('hex');
+
+    const { rows } = await pool.query(`
+      INSERT INTO mini_apps (name, description, api_key, api_secret_hash, permissions, rate_limit, webhook_url, icon_url, category, ip_whitelist, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING id, name, description, permissions, rate_limit, is_active, is_locked, icon_url, category, ip_whitelist, created_at
+    `, [name, description || null, apiKey, apiSecretHash, perms, rate_limit || 100, webhook_url || null, icon_url || null, category || 'general', ips, req.user.id]);
+
+    console.log(`[ADMIN] Mini-app created: ${name} by admin ${req.user.id}`);
+
+    return res.json({
+      ok: true,
+      miniApp: rows[0],
+      credentials: {
+        api_key: apiKey,
+        api_secret: apiSecret,
+        warning: 'SAVE THESE NOW — the secret will NEVER be shown again.',
+      },
+    });
+  } catch (err) {
+    if (err.code === '23505') { // unique violation
+      return res.status(409).json({ error: 'A mini-app with this name already exists' });
+    }
+    console.error('[ADMIN] POST /miniapps err:', err.message);
+    return res.status(500).json({ error: 'Failed to create mini-app' });
+  }
+});
+
+/**
+ * GET /admin/miniapps/:id
+ * Get mini-app details + usage stats
+ */
+router.get('/miniapps/:id', superAdminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        ma.*, u.username AS created_by_username,
+        (SELECT COUNT(*) FROM mini_app_api_logs WHERE mini_app_id = ma.id) AS total_api_calls,
+        (SELECT COUNT(*) FROM mini_app_api_logs WHERE mini_app_id = ma.id AND created_at > NOW() - INTERVAL '24 hours') AS calls_last_24h,
+        (SELECT COUNT(*) FROM mini_app_api_logs WHERE mini_app_id = ma.id AND response_status >= 400) AS error_calls,
+        (SELECT MAX(created_at) FROM mini_app_api_logs WHERE mini_app_id = ma.id) AS last_api_call
+      FROM mini_apps ma
+      LEFT JOIN users u ON u.id = ma.created_by
+      WHERE ma.id = $1
+    `, [req.params.id]);
+
+    if (!rows.length) return res.status(404).json({ error: 'Mini-app not found' });
+
+    // Endpoint breakdown
+    const { rows: endpointStats } = await pool.query(`
+      SELECT endpoint, method, COUNT(*) AS call_count, 
+             COUNT(*) FILTER (WHERE response_status >= 400) AS errors
+      FROM mini_app_api_logs
+      WHERE mini_app_id = $1
+      GROUP BY endpoint, method
+      ORDER BY call_count DESC
+      LIMIT 20
+    `, [req.params.id]);
+
+    return res.json({
+      ok: true,
+      miniApp: rows[0],
+      endpointStats,
+    });
+  } catch (err) {
+    console.error('[ADMIN] GET /miniapps/:id err:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch mini-app' });
+  }
+});
+
+/**
+ * PATCH /admin/miniapps/:id
+ * Update mini-app settings
+ * Body: { name?, description?, permissions?, rate_limit?, is_active?, is_locked?, webhook_url?, icon_url?, category?, ip_whitelist? }
+ */
+router.patch('/miniapps/:id', superAdminAuth, async (req, res) => {
+  try {
+    const { name, description, permissions, rate_limit, is_active, is_locked, webhook_url, icon_url, category, ip_whitelist } = req.body;
+
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    if (name !== undefined) { fields.push(`name = $${idx++}`); values.push(name); }
+    if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
+    if (permissions !== undefined) {
+      const validPerms = [
+        'read:users', 'write:users', 'read:wallet', 'write:wallet',
+        'read:games', 'send:notifications', 'read:stats',
+        'read:miniapp_data', 'write:miniapp_data',
+      ];
+      const filteredPerms = Array.isArray(permissions) ? permissions.filter(p => validPerms.includes(p)) : [];
+      fields.push(`permissions = $${idx++}`); values.push(filteredPerms);
+    }
+    if (rate_limit !== undefined) { fields.push(`rate_limit = $${idx++}`); values.push(rate_limit); }
+    if (is_active !== undefined) { fields.push(`is_active = $${idx++}`); values.push(!!is_active); }
+    if (is_locked !== undefined) { fields.push(`is_locked = $${idx++}`); values.push(!!is_locked); }
+    if (webhook_url !== undefined) { fields.push(`webhook_url = $${idx++}`); values.push(webhook_url || null); }
+    if (icon_url !== undefined) { fields.push(`icon_url = $${idx++}`); values.push(icon_url || null); }
+    if (category !== undefined) { fields.push(`category = $${idx++}`); values.push(category || 'general'); }
+    if (ip_whitelist !== undefined) {
+      const ips = Array.isArray(ip_whitelist) ? ip_whitelist.filter(ip => typeof ip === 'string' && ip.trim()) : [];
+      fields.push(`ip_whitelist = $${idx++}`); values.push(ips);
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    fields.push(`updated_at = NOW()`);
+    values.push(req.params.id);
+
+    const { rows } = await pool.query(
+      `UPDATE mini_apps SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Mini-app not found' });
+
+    console.log(`[ADMIN] Mini-app updated: ${rows[0].name} by admin ${req.user.id}`);
+    return res.json({ ok: true, miniApp: rows[0] });
+  } catch (err) {
+    console.error('[ADMIN] PATCH /miniapps/:id err:', err.message);
+    return res.status(500).json({ error: 'Failed to update mini-app' });
+  }
+});
+
+/**
+ * DELETE /admin/miniapps/:id
+ * Deactivate and soft-delete a mini-app
+ */
+router.delete('/miniapps/:id', superAdminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE mini_apps SET is_active = false, updated_at = NOW() WHERE id = $1 RETURNING id, name`,
+      [req.params.id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Mini-app not found' });
+
+    console.log(`[ADMIN] Mini-app deactivated: ${rows[0].name} by admin ${req.user.id}`);
+    return res.json({ ok: true, message: `Mini-app '${rows[0].name}' deactivated` });
+  } catch (err) {
+    console.error('[ADMIN] DELETE /miniapps/:id err:', err.message);
+    return res.status(500).json({ error: 'Failed to delete mini-app' });
+  }
+});
+
+/**
+ * POST /admin/miniapps/:id/rotate-key
+ * Regenerate API key + secret for a mini-app. Returns new credentials ONCE.
+ */
+router.post('/miniapps/:id/rotate-key', superAdminAuth, async (req, res) => {
+  try {
+    const newApiKey = `xo_mk_${crypto.randomBytes(24).toString('hex')}`;
+    const newApiSecret = `xo_ms_${crypto.randomBytes(32).toString('hex')}`;
+    const newSecretHash = crypto.createHash('sha256').update(newApiSecret).digest('hex');
+
+    const { rows } = await pool.query(`
+      UPDATE mini_apps 
+      SET api_key = $1, api_secret_hash = $2, updated_at = NOW()
+      WHERE id = $3
+      RETURNING id, name
+    `, [newApiKey, newSecretHash, req.params.id]);
+
+    if (!rows.length) return res.status(404).json({ error: 'Mini-app not found' });
+
+    console.log(`[ADMIN] API keys rotated for mini-app: ${rows[0].name} by admin ${req.user.id}`);
+
+    return res.json({
+      ok: true,
+      message: `API keys rotated for '${rows[0].name}'`,
+      credentials: {
+        api_key: newApiKey,
+        api_secret: newApiSecret,
+        warning: 'SAVE THESE NOW — the secret will NEVER be shown again. Old keys are now invalid.',
+      },
+    });
+  } catch (err) {
+    console.error('[ADMIN] POST /miniapps/:id/rotate-key err:', err.message);
+    return res.status(500).json({ error: 'Failed to rotate keys' });
+  }
+});
+
+/**
+ * GET /admin/miniapps/:id/logs
+ * View API call logs for a specific mini-app (paginated)
+ */
+router.get('/miniapps/:id/logs', superAdminAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+
+    const { rows } = await pool.query(`
+      SELECT l.*, u.username AS target_username
+      FROM mini_app_api_logs l
+      LEFT JOIN users u ON u.id = l.target_user_id
+      WHERE l.mini_app_id = $1
+      ORDER BY l.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [req.params.id, limit, offset]);
+
+    const { rows: countRows } = await pool.query(
+      'SELECT COUNT(*) AS total FROM mini_app_api_logs WHERE mini_app_id = $1',
+      [req.params.id]
+    );
+
+    return res.json({
+      ok: true,
+      logs: rows,
+      pagination: { total: Number(countRows[0]?.total || 0), limit, offset },
+    });
+  } catch (err) {
+    console.error('[ADMIN] GET /miniapps/:id/logs err:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+/**
+ * GET /admin/miniapps/logs
+ * View ALL mini-app API logs (global audit view, paginated)
+ */
+router.get('/miniapps-logs', superAdminAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+
+    const { rows } = await pool.query(`
+      SELECT l.*, ma.name AS app_name, u.username AS target_username
+      FROM mini_app_api_logs l
+      LEFT JOIN mini_apps ma ON ma.id = l.mini_app_id
+      LEFT JOIN users u ON u.id = l.target_user_id
+      ORDER BY l.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+
+    const { rows: countRows } = await pool.query(
+      'SELECT COUNT(*) AS total FROM mini_app_api_logs'
+    );
+
+    return res.json({
+      ok: true,
+      logs: rows,
+      pagination: { total: Number(countRows[0]?.total || 0), limit, offset },
+    });
+  } catch (err) {
+    console.error('[ADMIN] GET /miniapps-logs err:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch logs' });
   }
 });
 

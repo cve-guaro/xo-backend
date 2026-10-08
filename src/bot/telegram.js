@@ -6,8 +6,10 @@ const crypto = require('crypto');
 const { pool, redis, withTx, getGlobalSetting } = require('../db/index');
 const { applyNewUserGiveaways } = require('../models/payments.service');
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const BOT_USERNAME = (process.env.TELEGRAM_BOT_USERNAME && process.env.TELEGRAM_BOT_USERNAME !== 'Xoethiopia_Dev_Bot') ? process.env.TELEGRAM_BOT_USERNAME : 'XoethiopiaBot';
+// Sanitize env values — dotenv may include literal quotes if the .env value was quoted
+const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^"|"$/g, '').trim();
+const _rawUsername = (process.env.TELEGRAM_BOT_USERNAME || '').replace(/^"|"$/g, '').trim();
+const BOT_USERNAME = (_rawUsername && _rawUsername !== 'Xoethiopia_Dev_Bot') ? _rawUsername : 'XoethiopiaBot';
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPER_ADMIN_NUMBERS = (process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
 
@@ -124,7 +126,20 @@ function initTelegramBot() {
     }
   };
 
-  clearWebhookAndStart();
+  clearWebhookAndStart().then(() => {
+    // Health-check: verify the token is valid by calling getMe
+    if (bot) {
+      bot.getMe().then(me => {
+        console.log(`[TELEGRAM] ✅ Bot identity verified: @${me.username} (id=${me.id})`);
+        if (me.username !== BOT_USERNAME) {
+          console.warn(`[TELEGRAM] ⚠️  BOT_USERNAME env (${BOT_USERNAME}) does not match actual bot (@${me.username}). Deep links may break!`);
+        }
+      }).catch(err => {
+        console.error(`[TELEGRAM] ❌ Bot token verification FAILED: ${err.message}`);
+        console.error('[TELEGRAM] Check TELEGRAM_BOT_TOKEN in .env — the token may be invalid or Telegram API may be blocked.');
+      });
+    }
+  });
 
   // Log all incoming messages for debugging
   bot.on('message', (msg) => {
