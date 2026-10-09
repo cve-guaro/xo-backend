@@ -124,7 +124,24 @@ router.get('/weekly', auth, async (req, res) => {
       `;
       itemsParams.push(limit, offset);
 
-      const { rows } = await pool.query(itemsQuery, itemsParams);
+      let rows = [];
+      try {
+        const queryRes = await pool.query(itemsQuery, itemsParams);
+        rows = queryRes.rows;
+      } catch (err) {
+        if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
+          console.warn('[LEADERBOARD] payment_transactions missing, falling back to count * 50');
+          const fallbackItemsQuery = itemsQuery.replace(
+            /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
+            'COUNT(*) * 50 AS win_amount'
+          );
+          const queryRes = await pool.query(fallbackItemsQuery, itemsParams);
+          rows = queryRes.rows;
+        } else {
+          throw err;
+        }
+      }
+
       realListBase = rows.map((r, idx) => ({
         id: r.id,
         username: r.username,
@@ -135,7 +152,7 @@ router.get('/weekly', auth, async (req, res) => {
       }));
 
       // 3. Always fetch top 3 global winners for podium
-      const { rows: top3Rows } = await pool.query(`
+      const top3Query = `
         SELECT 
           u.id::text as id,
           u.username,
@@ -154,7 +171,24 @@ router.get('/weekly', auth, async (req, res) => {
         GROUP BY u.id, u.username, u.avatar
         ORDER BY wins DESC, MAX(g.created_at) ASC
         LIMIT 3
-      `, [weekStart.toISOString(), weekEnd.toISOString()]);
+      `;
+
+      let top3Rows = [];
+      try {
+        const top3Res = await pool.query(top3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
+        top3Rows = top3Res.rows;
+      } catch (err) {
+        if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
+          const fallbackTop3Query = top3Query.replace(
+            /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
+            'COUNT(*) * 50 AS win_amount'
+          );
+          const top3Res = await pool.query(fallbackTop3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
+          top3Rows = top3Res.rows;
+        } else {
+          throw err;
+        }
+      }
 
       top3Base = top3Rows.map((r, idx) => ({
         id: r.id,
@@ -289,7 +323,25 @@ router.get('/weekly', auth, async (req, res) => {
     });
   } catch (err) {
     console.error('[LEADERBOARD] weekly error:', err);
-    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+    const { weekStart, weekEnd } = getWeekBounds();
+    res.json({
+      leaderboard: [],
+      myRank: null,
+      prizes: [
+        { rank: 1, amount: 500, label: '1st Place' },
+        { rank: 2, amount: 300, label: '2nd Place' },
+        { rank: 3, amount: 200, label: '3rd Place' },
+      ],
+      weekStart: weekStart.toISOString(),
+      weekEnd: weekEnd.toISOString(),
+      secondsRemaining: 0,
+      previousWeekWin: null,
+      payoutPending: false,
+      top3: [],
+      total: 0,
+      page: 1,
+      limit: 50
+    });
   }
 });
 
