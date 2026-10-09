@@ -769,6 +769,12 @@ router.post('/quick-login', async (req, res) => {
       return u;
     });
 
+    const secret = process.env.JWT_SECRET || process.env.JWT_PUBLIC_KEY;
+    if (!secret) {
+      console.error('[QUICK_LOGIN] JWT secret missing in environment');
+      return res.status(500).json({ error: 'Server misconfigured' });
+    }
+
     const token = jwt.sign(
       {
         sub: user.id,
@@ -776,7 +782,7 @@ router.post('/quick-login', async (req, res) => {
         username: user.username,
         role: user.role || 'superadmin',
       },
-      JWT_SECRET,
+      secret,
       { algorithm: 'HS256', expiresIn: '7d' }
     );
 
