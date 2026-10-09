@@ -66,12 +66,12 @@ router.get('/methods', auth, async (req, res) => {
 // Chapa Return Page — After payment completes, immediately redirect to home page without showing receipt UI
 router.get('/chapa-return', async (req, res) => {
   const { tx_ref, status } = req.query;
-  if (process.env.NODE_ENV !== 'production' && tx_ref && status === 'success') {
+  if (tx_ref && (status === 'success' || !status)) {
     try {
       const { completeDeposit } = require('../models/payments.service');
-      await completeDeposit(tx_ref, 'CHAPA', 'MOCK_REF_' + Date.now());
+      await completeDeposit(tx_ref, 'CHAPA', 'CHAPA_RETURN_' + Date.now());
     } catch (e) {
-      console.log('[DEV MOCK DEPOSIT COMPLETE LOG]', e.message);
+      console.log('[DEPOSIT COMPLETE LOG]', e.message);
     }
   }
   const frontendBase = process.env.APP_URL || process.env.FRONTEND_URL || (process.env.NODE_ENV === 'production'

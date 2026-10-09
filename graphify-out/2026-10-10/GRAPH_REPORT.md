@@ -1,7 +1,7 @@
-# Graph Report - xoet_backend  (2026-10-10)
+# Graph Report - xoet_backend  (2026-10-09)
 
 ## Corpus Check
-- 96 files · ~129,841 words
+- 96 files · ~129,668 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -174,7 +174,7 @@ Nodes (5): { adminAuth }, express, jwt, { pool }, router
 
 ### Community 15 - "dependencies"
 Cohesion: 0.18
-Nodes (11): agora-token, express-validator, https-proxy-agent, node-cron, nodemon, dependencies, agora-token, express-validator (+3 more)
+Nodes (11): agora-token, express, express-validator, https-proxy-agent, node-cron, dependencies, agora-token, express (+3 more)
 
 ### Community 16 - "weeklyLeaderboard.js"
 Cohesion: 0.09

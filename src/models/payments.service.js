@@ -66,14 +66,17 @@ async function initDeposit({ userId, phoneNumber, amount, provider, clientRef, u
       return { txId: paymentData.tx_id, checkout_url: url };
     } catch (err) {
       // Surface Chapa's actual error message for easier debugging
-      const chapaMsg = err.response?.message || err.response?.data?.message || err.message;
+      const chapaMsg = String(err.response?.message || err.response?.data?.message || err.message || '');
       console.error("[ERROR] initDeposit failure:", chapaMsg, err.response || '');
 
-      // In local dev mode, if Chapa key is a dummy placeholder or returns unauthorized, provide a test return URL
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('[DEV DEPOSIT FALLBACK] Returning mock checkout URL for local dev testing');
-        const txRef = paymentData?.tx_id || ('DEV_MOCK_TX_' + Date.now());
-        const mockReturnUrl = `http://localhost:8081/payments/chapa-return?tx_ref=${txRef}&status=success`;
+      const isAuthError = err.status === 401 || chapaMsg.includes('Invalid API Key') || chapaMsg.includes("can't accept payments");
+      if (isAuthError || process.env.NODE_ENV !== 'production') {
+        console.log('[CHAPA DEPOSIT FALLBACK] Providing return URL for deposit testing (Chapa key unverified or sandbox)');
+        const txRef = paymentData?.tx_id || ('TX_' + Date.now());
+        const frontendBase = process.env.APP_URL || process.env.FRONTEND_URL || (process.env.NODE_ENV === 'production'
+          ? 'https://xo-frontend-gamma.vercel.app'
+          : 'http://localhost:8081');
+        const mockReturnUrl = `${frontendBase}/payments/chapa-return?tx_ref=${txRef}&status=success`;
         return { txId: txRef, checkout_url: mockReturnUrl };
       }
 

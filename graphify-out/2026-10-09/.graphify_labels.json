@@ -62,10 +62,5 @@
   "60": "uuid",
   "61": "zod",
   "62": "temp.js",
-  "63": "payments.routes.js",
-  "64": "compression",
-  "65": "jsonwebtoken",
-  "66": "node-telegram-bot-api",
-  "67": "pg",
-  "68": "connectRedisAdapter"
+  "63": "payments.routes.js"
 }

