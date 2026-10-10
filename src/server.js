@@ -550,6 +550,28 @@ async function ensureUserSchema() {
       );
       CREATE INDEX IF NOT EXISTS idx_payment_transactions_user ON payment_transactions(user_id);
 
+      CREATE TABLE IF NOT EXISTS promotion_links (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        bonus_amount NUMERIC DEFAULT 0,
+        code TEXT UNIQUE,
+        is_active BOOLEAN DEFAULT true,
+        total_claims INT DEFAULT 0,
+        total_registrations INT DEFAULT 0,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS admin_audit_logs (
+        id SERIAL PRIMARY KEY,
+        admin_id UUID,
+        action TEXT NOT NULL,
+        target_id TEXT,
+        details JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE admin_audit_logs ADD COLUMN IF NOT EXISTS target_id TEXT;
+
       -- Ensure 0939484533 / 251939484533 admin account with 10k ETB balance
       DO $$
       DECLARE
