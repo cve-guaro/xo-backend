@@ -813,5 +813,101 @@ router.post('/quick-login', async (req, res) => {
   }
 });
 
+// ─── 4 TEST GUEST ACCOUNTS FOR TESTING PHASE ──────────────────────────────────
+const GUEST_ACCOUNTS = [
+  { index: 1, number: '251900000001', username: 'guest_1', displayName: 'Guest 1 (Abebe)' },
+  { index: 2, number: '251900000002', username: 'guest_2', displayName: 'Guest 2 (Sara)' },
+  { index: 3, number: '251900000003', username: 'guest_3', displayName: 'Guest 3 (Dawit)' },
+  { index: 4, number: '251900000004', username: 'guest_4', displayName: 'Guest 4 (Tigist)' },
+];
+
+router.get('/guest-accounts', (req, res) => {
+  return res.json({
+    ok: true,
+    guests: GUEST_ACCOUNTS.map(g => ({
+      index: g.index,
+      name: g.displayName,
+      username: g.username,
+      amount: 1000,
+    }))
+  });
+});
+
+router.post('/guest-login', async (req, res) => {
+  try {
+    const guestIndex = Number(req.body?.guestIndex || 1);
+    const guestCfg = GUEST_ACCOUNTS.find(g => g.index === guestIndex) || GUEST_ACCOUNTS[0];
+
+    const user = await withTx(async (client) => {
+      // 1) Upsert guest user
+      const { rows } = await client.query(
+        `INSERT INTO users (number, username, display_name, role, new_user)
+         VALUES ($1, $2, $3, 'user', false)
+         ON CONFLICT (number)
+         DO UPDATE SET display_name = EXCLUDED.display_name, new_user = false
+         RETURNING id, number, username, display_name, avatar, role, sound_muted`,
+        [guestCfg.number, guestCfg.username, guestCfg.displayName]
+      );
+      const u = rows[0];
+
+      // 2) Ensure wallet exists with at least 1,000 ETB available & withdrawable
+      await client.query(
+        `INSERT INTO wallets (user_id, available_balance, withdrawable_balance, bonus_balance)
+         VALUES ($1, 1000, 1000, 0)
+         ON CONFLICT (user_id)
+         DO UPDATE SET 
+           available_balance = GREATEST(wallets.available_balance, 1000),
+           withdrawable_balance = GREATEST(wallets.withdrawable_balance, 1000),
+           updated_at = NOW()`,
+        [u.id]
+      );
+
+      return u;
+    });
+
+    const secret = process.env.JWT_SECRET || process.env.JWT_PUBLIC_KEY;
+    if (!secret) {
+      console.error('[GUEST_LOGIN] JWT secret missing');
+      return res.status(500).json({ error: 'Server misconfigured' });
+    }
+
+    const token = jwt.sign(
+      {
+        sub: user.id,
+        number: user.number,
+        username: user.username,
+        role: 'user',
+      },
+      secret,
+      { algorithm: 'HS256', expiresIn: '7d' }
+    );
+
+    const refreshToken = crypto.randomBytes(40).toString('hex');
+    redis.set(`refresh_token:${refreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60).catch(() => {});
+
+    console.log(`[GUEST_LOGIN] Logged in guest ${guestCfg.displayName} (${guestCfg.number}) with 1000 ETB`);
+
+    return res.json({
+      ok: true,
+      token,
+      refreshToken,
+      user: {
+        id: user.id,
+        number: user.number,
+        username: user.username,
+        display_name: user.display_name,
+        avatar: user.avatar,
+        role: 'user',
+        available_balance: 1000,
+        withdrawable_balance: 1000,
+        bonus_balance: 0,
+      }
+    });
+  } catch (err) {
+    console.error('[GUEST_LOGIN_ERR]', err);
+    return res.status(500).json({ error: 'Guest login failed' });
+  }
+});
+
 module.exports = router;
 
