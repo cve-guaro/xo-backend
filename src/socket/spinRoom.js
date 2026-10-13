@@ -522,6 +522,7 @@ async function cancelRound(io, round) {
     } catch (err) {
       console.error(`${LOG_PREFIX} Refund failed for user=${player.userId}:`, err.message);
     }
+    playerToRound.delete(`${player.userId}:${round.configId}`);
     playerToRound.delete(player.userId);
   }
 
@@ -547,9 +548,17 @@ async function cancelRound(io, round) {
 function cleanupRound(round) {
   // Remove player→round mappings
   for (const player of round.players) {
+    const key = `${player.userId}:${round.configId}`;
+    if (playerToRound.get(key) === round.id) {
+      playerToRound.delete(key);
+    }
     if (playerToRound.get(player.userId) === round.id) {
       playerToRound.delete(player.userId);
     }
+  }
+  if (round.watchdogTimer) {
+    clearTimeout(round.watchdogTimer);
+    round.watchdogTimer = null;
   }
   activeSpinRounds.delete(round.id);
   console.log(`${LOG_PREFIX} Cleaned up round=${round.id}`);
@@ -641,6 +650,7 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
   round.players.push(player);
 
   if (!isBot) {
+    playerToRound.set(`${userId}:${round.configId}`, round.id);
     playerToRound.set(userId, round.id);
   }
 
@@ -727,9 +737,17 @@ function setupSpinSocket(io) {
           return ack?.({ ok: false, error: "SPIN_GAME_DISABLED" });
         }
 
-        // Check if player is already in a spin round
-        if (playerToRound.has(userId)) {
-          const existingRoundId = playerToRound.get(userId);
+        // Resolve Config first
+        const configs = await getSpinConfigs();
+        const config = configs.find(c => c.name === mode || (mode === "5_PLAYER" && c.id === 1) || (mode === "RAIL" && c.id === 2));
+        if (!config) {
+          return ack?.({ ok: false, error: "INVALID_ROOM" });
+        }
+
+        // Check if player is already in an active spin round for THIS mode/config
+        const playerKey = `${userId}:${config.id}`;
+        if (playerToRound.has(playerKey)) {
+          const existingRoundId = playerToRound.get(playerKey);
           const existingRound = activeSpinRounds.get(existingRoundId);
           if (existingRound && existingRound.status !== "resolved" && existingRound.status !== "paid" && existingRound.status !== "cancelled") {
             // Reconnect to existing round
@@ -738,6 +756,7 @@ function setupSpinSocket(io) {
             return ack?.({ ok: true, reconnect: true, data: buildRoomState(existingRound) });
           }
           // Stale mapping — clean up
+          playerToRound.delete(playerKey);
           playerToRound.delete(userId);
         }
 
@@ -745,13 +764,6 @@ function setupSpinSocket(io) {
         const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGame) {
           return ack?.({ ok: false, error: "ALREADY_IN_GAME" });
-        }
-
-        // Resolve Config
-        const configs = await getSpinConfigs();
-        const config = configs.find(c => c.name === mode || (mode === "5_PLAYER" && c.id === 1) || (mode === "RAIL" && c.id === 2));
-        if (!config) {
-          return ack?.({ ok: false, error: "INVALID_ROOM" });
         }
 
         // Check Granular 3-Switch Spin Locks
@@ -859,12 +871,12 @@ function setupSpinSocket(io) {
               const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
               const spin5pEntry = Number(spin5pEntryStr || 100);
 
-              // 4 Bots enter within 0–2min 30s (0 - 150s)
+              // Responsive, swift bot filling (within 1.5–8.5 seconds)
               const botDelays = [
-                10000 + Math.random() * 20000,   // 10-30s
-                40000 + Math.random() * 30000,   // 40-70s
-                80000 + Math.random() * 30000,   // 80-110s
-                115000 + Math.random() * 30000,  // 115-145s
+                1500 + Math.random() * 1500,   // 1.5-3s
+                3500 + Math.random() * 1500,   // 3.5-5s
+                5500 + Math.random() * 1500,   // 5.5-7s
+                7500 + Math.random() * 1500,   // 7.5-9s
               ];
 
               round.botCancelFn = scheduleBotFill({
@@ -874,19 +886,53 @@ function setupSpinSocket(io) {
                 staggerDelaysMs: botDelays,
                 onBotJoin: async (bot) => {
                   if (round.status !== "waiting" || round.players.length >= round.maxPlayers) return;
-                  try {
-                    await addPlayerToRound(io, round, {
-                      userId: bot.id,
-                      username: bot.username,
-                      isBot: true,
-                      avatar: null,
-                      stake: spin5pEntry,
-                    });
-                  } catch (err) {
-                    console.error(`${LOG_PREFIX} 5-Player Bot join failed:`, err.message);
-                  }
+                  const tryJoinBot = async (b, attempt = 1) => {
+                    try {
+                      await addPlayerToRound(io, round, {
+                        userId: b.id,
+                        username: b.username,
+                        isBot: true,
+                        avatar: null,
+                        stake: spin5pEntry,
+                      });
+                    } catch (err) {
+                      console.error(`${LOG_PREFIX} 5-Player Bot join failed (attempt ${attempt}):`, err.message);
+                      if (attempt < 3 && round.status === "waiting" && round.players.length < round.maxPlayers) {
+                        const excludeIds = round.players.map(p => p.userId);
+                        const newBot = await getBot(excludeIds);
+                        setTimeout(() => tryJoinBot(newBot, attempt + 1), 600);
+                      }
+                    }
+                  };
+                  await tryJoinBot(bot);
                 },
               });
+
+              // Watchdog safeguard: guarantee 5-player room fills smoothly and never gets stuck
+              if (!round.watchdogTimer) {
+                round.watchdogTimer = setTimeout(async () => {
+                  if (round.status === "waiting" && round.players.length < round.maxPlayers) {
+                    const needed = round.maxPlayers - round.players.length;
+                    console.log(`${LOG_PREFIX} 5-Player Watchdog: auto-filling remaining ${needed} seats with bots.`);
+                    for (let i = 0; i < needed; i++) {
+                      if (round.status !== "waiting" || round.players.length >= round.maxPlayers) break;
+                      try {
+                        const excludeIds = round.players.map(p => p.userId);
+                        const b = await getBot(excludeIds);
+                        await addPlayerToRound(io, round, {
+                          userId: b.id,
+                          username: b.username,
+                          isBot: true,
+                          avatar: null,
+                          stake: spin5pEntry,
+                        });
+                      } catch (err) {
+                        console.error(`${LOG_PREFIX} Watchdog bot fill error:`, err.message);
+                      }
+                    }
+                  }
+                }, 12000);
+              }
             }
           }
         }
@@ -1050,6 +1096,7 @@ function setupSpinSocket(io) {
         // Re-index seat numbers
         round.players.forEach((p, i) => { p.seatIndex = i; });
 
+        playerToRound.delete(`${userId}:${round.configId}`);
         playerToRound.delete(userId);
         socket.leave(`spin:${round.id}`);
 
@@ -1078,7 +1125,7 @@ function setupSpinSocket(io) {
     socket.on("disconnect", async () => {
       try {
         const userId = socket.data?.userId;
-        const roundId = socket.data?.spinRoundId || (userId ? playerToRound.get(userId) : null);
+        const roundId = socket.data?.spinRoundId || (userId ? (playerToRound.get(`${userId}:1`) || playerToRound.get(`${userId}:2`) || playerToRound.get(userId)) : null);
         if (!roundId) return;
 
         const round = activeSpinRounds.get(roundId);
@@ -1098,7 +1145,10 @@ function setupSpinSocket(io) {
 
             round.players.splice(pIdx, 1);
             round.players.forEach((p, i) => { p.seatIndex = i; });
-            if (userId) playerToRound.delete(userId);
+            if (userId) {
+              playerToRound.delete(`${userId}:${round.configId}`);
+              playerToRound.delete(userId);
+            }
 
             broadcastRoomUpdate(io, round);
             broadcastToRound(io, round, "spin:player_left", {
