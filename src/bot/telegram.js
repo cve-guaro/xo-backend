@@ -151,6 +151,7 @@ function initTelegramBot() {
   });
 
   // Handle polling errors cleanly
+  let lastTransientLogTime = 0;
   bot.on('polling_error', async (err) => {
     if (err.message && err.message.includes('409 Conflict')) {
       // Another instance is polling — stop permanently & stand by silently.
@@ -165,7 +166,20 @@ function initTelegramBot() {
       } catch (_) {}
       return;
     }
-    console.error('[TELEGRAM] Polling error (non-fatal):', err.message);
+
+    // Throttle transient gateway / network errors (502, 504, ECONNRESET, ETIMEDOUT) to avoid console spam
+    const msg = err.message || '';
+    const isTransient = msg.includes('502') || msg.includes('504') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('EFATAL');
+    const now = Date.now();
+    if (isTransient) {
+      if (now - lastTransientLogTime > 60000) {
+        lastTransientLogTime = now;
+        console.warn(`[TELEGRAM] Polling gateway/network error (throttled 60s): ${msg}`);
+      }
+      return;
+    }
+
+    console.error('[TELEGRAM] Polling error (non-fatal):', msg);
   });
 
   // ── In-memory chat↔session mapping (fallback when Redis is down) ─────────

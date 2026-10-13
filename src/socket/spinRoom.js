@@ -128,6 +128,12 @@ function broadcastToRound(io, round, event, payload) {
   io.to(`spin:${round.id}`).emit(event, payload);
 }
 
+function broadcastRoomUpdate(io, round) {
+  if (!round || !round.id) return;
+  const state = buildRoomState(round);
+  broadcastToRound(io, round, "spin:room_state", state);
+}
+
 function buildRoomState(round) {
   const pot = round.players.reduce((sum, p) => sum + Number(p.stake), 0);
   return {
@@ -270,7 +276,29 @@ function startSpin(io, round) {
   console.log(`${LOG_PREFIX} SPINNING round=${round.id} duration=${spinDuration}ms`);
 
   // Wait for animation to finish, then resolve
-  setTimeout(() => resolveRound(io, round), spinDuration + 500);
+  setTimeout(async () => {
+    try {
+      await resolveRound(io, round);
+    } catch (err) {
+      console.error(`${LOG_PREFIX} resolveRound error for round=${round.id}:`, err.message);
+      round.status = "resolved";
+      cleanupRound(round);
+    }
+  }, spinDuration + 500);
+
+  // Fallback watchdog: If round remains in spinning after 12s, force resolve
+  setTimeout(async () => {
+    if (round && round.status === "spinning") {
+      console.warn(`${LOG_PREFIX} Watchdog: round=${round.id} still in spinning status after 12s. Forcing resolution.`);
+      try {
+        await resolveRound(io, round);
+      } catch (err) {
+        console.error(`${LOG_PREFIX} Watchdog force-resolve error:`, err.message);
+        round.status = "resolved";
+        cleanupRound(round);
+      }
+    }
+  }, 12000);
 }
 
 // ── Resolve & Payout ───────────────────────────────────────────────────────
@@ -663,7 +691,10 @@ function setupSpinSocket(io) {
         cleanupRound(round);
       } else if ((round.status === "locked" || round.status === "spinning") && ageMs > 120_000) {
         console.warn(`${LOG_PREFIX} Force cleaning stuck round=${id} status=${round.status}`);
-        cleanupRound(round);
+        resolveRound(io, round).catch(err => {
+          console.error(`${LOG_PREFIX} Sweeper resolveRound failed:`, err.message);
+          cleanupRound(round);
+        });
       } else if (round.status === "waiting" && round.players.length === 0 && ageMs > 300_000) {
         cleanupRound(round);
       }
