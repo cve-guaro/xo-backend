@@ -70,7 +70,7 @@ async function debitWager(client, { userId, amount, roundId, isBot = false }) {
          withdrawable_balance = GREATEST(withdrawable_balance - $3, 0),
          updated_at           = now()
      WHERE user_id = $4`,
-    [betAmount, bonusToUse, realToUse, userId]
+    [realToUse, bonusToUse, realToUse, userId]
   );
 
   console.log(`${LOG_PREFIX} Debit: user=${userId} bet=${betAmount} bonus=${bonusToUse} real=${realToUse} round=${roundId}`);
@@ -144,6 +144,20 @@ async function refundWager({ userId, amount, bonusUsed, roundId, isBot = false }
   const realReturn = betAmount - bonusReturn;
 
   return withTx(async (client) => {
+    // Idempotency check: prevent duplicate refunds if disconnect + leave fire concurrently
+    const existingRefund = await client.query(
+      `SELECT id FROM payment_transactions 
+       WHERE user_id = $1::uuid 
+         AND bank = 'SPIN_REFUND' 
+         AND (provider_payload->>'roundId') = $2
+       LIMIT 1`,
+      [userId, String(roundId)]
+    );
+    if (existingRefund.rowCount > 0) {
+      console.log(`${LOG_PREFIX} Duplicate refund prevented for user=${userId} round=${roundId}`);
+      return;
+    }
+
     // Reverse the deduction exactly
     await client.query(
       `UPDATE wallets
@@ -152,7 +166,7 @@ async function refundWager({ userId, amount, bonusUsed, roundId, isBot = false }
            withdrawable_balance = withdrawable_balance + $3,
            updated_at           = NOW()
        WHERE user_id = $4`,
-      [betAmount, bonusReturn, realReturn, userId]
+      [realReturn, bonusReturn, realReturn, userId]
     );
 
     // Ledger record for the refund
@@ -160,7 +174,7 @@ async function refundWager({ userId, amount, bonusUsed, roundId, isBot = false }
     await client.query(
       `INSERT INTO payment_transactions (id, user_id, type, status, amount, bank, tx_ref, provider_payload)
        VALUES (gen_random_uuid(), $1, 'deposit', 'success', $2, 'SPIN_REFUND', $3, $4::jsonb)`,
-      [userId, betAmount, txRef, JSON.stringify({ roundId, game_type: 'SPIN', refund: true })]
+      [userId, betAmount, txRef, JSON.stringify({ roundId: String(roundId), game_type: 'SPIN', refund: true })]
     );
 
     console.log(`${LOG_PREFIX} Refund: user=${userId} amount=${betAmount} bonus=${bonusReturn} real=${realReturn} round=${roundId}`);

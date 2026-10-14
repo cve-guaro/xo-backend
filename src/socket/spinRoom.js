@@ -157,6 +157,41 @@ function buildRoomState(round) {
   };
 }
 
+// ── Last 15s Bot Scheduler for Real Spin (Rail) ──────────────────────────
+function scheduleLast15sRailBots(io, round) {
+  if (round.last15sBotTriggered) return;
+  round.last15sBotTriggered = true;
+
+  const currentCount = round.players.length;
+  const neededBots = Math.max(0, 5 - currentCount);
+  if (neededBots <= 0) return;
+
+  console.log(`${LOG_PREFIX} Rail last-15s window: current players=${currentCount}, scheduling ${neededBots} bots`);
+
+  // Stagger needed bots within the remaining 13 seconds
+  const step = 12000 / neededBots;
+  for (let i = 0; i < neededBots; i++) {
+    const delay = Math.round((i * step) + 1000 + (Math.random() * (step * 0.5)));
+    setTimeout(async () => {
+      if (round.status !== "waiting" || round.players.length >= 5) return;
+      try {
+        const excludeIds = round.players.map(p => p.userId);
+        const bot = await getBot(excludeIds);
+        const botStake = 10 + Math.floor(Math.random() * 11); // Random stake 10-20 ETB
+        await addPlayerToRound(io, round, {
+          userId: bot.id,
+          username: bot.username,
+          isBot: true,
+          avatar: null,
+          stake: botStake,
+        });
+      } catch (err) {
+        console.error(`${LOG_PREFIX} Rail last-15s bot error:`, err.message);
+      }
+    }, delay);
+  }
+}
+
 // ── Countdown & auto-lock ──────────────────────────────────────────────────
 function startCountdown(io, round) {
   if (round.countdownInterval) return; // already running
@@ -165,6 +200,11 @@ function startCountdown(io, round) {
     round.countdown -= 1;
 
     broadcastToRound(io, round, "spin:countdown", { secondsLeft: round.countdown });
+
+    // In the last 15 seconds of Rail mode, add bots if needed to ensure at least 5 players
+    if (round.mode === "RAIL" && round.status === "waiting" && round.countdown <= 15 && !round.last15sBotTriggered) {
+      scheduleLast15sRailBots(io, round);
+    }
 
     if (round.countdown <= 0) {
       clearInterval(round.countdownInterval);
@@ -176,8 +216,9 @@ function startCountdown(io, round) {
         round.botCancelFn = null;
       }
 
-      // Need at least 2 players to proceed
-      if (round.players.length >= 2) {
+      // Need at least 5 players to proceed in RAIL mode (or 2 in generic)
+      const minRequired = round.mode === "RAIL" ? 5 : 2;
+      if (round.players.length >= minRequired) {
         lockRound(io, round);
       } else {
         // Not enough players — cancel and refund
@@ -461,11 +502,12 @@ async function finalizeSpinRematch(io, originalRoundId) {
   // Start bot fill scheduler for remaining seats in 5_PLAYER mode if needed
   const fivepBotsEnabled = await getGlobalSetting("spin_5p_bots_enabled", true);
   if (fivepBotsEnabled && newRound.status === "waiting" && newRound.players.length < newRound.maxPlayers) {
+    // 5-20s random per bot, 20s gap between each
     const botDelays = [
-      10000 + Math.random() * 20000,
-      40000 + Math.random() * 30000,
-      80000 + Math.random() * 30000,
-      115000 + Math.random() * 30000,
+      5000 + Math.random() * 15000,    // Bot 1: 5-20s
+      25000 + Math.random() * 15000,   // Bot 2: 25-40s
+      45000 + Math.random() * 15000,   // Bot 3: 45-60s
+      65000 + Math.random() * 15000,   // Bot 4: 65-80s
     ];
 
     newRound.botCancelFn = scheduleBotFill({
@@ -511,6 +553,8 @@ async function cancelRound(io, round) {
 
   // Refund all real players their specific wagers
   for (const player of round.players) {
+    if (player.refunded) continue;
+    player.refunded = true;
     try {
       await refundWager({
         userId: player.userId,
@@ -835,48 +879,18 @@ function setupSpinSocket(io) {
             if (round.players.length - round.players.filter(p => p.isBot).length === 1 && !round.countdownInterval) {
               startCountdown(io, round);
             }
-            if (railBotsEnabled) {
-              const realPlayer = round.players.find(p => !p.isBot);
-              const realStake = realPlayer ? Number(realPlayer.stake || 0) : 0;
-              let dynamicMaxBots = 4;
-              if (realStake > 500) dynamicMaxBots = 7;
-              else if (realStake > 250) dynamicMaxBots = 6;
-              else if (realStake > 100) dynamicMaxBots = 5;
-
-              round.botCancelFn = scheduleBotFill({
-                maxBots: dynamicMaxBots,
-                currentPlayerCount: round.players.length,
-                maxPlayers: round.maxPlayers,
-                onBotJoin: async (bot) => {
-                  if (round.status !== "waiting" || round.players.length >= round.maxPlayers) return;
-                  const botStake = 10 + Math.floor(Math.random() * 11); // Random stake 10-20
-                  try {
-                    await addPlayerToRound(io, round, {
-                      userId: bot.id,
-                      username: bot.username,
-                      isBot: true,
-                      avatar: null,
-                      stake: botStake,
-                    });
-                  } catch (err) {
-                    console.error(`${LOG_PREFIX} Bot join failed:`, err.message);
-                  }
-                },
-                minDelayMs: 8000,
-                maxDelayMs: 15000,
-              });
-            }
+            // Rail bots do not join in the first 1:45; they only enter in the last 15s if needed!
           } else if (round.mode === "5_PLAYER") {
             if (fivepBotsEnabled) {
               const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
               const spin5pEntry = Number(spin5pEntryStr || 100);
 
-              // Responsive, swift bot filling (within 1.5–8.5 seconds)
+              // 5-20s random per bot, 20s gap between each
               const botDelays = [
-                1500 + Math.random() * 1500,   // 1.5-3s
-                3500 + Math.random() * 1500,   // 3.5-5s
-                5500 + Math.random() * 1500,   // 5.5-7s
-                7500 + Math.random() * 1500,   // 7.5-9s
+                5000 + Math.random() * 15000,    // Bot 1: 5-20s
+                25000 + Math.random() * 15000,   // Bot 2: 25-40s
+                45000 + Math.random() * 15000,   // Bot 3: 45-60s
+                65000 + Math.random() * 15000,   // Bot 4: 65-80s
               ];
 
               round.botCancelFn = scheduleBotFill({
@@ -1082,14 +1096,22 @@ function setupSpinSocket(io) {
           return ack?.({ ok: true });
         }
 
+        // Rule: If countdown is in final 1 minute (<= 60s in Rail mode), leave is disabled
+        if (round.mode === "RAIL" && round.countdown !== undefined && round.countdown > 0 && round.countdown <= 60) {
+          return ack?.({ ok: false, error: "CANNOT_LEAVE_DURING_FINAL_MINUTE" });
+        }
+
         // Refund if leaving while waiting
-        await refundWager({
-          userId,
-          amount: player.stake,
-          bonusUsed: player.bonusUsed || 0,
-          roundId: round.id,
-          isBot: false,
-        }).catch(err => console.error(`${LOG_PREFIX} Refund on leave error:`, err.message));
+        if (!player.refunded) {
+          player.refunded = true;
+          await refundWager({
+            userId,
+            amount: player.stake,
+            bonusUsed: player.bonusUsed || 0,
+            roundId: round.id,
+            isBot: false,
+          }).catch(err => console.error(`${LOG_PREFIX} Refund on leave error:`, err.message));
+        }
 
         // Remove from round
         round.players.splice(playerIdx, 1);
@@ -1135,13 +1157,16 @@ function setupSpinSocket(io) {
           const pIdx = round.players.findIndex(p => p.userId === userId && !p.isBot);
           if (pIdx !== -1) {
             const player = round.players[pIdx];
-            await refundWager({
-              userId,
-              amount: player.stake,
-              bonusUsed: player.bonusUsed || 0,
-              roundId: round.id,
-              isBot: false,
-            }).catch(err => console.error(`${LOG_PREFIX} Refund on disconnect error:`, err.message));
+            if (!player.refunded) {
+              player.refunded = true;
+              await refundWager({
+                userId,
+                amount: player.stake,
+                bonusUsed: player.bonusUsed || 0,
+                roundId: round.id,
+                isBot: false,
+              }).catch(err => console.error(`${LOG_PREFIX} Refund on disconnect error:`, err.message));
+            }
 
             round.players.splice(pIdx, 1);
             round.players.forEach((p, i) => { p.seatIndex = i; });
@@ -1313,51 +1338,16 @@ function setupSpinSocket(io) {
       ack?.({ ok: true });
     });
 
-    // ── Handle disconnect ──────────────────────────────────────────────
-    socket.on("disconnect", async () => {
-      const userId = socket.data?.userId;
-      let roundId = socket.data?.spinRoundId;
-
-      if (!userId) return;
-      if (!roundId && playerToRound.has(userId)) {
-        roundId = playerToRound.get(userId);
-      }
-      if (!roundId) return;
-
-      const round = activeSpinRounds.get(roundId);
-      if (!round) {
-        playerToRound.delete(userId);
-        return;
-      }
-
-      const playerIdx = round.players.findIndex(p => p.userId === userId && !p.isBot);
-      if (playerIdx !== -1) {
-        const player = round.players[playerIdx];
-
-        if (round.status === "waiting" || round.status === "pre_countdown") {
-          await refundWager({
-            userId,
-            amount: player.stake,
-            bonusUsed: player.bonusUsed || 0,
-            roundId: round.id,
-            isBot: false,
-          }).catch(err => console.error(`${LOG_PREFIX} Disconnect refund error:`, err.message));
-
-          round.players.splice(playerIdx, 1);
-          round.players.forEach((p, i) => { p.seatIndex = i; });
-          playerToRound.delete(userId);
-
-          broadcastToRound(io, round, "spin:player_left", {
-            roundId: round.id,
-            userId,
-            currentPlayers: round.players.length,
-          });
-
-          const realPlayers = round.players.filter(p => !p.isBot);
-          if (realPlayers.length === 0) {
-            cancelRound(io, round);
-          }
-        }
+    // ── spin:get_state (re-sync on tab return or visibility change) ──
+    socket.on("spin:get_state", async (data, ack) => {
+      try {
+        const { roundId } = data || {};
+        if (!roundId) return ack?.({ ok: false, error: "MISSING_ROUND_ID" });
+        const round = activeSpinRounds.get(roundId);
+        if (!round) return ack?.({ ok: false, error: "ROUND_NOT_FOUND" });
+        ack?.({ ok: true, data: buildRoomState(round) });
+      } catch (err) {
+        ack?.({ ok: false, error: err.message });
       }
     });
   });
