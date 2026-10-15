@@ -968,8 +968,8 @@ function setupSpinSocket(io) {
 
               // Real player arrived: notify scheduler (cancels window's bot if arrived before bot second)
               round.houseScheduler.onPlayerJoined({
-                userId: currentUser.id,
-                username: currentUser.username,
+                userId,
+                username: user.username || "Player",
                 isBot: false,
                 stake: Number(stake || 0),
               });
