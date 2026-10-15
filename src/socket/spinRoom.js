@@ -11,7 +11,7 @@ const { v4: uuidv4 } = require("uuid");
 const jwt = require("jsonwebtoken");
 const { pool, redis, getGlobalSetting } = require("../db/index");
 const { debitWager, creditWinnings, refundWager, calculateSpinPrize } = require("../services/spinWalletService");
-const { scheduleBotFill } = require("./spinBot");
+const { scheduleBotFill, getBot } = require("./spinBot");
 
 const LOG_PREFIX = "[SPIN_ROOM]";
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -216,14 +216,39 @@ function startCountdown(io, round) {
         round.botCancelFn = null;
       }
 
-      // Need at least 5 players to proceed in RAIL mode (or 2 in generic)
-      const minRequired = round.mode === "RAIL" ? 5 : 2;
-      if (round.players.length >= minRequired) {
-        lockRound(io, round);
-      } else {
-        // Not enough players — cancel and refund
-        cancelRound(io, round);
-      }
+      // Need at least 2 players to proceed in Rail mode (or 5 for 5_PLAYER mode)
+      const minRequired = round.mode === "5_PLAYER" ? 5 : 2;
+      const finishAndLock = async () => {
+        // If room has fewer than minRequired, fill remaining with bots so it ALWAYS spins!
+        if (round.players.length < minRequired) {
+          const needed = minRequired - round.players.length;
+          console.log(`${LOG_PREFIX} Countdown reached 0: auto-filling remaining ${needed} bots to trigger spin`);
+          for (let i = 0; i < needed; i++) {
+            try {
+              const excludeIds = round.players.map(p => p.userId);
+              const bot = await getBot(excludeIds);
+              const botStake = 10 + Math.floor(Math.random() * 11);
+              await addPlayerToRound(io, round, {
+                userId: bot.id,
+                username: bot.username,
+                isBot: true,
+                avatar: null,
+                stake: botStake,
+              });
+            } catch (err) {
+              console.error(`${LOG_PREFIX} Countdown 0 bot fill error:`, err.message);
+            }
+          }
+        }
+
+        if (round.players.length >= minRequired) {
+          lockRound(io, round);
+        } else {
+          cancelRound(io, round);
+        }
+      };
+
+      finishAndLock().catch(() => cancelRound(io, round));
     }
   }, 1000);
 }
@@ -879,7 +904,35 @@ function setupSpinSocket(io) {
             if (round.players.length - round.players.filter(p => p.isBot).length === 1 && !round.countdownInterval) {
               startCountdown(io, round);
             }
-            // Rail bots do not join in the first 1:45; they only enter in the last 15s if needed!
+            if (railBotsEnabled && !round.botCancelFn) {
+              const botDelays = [
+                4000 + Math.random() * 8000,     // Bot 1: 4-12s
+                16000 + Math.random() * 10000,   // Bot 2: 16-26s
+                32000 + Math.random() * 15000,   // Bot 3: 32-47s
+                55000 + Math.random() * 20000,   // Bot 4: 55-75s
+              ];
+              round.botCancelFn = scheduleBotFill({
+                maxBots: 4,
+                currentPlayerCount: round.players.length,
+                maxPlayers: 9999,
+                staggerDelaysMs: botDelays,
+                onBotJoin: async (bot) => {
+                  if (round.status !== "waiting") return;
+                  try {
+                    const botStake = 10 + Math.floor(Math.random() * 6) * 5; // 10, 15, 20, 25, 30, 35 ETB
+                    await addPlayerToRound(io, round, {
+                      userId: bot.id,
+                      username: bot.username,
+                      isBot: true,
+                      avatar: null,
+                      stake: botStake,
+                    });
+                  } catch (err) {
+                    console.error(`${LOG_PREFIX} Rail progressive bot join failed:`, err.message);
+                  }
+                },
+              });
+            }
           } else if (round.mode === "5_PLAYER") {
             if (fivepBotsEnabled) {
               const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
@@ -1336,6 +1389,25 @@ function setupSpinSocket(io) {
       });
 
       ack?.({ ok: true });
+    });
+
+    // ── spin:mic_toggle ────────────────────────────────────────────────
+    socket.on("spin:mic_toggle", (data) => {
+      try {
+        const userId = socket.data?.userId || data?.userId;
+        let roundId = socket.data?.spinRoundId || data?.roundId;
+        if (!userId) return;
+        if (!roundId && playerToRound.has(userId)) {
+          roundId = playerToRound.get(userId);
+        }
+        if (!roundId) return;
+        const round = activeSpinRounds.get(roundId);
+        if (!round) return;
+        const muted = !!data?.muted;
+        broadcastToRound(io, round, "spin:player_mic_state", { userId, muted });
+      } catch (err) {
+        console.error(`${LOG_PREFIX} spin:mic_toggle error:`, err.message);
+      }
     });
 
     // ── spin:get_state (re-sync on tab return or visibility change) ──
