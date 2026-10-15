@@ -216,18 +216,24 @@ function startCountdown(io, round) {
         round.botCancelFn = null;
       }
 
-      // Need at least 2 players to proceed in Rail mode (or 5 for 5_PLAYER mode)
-      const minRequired = round.mode === "5_PLAYER" ? 5 : 2;
+      // Need at least 5 players to proceed in both Rail and 5_PLAYER mode
+      const minRequired = 5;
       const finishAndLock = async () => {
-        // If room has fewer than minRequired, fill remaining with bots so it ALWAYS spins!
+        const realPlayersCount = round.players.filter(p => !p.isBot).length;
+        if (realPlayersCount === 0) {
+          // Empty room — cancel cleanly without adding bots
+          return cancelRound(io, round);
+        }
+
+        // If room has fewer than 5 players, fill remaining with bots so it ALWAYS spins!
         if (round.players.length < minRequired) {
           const needed = minRequired - round.players.length;
-          console.log(`${LOG_PREFIX} Countdown reached 0: auto-filling remaining ${needed} bots to trigger spin`);
+          console.log(`${LOG_PREFIX} Countdown reached 0: auto-filling remaining ${needed} bots to ensure 5 players`);
           for (let i = 0; i < needed; i++) {
             try {
               const excludeIds = round.players.map(p => p.userId);
               const bot = await getBot(excludeIds);
-              const botStake = 10 + Math.floor(Math.random() * 11);
+              const botStake = round.mode === "5_PLAYER" ? round.betAmount : (10 + Math.floor(Math.random() * 6) * 5);
               await addPlayerToRound(io, round, {
                 userId: bot.id,
                 username: bot.username,
@@ -242,7 +248,7 @@ function startCountdown(io, round) {
         }
 
         if (round.players.length >= minRequired) {
-          lockRound(io, round);
+          await lockRound(io, round);
         } else {
           cancelRound(io, round);
         }
@@ -337,6 +343,14 @@ function startSpin(io, round) {
     winnerId: round.winnerId,
     spinDuration,
     playerCount: round.players.length,
+    players: round.players.map(p => ({
+      userId: p.userId,
+      username: p.username,
+      seatIndex: p.seatIndex,
+      avatar: p.avatar || null,
+      isBot: p.isBot,
+      stake: Number(p.stake),
+    })),
   });
 
   console.log(`${LOG_PREFIX} SPINNING round=${round.id} duration=${spinDuration}ms`);
@@ -745,10 +759,12 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
       round.botCancelFn();
       round.botCancelFn = null;
     }
-    if (!round.countdownInterval) {
-      round.countdown = 5;
-      startCountdown(io, round);
+    if (round.countdownInterval) {
+      clearInterval(round.countdownInterval);
+      round.countdownInterval = null;
     }
+    round.countdown = 5;
+    startCountdown(io, round);
   }
 
   return { seatIndex, roundId: round.id };
@@ -894,30 +910,41 @@ function setupSpinSocket(io) {
         const railBotsEnabled = await getGlobalSetting("spin_rail_bots_enabled", true);
         const fivepBotsEnabled = await getGlobalSetting("spin_5p_bots_enabled", true);
 
-        if (round.status === "waiting" && round.players.length < round.maxPlayers) {
+        const realUsersCount = round.players.filter(p => !p.isBot).length;
+        const currentBotsCount = round.players.filter(p => p.isBot).length;
+        const botsNeeded = Math.max(0, 5 - realUsersCount - currentBotsCount);
+
+        // Bots only join if there is at least 1 real human player in the room (never fill an empty room)
+        if (round.status === "waiting" && realUsersCount >= 1 && botsNeeded > 0) {
           if (round.botCancelFn) {
             round.botCancelFn();
             round.botCancelFn = null;
           }
 
+          // Natural staggered delays so each bot enters naturally at a different time:
+          // Bot 1: 3-5s
+          // Bot 2: 7-10s
+          // Bot 3: 12-15s
+          // Bot 4: 17-20s
+          const botDelays = [
+            3000 + Math.random() * 2000,
+            7000 + Math.random() * 3000,
+            12000 + Math.random() * 3000,
+            17000 + Math.random() * 3000,
+          ];
+
           if (round.mode === "RAIL") {
-            if (round.players.length - round.players.filter(p => p.isBot).length === 1 && !round.countdownInterval) {
+            if (realUsersCount === 1 && !round.countdownInterval) {
               startCountdown(io, round);
             }
-            if (railBotsEnabled && !round.botCancelFn) {
-              const botDelays = [
-                4000 + Math.random() * 8000,     // Bot 1: 4-12s
-                16000 + Math.random() * 10000,   // Bot 2: 16-26s
-                32000 + Math.random() * 15000,   // Bot 3: 32-47s
-                55000 + Math.random() * 20000,   // Bot 4: 55-75s
-              ];
+            if (railBotsEnabled) {
               round.botCancelFn = scheduleBotFill({
-                maxBots: 4,
+                maxBots: botsNeeded,
                 currentPlayerCount: round.players.length,
-                maxPlayers: 9999,
+                maxPlayers: 5,
                 staggerDelaysMs: botDelays,
                 onBotJoin: async (bot) => {
-                  if (round.status !== "waiting") return;
+                  if (round.status !== "waiting" || round.players.length >= 5) return;
                   try {
                     const botStake = 10 + Math.floor(Math.random() * 6) * 5; // 10, 15, 20, 25, 30, 35 ETB
                     await addPlayerToRound(io, round, {
@@ -938,21 +965,13 @@ function setupSpinSocket(io) {
               const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
               const spin5pEntry = Number(spin5pEntryStr || 100);
 
-              // 5-20s random per bot, 20s gap between each
-              const botDelays = [
-                5000 + Math.random() * 15000,    // Bot 1: 5-20s
-                25000 + Math.random() * 15000,   // Bot 2: 25-40s
-                45000 + Math.random() * 15000,   // Bot 3: 45-60s
-                65000 + Math.random() * 15000,   // Bot 4: 65-80s
-              ];
-
               round.botCancelFn = scheduleBotFill({
-                maxBots: 4,
+                maxBots: botsNeeded,
                 currentPlayerCount: round.players.length,
-                maxPlayers: round.maxPlayers,
+                maxPlayers: 5,
                 staggerDelaysMs: botDelays,
                 onBotJoin: async (bot) => {
-                  if (round.status !== "waiting" || round.players.length >= round.maxPlayers) return;
+                  if (round.status !== "waiting" || round.players.length >= 5) return;
                   const tryJoinBot = async (b, attempt = 1) => {
                     try {
                       await addPlayerToRound(io, round, {
@@ -964,7 +983,7 @@ function setupSpinSocket(io) {
                       });
                     } catch (err) {
                       console.error(`${LOG_PREFIX} 5-Player Bot join failed (attempt ${attempt}):`, err.message);
-                      if (attempt < 3 && round.status === "waiting" && round.players.length < round.maxPlayers) {
+                      if (attempt < 3 && round.status === "waiting" && round.players.length < 5) {
                         const excludeIds = round.players.map(p => p.userId);
                         const newBot = await getBot(excludeIds);
                         setTimeout(() => tryJoinBot(newBot, attempt + 1), 600);
@@ -978,11 +997,11 @@ function setupSpinSocket(io) {
               // Watchdog safeguard: guarantee 5-player room fills smoothly and never gets stuck
               if (!round.watchdogTimer) {
                 round.watchdogTimer = setTimeout(async () => {
-                  if (round.status === "waiting" && round.players.length < round.maxPlayers) {
-                    const needed = round.maxPlayers - round.players.length;
+                  if (round.status === "waiting" && round.players.length < 5) {
+                    const needed = 5 - round.players.length;
                     console.log(`${LOG_PREFIX} 5-Player Watchdog: auto-filling remaining ${needed} seats with bots.`);
                     for (let i = 0; i < needed; i++) {
-                      if (round.status !== "waiting" || round.players.length >= round.maxPlayers) break;
+                      if (round.status !== "waiting" || round.players.length >= 5) break;
                       try {
                         const excludeIds = round.players.map(p => p.userId);
                         const b = await getBot(excludeIds);
