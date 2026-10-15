@@ -12,7 +12,7 @@ const jwt = require("jsonwebtoken");
 const { pool, redis, getGlobalSetting } = require("../db/index");
 const { debitWager, creditWinnings, refundWager, calculateSpinPrize } = require("../services/spinWalletService");
 const { scheduleBotFill, getBot } = require("./spinBot");
-const { createHouseScheduler } = require("./spin5pHouseScheduler");
+const { createRealHouseScheduler } = require("./spinHouseScheduler");
 
 const LOG_PREFIX = "[SPIN_ROOM]";
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -202,15 +202,10 @@ function startCountdown(io, round) {
 
     broadcastToRound(io, round, "spin:countdown", { secondsLeft: round.countdown });
 
-    // In 5_PLAYER mode, tick the 4-window house scheduler
-    if (round.mode === "5_PLAYER" && round.houseScheduler && round.status === "waiting") {
+    // In Real Spin (RAIL) mode, tick the 4-window house scheduler
+    if (round.mode === "RAIL" && round.houseScheduler && round.status === "waiting") {
       const elapsed = Math.max(0, 120 - round.countdown);
       round.houseScheduler.tickSecond(elapsed);
-    }
-
-    // In the last 15 seconds of Rail mode, add bots if needed to ensure at least 5 players
-    if (round.mode === "RAIL" && round.status === "waiting" && round.countdown <= 15 && !round.last15sBotTriggered) {
-      scheduleLast15sRailBots(io, round);
     }
 
     if (round.countdown <= 0) {
@@ -233,38 +228,17 @@ function startCountdown(io, round) {
           return cancelRound(io, round);
         }
 
-        if (round.mode === "5_PLAYER") {
-          // 5-player room rule: fewer than 2 seats at lock -> cancel and refund all
-          if (round.players.length < 2) {
-            console.log(`${LOG_PREFIX} 5-Player lock reached with < 2 seats: cancelling and refunding.`);
-            return cancelRound(io, round);
+        if (round.mode === "RAIL") {
+          // Real Spin: lock and spin if at least 1 real player is present and at least 2 players in room
+          if (realPlayersCount >= 1 && round.players.length >= 2) {
+            await lockRound(io, round);
+          } else {
+            console.log(`${LOG_PREFIX} Real Spin lock reached with < 2 players: cancelling and refunding.`);
+            cancelRound(io, round);
           }
-          await lockRound(io, round);
         } else {
-          // Rail mode: ensure at least 5 players
-          const minRequired = 5;
-          if (round.players.length < minRequired) {
-            const needed = minRequired - round.players.length;
-            console.log(`${LOG_PREFIX} Rail countdown reached 0: auto-filling remaining ${needed} bots to ensure 5 players`);
-            for (let i = 0; i < needed; i++) {
-              try {
-                const excludeIds = round.players.map(p => p.userId);
-                const bot = await getBot(excludeIds);
-                const botStake = 10 + Math.floor(Math.random() * 6) * 5;
-                await addPlayerToRound(io, round, {
-                  userId: bot.id,
-                  username: bot.username,
-                  isBot: true,
-                  avatar: null,
-                  stake: botStake,
-                });
-              } catch (err) {
-                console.error(`${LOG_PREFIX} Rail countdown 0 bot fill error:`, err.message);
-              }
-            }
-          }
-
-          if (round.players.length >= minRequired) {
+          // 5-player room: lock and spin when full
+          if (round.players.length >= 2) {
             await lockRound(io, round);
           } else {
             cancelRound(io, round);
@@ -961,85 +935,59 @@ function setupSpinSocket(io) {
           ];
 
           if (round.mode === "RAIL") {
-            if (realUsersCount === 1 && !round.countdownInterval) {
-              startCountdown(io, round);
-            }
+            // Real Spin (Rail): 4-window house bot scheduler
+            // Window 1: 1:59-1:30 (1-30s), Window 2: 1:29-1:00 (31-60s), Window 3: 0:59-0:30 (61-90s), Window 4: 0:29-0:02 (91-118s), Lock: 0:00
             if (railBotsEnabled) {
-              round.botCancelFn = scheduleBotFill({
-                maxBots: botsNeeded,
-                currentPlayerCount: round.players.length,
-                maxPlayers: 5,
-                staggerDelaysMs: botDelays,
-                onBotJoin: async (bot) => {
-                  if (round.status !== "waiting" || round.players.length >= 5) return;
-                  try {
-                    const botStake = 10 + Math.floor(Math.random() * 6) * 5; // 10, 15, 20, 25, 30, 35 ETB
-                    await addPlayerToRound(io, round, {
-                      userId: bot.id,
-                      username: bot.username,
-                      isBot: true,
-                      avatar: null,
-                      stake: botStake,
-                    });
-                  } catch (err) {
-                    console.error(`${LOG_PREFIX} Rail progressive bot join failed:`, err.message);
-                  }
-                },
+              if (!round.houseScheduler) {
+                round.houseScheduler = createRealHouseScheduler(round, {
+                  onBotSpawn: async (botPlayer) => {
+                    if (round.status !== "waiting") return;
+                    try {
+                      const excludeIds = round.players.map(p => p.userId);
+                      const b = await getBot(excludeIds);
+                      await addPlayerToRound(io, round, {
+                        userId: b.id,
+                        username: b.username,
+                        isBot: true,
+                        isHouse: true,
+                        avatar: null,
+                        stake: botPlayer.stake,
+                        window: botPlayer.window,
+                        second: botPlayer.second,
+                      });
+                    } catch (err) {
+                      console.error(`${LOG_PREFIX} Real Spin window bot spawn error:`, err.message);
+                    }
+                  },
+                  onRoundCancel: (reason) => {
+                    console.log(`${LOG_PREFIX} Real Spin round cancelled by scheduler: ${reason}`);
+                    cancelRound(io, round);
+                  },
+                });
+              }
+
+              // Real player arrived: notify scheduler (cancels window's bot if arrived before bot second)
+              round.houseScheduler.onPlayerJoined({
+                userId: currentUser.id,
+                username: currentUser.username,
+                isBot: false,
+                stake: Number(stake || 0),
               });
             }
-          } else if (round.mode === "5_PLAYER") {
-            const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
-            const spin5pEntry = Number(spin5pEntryStr || 100);
-
-            // Initialize 4-window house scheduler for 5_PLAYER mode if not already initialized
-            if (!round.houseScheduler) {
-              round.houseScheduler = createHouseScheduler(round, {
-                onBotSpawn: async (botPlayer) => {
-                  if (round.status !== "waiting" || round.players.length >= 5) return;
-                  if (!fivepBotsEnabled) return;
-                  try {
-                    const excludeIds = round.players.map(p => p.userId);
-                    const b = await getBot(excludeIds);
-                    await addPlayerToRound(io, round, {
-                      userId: b.id,
-                      username: b.username,
-                      isBot: true,
-                      isHouse: true,
-                      avatar: null,
-                      stake: spin5pEntry,
-                      window: botPlayer.window,
-                      second: botPlayer.second,
-                    });
-                  } catch (err) {
-                    console.error(`${LOG_PREFIX} 5-Player window bot spawn error:`, err.message);
-                  }
-                },
-                onBotYield: (yieldedBot) => {
-                  console.log(`${LOG_PREFIX} 5-Player newest bot yielded seat: ${yieldedBot.username}`);
-                  broadcastToRound(io, round, "spin:player_left", {
-                    roundId: round.id,
-                    userId: yieldedBot.userId,
-                    currentPlayers: round.players.length,
-                  });
-                },
-                onRoundCancel: (reason) => {
-                  console.log(`${LOG_PREFIX} 5-Player round cancelled by scheduler: ${reason}`);
-                  cancelRound(io, round);
-                },
-              });
-            }
-
-            // Notify scheduler of real player join
-            round.houseScheduler.onPlayerJoined({
-              userId: currentUser.id,
-              username: currentUser.username,
-              isBot: false,
-            });
 
             // Start 120s timer if not running
             if (!round.countdownInterval) {
               round.countdown = 120;
               startCountdown(io, round);
+            }
+          } else if (round.mode === "5_PLAYER") {
+            // 5-Player room: real users join by themselves
+            if (round.players.length >= round.maxPlayers) {
+              // 5 seats full: start short 5-second countdown to lock
+              if (!round.countdownInterval) {
+                round.countdown = 5;
+                startCountdown(io, round);
+              }
             }
           }
         }
@@ -1222,7 +1170,7 @@ function setupSpinSocket(io) {
           currentPlayers: round.players.length,
         });
 
-        if (round.mode === "5_PLAYER" && round.houseScheduler) {
+        if (round.mode === "RAIL" && round.houseScheduler) {
           round.houseScheduler.onPlayerLeft({ userId });
         }
 
@@ -1278,6 +1226,10 @@ function setupSpinSocket(io) {
               userId,
               currentPlayers: round.players.length,
             });
+
+            if (round.mode === "RAIL" && round.houseScheduler) {
+              round.houseScheduler.onPlayerLeft({ userId });
+            }
 
             const realPlayers = round.players.filter(p => !p.isBot);
             if (realPlayers.length === 0) {
