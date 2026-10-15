@@ -12,6 +12,7 @@ const jwt = require("jsonwebtoken");
 const { pool, redis, getGlobalSetting } = require("../db/index");
 const { debitWager, creditWinnings, refundWager, calculateSpinPrize } = require("../services/spinWalletService");
 const { scheduleBotFill, getBot } = require("./spinBot");
+const { createHouseScheduler } = require("./spin5pHouseScheduler");
 
 const LOG_PREFIX = "[SPIN_ROOM]";
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -201,6 +202,12 @@ function startCountdown(io, round) {
 
     broadcastToRound(io, round, "spin:countdown", { secondsLeft: round.countdown });
 
+    // In 5_PLAYER mode, tick the 4-window house scheduler
+    if (round.mode === "5_PLAYER" && round.houseScheduler && round.status === "waiting") {
+      const elapsed = Math.max(0, 120 - round.countdown);
+      round.houseScheduler.tickSecond(elapsed);
+    }
+
     // In the last 15 seconds of Rail mode, add bots if needed to ensure at least 5 players
     if (round.mode === "RAIL" && round.status === "waiting" && round.countdown <= 15 && !round.last15sBotTriggered) {
       scheduleLast15sRailBots(io, round);
@@ -215,9 +222,10 @@ function startCountdown(io, round) {
         round.botCancelFn();
         round.botCancelFn = null;
       }
+      if (round.houseScheduler) {
+        round.houseScheduler.cancelAll("lock_reached");
+      }
 
-      // Need at least 5 players to proceed in both Rail and 5_PLAYER mode
-      const minRequired = 5;
       const finishAndLock = async () => {
         const realPlayersCount = round.players.filter(p => !p.isBot).length;
         if (realPlayersCount === 0) {
@@ -225,32 +233,42 @@ function startCountdown(io, round) {
           return cancelRound(io, round);
         }
 
-        // If room has fewer than 5 players, fill remaining with bots so it ALWAYS spins!
-        if (round.players.length < minRequired) {
-          const needed = minRequired - round.players.length;
-          console.log(`${LOG_PREFIX} Countdown reached 0: auto-filling remaining ${needed} bots to ensure 5 players`);
-          for (let i = 0; i < needed; i++) {
-            try {
-              const excludeIds = round.players.map(p => p.userId);
-              const bot = await getBot(excludeIds);
-              const botStake = round.mode === "5_PLAYER" ? round.betAmount : (10 + Math.floor(Math.random() * 6) * 5);
-              await addPlayerToRound(io, round, {
-                userId: bot.id,
-                username: bot.username,
-                isBot: true,
-                avatar: null,
-                stake: botStake,
-              });
-            } catch (err) {
-              console.error(`${LOG_PREFIX} Countdown 0 bot fill error:`, err.message);
-            }
+        if (round.mode === "5_PLAYER") {
+          // 5-player room rule: fewer than 2 seats at lock -> cancel and refund all
+          if (round.players.length < 2) {
+            console.log(`${LOG_PREFIX} 5-Player lock reached with < 2 seats: cancelling and refunding.`);
+            return cancelRound(io, round);
           }
-        }
-
-        if (round.players.length >= minRequired) {
           await lockRound(io, round);
         } else {
-          cancelRound(io, round);
+          // Rail mode: ensure at least 5 players
+          const minRequired = 5;
+          if (round.players.length < minRequired) {
+            const needed = minRequired - round.players.length;
+            console.log(`${LOG_PREFIX} Rail countdown reached 0: auto-filling remaining ${needed} bots to ensure 5 players`);
+            for (let i = 0; i < needed; i++) {
+              try {
+                const excludeIds = round.players.map(p => p.userId);
+                const bot = await getBot(excludeIds);
+                const botStake = 10 + Math.floor(Math.random() * 6) * 5;
+                await addPlayerToRound(io, round, {
+                  userId: bot.id,
+                  username: bot.username,
+                  isBot: true,
+                  avatar: null,
+                  stake: botStake,
+                });
+              } catch (err) {
+                console.error(`${LOG_PREFIX} Rail countdown 0 bot fill error:`, err.message);
+              }
+            }
+          }
+
+          if (round.players.length >= minRequired) {
+            await lockRound(io, round);
+          } else {
+            cancelRound(io, round);
+          }
         }
       };
 
@@ -587,6 +605,9 @@ async function cancelRound(io, round) {
     round.botCancelFn();
     round.botCancelFn = null;
   }
+  if (round.houseScheduler) {
+    round.houseScheduler.cancelAll("round_cancelled");
+  }
 
   console.log(`${LOG_PREFIX} CANCELLED round=${round.id} (only ${round.players.length} players)`);
 
@@ -662,10 +683,16 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
   // If room is full but a real player is joining, evict a bot to make room
   if (round.players.length >= round.maxPlayers) {
     if (!isBot) {
-      const botIdx = round.players.findIndex(p => p.isBot);
+      let botIdx = -1;
+      for (let i = round.players.length - 1; i >= 0; i--) {
+        if (round.players[i].isBot) {
+          botIdx = i;
+          break;
+        }
+      }
       if (botIdx !== -1) {
         const evictedBot = round.players.splice(botIdx, 1)[0];
-        console.log(`${LOG_PREFIX} Evicted bot ${evictedBot.username} to make room for real player ${username}`);
+        console.log(`${LOG_PREFIX} Evicted newest bot ${evictedBot.username} to make room for real player ${username}`);
         round.players.forEach((p, i) => { p.seatIndex = i; });
         broadcastToRound(io, round, "spin:player_left", {
           roundId: round.id,
@@ -961,64 +988,58 @@ function setupSpinSocket(io) {
               });
             }
           } else if (round.mode === "5_PLAYER") {
-            if (fivepBotsEnabled) {
-              const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
-              const spin5pEntry = Number(spin5pEntryStr || 100);
+            const spin5pEntryStr = await getGlobalSetting("spin_5p_entry_amount", "100");
+            const spin5pEntry = Number(spin5pEntryStr || 100);
 
-              round.botCancelFn = scheduleBotFill({
-                maxBots: botsNeeded,
-                currentPlayerCount: round.players.length,
-                maxPlayers: 5,
-                staggerDelaysMs: botDelays,
-                onBotJoin: async (bot) => {
+            // Initialize 4-window house scheduler for 5_PLAYER mode if not already initialized
+            if (!round.houseScheduler) {
+              round.houseScheduler = createHouseScheduler(round, {
+                onBotSpawn: async (botPlayer) => {
                   if (round.status !== "waiting" || round.players.length >= 5) return;
-                  const tryJoinBot = async (b, attempt = 1) => {
-                    try {
-                      await addPlayerToRound(io, round, {
-                        userId: b.id,
-                        username: b.username,
-                        isBot: true,
-                        avatar: null,
-                        stake: spin5pEntry,
-                      });
-                    } catch (err) {
-                      console.error(`${LOG_PREFIX} 5-Player Bot join failed (attempt ${attempt}):`, err.message);
-                      if (attempt < 3 && round.status === "waiting" && round.players.length < 5) {
-                        const excludeIds = round.players.map(p => p.userId);
-                        const newBot = await getBot(excludeIds);
-                        setTimeout(() => tryJoinBot(newBot, attempt + 1), 600);
-                      }
-                    }
-                  };
-                  await tryJoinBot(bot);
+                  if (!fivepBotsEnabled) return;
+                  try {
+                    const excludeIds = round.players.map(p => p.userId);
+                    const b = await getBot(excludeIds);
+                    await addPlayerToRound(io, round, {
+                      userId: b.id,
+                      username: b.username,
+                      isBot: true,
+                      isHouse: true,
+                      avatar: null,
+                      stake: spin5pEntry,
+                      window: botPlayer.window,
+                      second: botPlayer.second,
+                    });
+                  } catch (err) {
+                    console.error(`${LOG_PREFIX} 5-Player window bot spawn error:`, err.message);
+                  }
+                },
+                onBotYield: (yieldedBot) => {
+                  console.log(`${LOG_PREFIX} 5-Player newest bot yielded seat: ${yieldedBot.username}`);
+                  broadcastToRound(io, round, "spin:player_left", {
+                    roundId: round.id,
+                    userId: yieldedBot.userId,
+                    currentPlayers: round.players.length,
+                  });
+                },
+                onRoundCancel: (reason) => {
+                  console.log(`${LOG_PREFIX} 5-Player round cancelled by scheduler: ${reason}`);
+                  cancelRound(io, round);
                 },
               });
+            }
 
-              // Watchdog safeguard: guarantee 5-player room fills smoothly and never gets stuck
-              if (!round.watchdogTimer) {
-                round.watchdogTimer = setTimeout(async () => {
-                  if (round.status === "waiting" && round.players.length < 5) {
-                    const needed = 5 - round.players.length;
-                    console.log(`${LOG_PREFIX} 5-Player Watchdog: auto-filling remaining ${needed} seats with bots.`);
-                    for (let i = 0; i < needed; i++) {
-                      if (round.status !== "waiting" || round.players.length >= 5) break;
-                      try {
-                        const excludeIds = round.players.map(p => p.userId);
-                        const b = await getBot(excludeIds);
-                        await addPlayerToRound(io, round, {
-                          userId: b.id,
-                          username: b.username,
-                          isBot: true,
-                          avatar: null,
-                          stake: spin5pEntry,
-                        });
-                      } catch (err) {
-                        console.error(`${LOG_PREFIX} Watchdog bot fill error:`, err.message);
-                      }
-                    }
-                  }
-                }, 12000);
-              }
+            // Notify scheduler of real player join
+            round.houseScheduler.onPlayerJoined({
+              userId: currentUser.id,
+              username: currentUser.username,
+              isBot: false,
+            });
+
+            // Start 120s timer if not running
+            if (!round.countdownInterval) {
+              round.countdown = 120;
+              startCountdown(io, round);
             }
           }
         }
@@ -1200,6 +1221,10 @@ function setupSpinSocket(io) {
           userId,
           currentPlayers: round.players.length,
         });
+
+        if (round.mode === "5_PLAYER" && round.houseScheduler) {
+          round.houseScheduler.onPlayerLeft({ userId });
+        }
 
         // If no real players left, cancel the round
         const realPlayers = round.players.filter(p => !p.isBot);
