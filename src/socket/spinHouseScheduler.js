@@ -80,21 +80,30 @@ function createRealHouseScheduler(round, options = {}) {
     if (cancelled || round.status !== "waiting") return;
 
     if (!player.isBot) {
-      player.seatIndex = round.players.length;
-      round.players.push(player);
+      if (!round.players.some(p => p.userId === player.userId)) {
+        player.seatIndex = round.players.length;
+        round.players.push(player);
+      }
 
-      // Check if real player arrived during window w before that window's bot second
-      const currentWindow = getWindowForSecond(elapsedSeconds);
-      if (currentWindow) {
-        const item = plan.find(p => p.window === currentWindow);
-        if (item && !item.fired && elapsedSeconds < item.second) {
-          item.cancelled = true;
-          item.cancelReason = "real_joined_before_bot_second";
+      // Check real players count. Only cancel the current window's bot if MORE THAN ONE
+      // real player is now in the room (i.e. another real user joined before the bot's second).
+      // A lone real user should NEVER cancel the bot; the bot is needed as their opponent!
+      const realUsers = round.players.filter(p => !p.isBot);
+      if (realUsers.length > 1) {
+        const currentWindow = getWindowForSecond(elapsedSeconds);
+        if (currentWindow) {
+          const item = plan.find(p => p.window === currentWindow);
+          if (item && !item.fired && elapsedSeconds < item.second) {
+            item.cancelled = true;
+            item.cancelReason = "real_joined_before_bot_second";
+          }
         }
       }
     } else {
-      player.seatIndex = round.players.length;
-      round.players.push(player);
+      if (!round.players.some(p => p.userId === player.userId)) {
+        player.seatIndex = round.players.length;
+        round.players.push(player);
+      }
     }
   }
 
@@ -144,7 +153,9 @@ function createRealHouseScheduler(round, options = {}) {
           if (onBotSpawn) {
             onBotSpawn(botPlayer);
           } else {
-            round.players.push(botPlayer);
+            if (!round.players.some(p => p.userId === botPlayer.userId)) {
+              round.players.push(botPlayer);
+            }
           }
         } else {
           item.cancelled = true;

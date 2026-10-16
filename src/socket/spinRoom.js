@@ -246,7 +246,10 @@ function startCountdown(io, round) {
         }
       };
 
-      finishAndLock().catch(() => cancelRound(io, round));
+      finishAndLock().catch((err) => {
+        console.error(`${LOG_PREFIX} finishAndLock error for round=${round.id}:`, err?.message || err);
+        cancelRound(io, round);
+      });
     }
   }, 1000);
 }
@@ -749,6 +752,7 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
     currentPlayers: round.players.length,
     maxPlayers: round.maxPlayers,
   });
+  broadcastRoomUpdate(io, round);
 
   console.log(`${LOG_PREFIX} Player joined: ${username}${isBot ? ' (BOT)' : ''} seat=${seatIndex} stake=${finalStake} round=${round.id} (${round.players.length}/${round.maxPlayers})`);
 
@@ -915,25 +919,7 @@ function setupSpinSocket(io) {
         const currentBotsCount = round.players.filter(p => p.isBot).length;
         const botsNeeded = Math.max(0, 5 - realUsersCount - currentBotsCount);
 
-        // Bots only join if there is at least 1 real human player in the room (never fill an empty room)
-        if (round.status === "waiting" && realUsersCount >= 1 && botsNeeded > 0) {
-          if (round.botCancelFn) {
-            round.botCancelFn();
-            round.botCancelFn = null;
-          }
-
-          // Natural staggered delays so each bot enters naturally at a different time:
-          // Bot 1: 3-5s
-          // Bot 2: 7-10s
-          // Bot 3: 12-15s
-          // Bot 4: 17-20s
-          const botDelays = [
-            3000 + Math.random() * 2000,
-            7000 + Math.random() * 3000,
-            12000 + Math.random() * 3000,
-            17000 + Math.random() * 3000,
-          ];
-
+        if (round.status === "waiting" && realUsersCount >= 1) {
           if (round.mode === "RAIL") {
             // Real Spin (Rail): 4-window house bot scheduler
             // Window 1: 1:59-1:30 (1-30s), Window 2: 1:29-1:00 (31-60s), Window 3: 0:59-0:30 (61-90s), Window 4: 0:29-0:02 (91-118s), Lock: 0:00
@@ -966,7 +952,7 @@ function setupSpinSocket(io) {
                 });
               }
 
-              // Real player arrived: notify scheduler (cancels window's bot if arrived before bot second)
+              // Real player arrived: notify scheduler (cancels window's bot if 2+ real players exist before bot second)
               round.houseScheduler.onPlayerJoined({
                 userId,
                 username: user.username || "Player",
