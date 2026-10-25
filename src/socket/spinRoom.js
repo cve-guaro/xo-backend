@@ -208,6 +208,11 @@ function startCountdown(io, round) {
       round.houseScheduler.tickSecond(elapsed);
     }
 
+    // Trigger last-15s bot fill in Rail mode so solo rooms reach lock & spin
+    if (round.mode === "RAIL" && round.countdown <= 15 && round.status === "waiting") {
+      scheduleLast15sRailBots(io, round);
+    }
+
     if (round.countdown <= 0) {
       clearInterval(round.countdownInterval);
       round.countdownInterval = null;
@@ -1401,6 +1406,51 @@ function setupSpinSocket(io) {
         if (!round) return ack?.({ ok: false, error: "ROUND_NOT_FOUND" });
         ack?.({ ok: true, data: buildRoomState(round) });
       } catch (err) {
+        ack?.({ ok: false, error: err.message });
+      }
+    });
+
+    // ── spin:invite_friend ──────────────────────────────────────────────
+    socket.on("spin:invite_friend", async (data, ack) => {
+      try {
+        const { targetUserId, mode, entryAmount, token } = data || {};
+        const authToken = token || socket.handshake.auth?.token;
+        if (!authToken) return ack?.({ ok: false, error: "AUTH_FAILED" });
+
+        let decoded;
+        try { decoded = verifyToken(authToken); } catch { return ack?.({ ok: false, error: "AUTH_FAILED" }); }
+        const senderId = decoded.sub || decoded.userId || decoded.id;
+
+        if (!targetUserId) return ack?.({ ok: false, error: "MISSING_TARGET" });
+        if (String(senderId) === String(targetUserId)) {
+          return ack?.({ ok: false, error: "CANNOT_INVITE_SELF" });
+        }
+
+        const { isUserOnline, emitToUserEvent } = require("./game");
+        const online = isUserOnline(targetUserId);
+        if (!online) {
+          return ack?.({ ok: false, error: "USER_OFFLINE", message: "User is currently offline" });
+        }
+
+        // Fetch sender info
+        const senderRes = await pool.query(
+          `SELECT username, display_name FROM users WHERE id=$1`,
+          [senderId]
+        );
+        const senderName = senderRes.rows[0]?.display_name || senderRes.rows[0]?.username || decoded.username || "A Friend";
+
+        // Emit invite to target user's personal room
+        emitToUserEvent(targetUserId, "spin:invite_received", {
+          fromUserId: senderId,
+          fromUsername: senderName,
+          mode: mode || "5_PLAYER",
+          entryAmount: Number(entryAmount) || 100,
+          timestamp: Date.now(),
+        });
+
+        ack?.({ ok: true, targetUserId });
+      } catch (err) {
+        console.error(`${LOG_PREFIX} spin:invite_friend error:`, err.message);
         ack?.({ ok: false, error: err.message });
       }
     });

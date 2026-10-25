@@ -5,6 +5,7 @@ const { pool, getGlobalSetting, redis } = require("../db/index");
 const { deductStake } = require("../models/stake");
 require('dotenv').config();
 const { creditPrize } = require('../models/payments.service')
+const { recordFriendship } = require('../services/friendService');
 
 // ---- Debug helpers -------------------------------------------------
 // Opt-in only. Previously defaulted ON whenever NODE_ENV !== 'production', which floods
@@ -219,6 +220,12 @@ function removeUserSocket(userId, socketId) {
   if (!set) return;
   set.delete(socketId);
   if (!set.size) userSockets.delete(userId);
+}
+
+function isUserOnline(userId) {
+  if (!userId) return false;
+  const set = userSockets.get(String(userId)) || userSockets.get(userId);
+  return Boolean(set && set.size > 0);
 }
 
 function findSocketByUser(io, userId) {
@@ -438,6 +445,9 @@ async function startDirectMatch(io, userA, userB, betAmount, isRematch = false) 
       O: String(userA) === String(O) ? sA : sB,
     };
 
+    // Auto-record friendship from direct invitation match
+    recordFriendship(userA, userB, 'invite').catch(() => {});
+
     // Get room configuration based on bet amount
     const roomNumber = determineRoomByBetAmount(betAmount);
     const initialTimer = roomNumber ? ROOMS_CONFIG[roomNumber].timerDuration : 30;
@@ -623,6 +633,10 @@ async function lockAndStartMatch(matchId, playerXId, playerOId, betAmount) {
         so.lockedUsed
       ]
     );
+
+    // Auto-record friendship between 1v1 match players
+    recordFriendship(playerXId, playerOId, '1v1_match').catch(() => {});
+
     return { id: matchId, player_x: playerXId, player_o: playerOId, bet_amount: betAmount, status: "ongoing" };
   });
 }
@@ -2837,5 +2851,7 @@ module.exports = {
   determineRoomByBetAmount,
   activeGames,
   emitToUserEvent,
-  finishAndPayout
+  finishAndPayout,
+  isUserOnline,
+  userSockets,
 };

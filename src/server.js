@@ -53,6 +53,8 @@ const otpAuthRoutes = require('./routes/otp');
 const adminRoutes = require('./routes/admin');
 const telegramAuthRoutes = require('./routes/telegram-auth');
 const miniAppApiRoutes = require('./routes/miniapp-api');
+const friendsRoutes = require('./routes/friends');
+const { ensureFriendsTable } = require('./services/friendService');
 
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
@@ -376,6 +378,8 @@ app.use('/payments', payments);
 app.use('/api/auth', authRoutes);
 app.use("/api/transactions", txRoutes);
 app.use('/user', userRoutes);
+app.use('/friends', friendsRoutes);
+app.use('/api/friends', friendsRoutes);
 app.use('/auth', otpAuthRoutes);
 app.use('/otp', otpAuthRoutes);
 app.use('/api/otp', otpAuthRoutes);
@@ -571,7 +575,6 @@ async function ensureUserSchema() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
       ALTER TABLE admin_audit_logs ADD COLUMN IF NOT EXISTS target_id TEXT;
-
       -- Ensure 0939484533 / 251939484533 admin account with 10k ETB balance
       DO $$
       DECLARE
@@ -609,6 +612,7 @@ async function ensureUserSchema() {
       END $$;
     `);
     console.log('[DB] ✅ Core schema (users, wallets, games, bonus_logs, payment_transactions, admin seed) verified successfully.');
+    await ensureFriendsTable();
   } catch (err) {
     console.warn('[DB] ⚠️ ensureUserSchema notice:', err.message);
   }
