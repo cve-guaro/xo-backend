@@ -1427,7 +1427,8 @@ function setupSpinSocket(io) {
         }
 
         const { isUserOnline, emitToUserEvent } = require("./game");
-        const online = isUserOnline(targetUserId);
+        const targetUidStr = String(targetUserId);
+        const online = isUserOnline(targetUidStr);
         if (!online) {
           return ack?.({ ok: false, error: "USER_OFFLINE", message: "User is currently offline" });
         }
@@ -1440,7 +1441,7 @@ function setupSpinSocket(io) {
         const senderName = senderRes.rows[0]?.display_name || senderRes.rows[0]?.username || decoded.username || "A Friend";
 
         // Emit invite to target user's personal room
-        emitToUserEvent(targetUserId, "spin:invite_received", {
+        emitToUserEvent(targetUidStr, "spin:invite_received", {
           fromUserId: senderId,
           fromUsername: senderName,
           mode: mode || "5_PLAYER",
@@ -1448,7 +1449,7 @@ function setupSpinSocket(io) {
           timestamp: Date.now(),
         });
 
-        ack?.({ ok: true, targetUserId });
+        ack?.({ ok: true, targetUserId: targetUidStr });
       } catch (err) {
         console.error(`${LOG_PREFIX} spin:invite_friend error:`, err.message);
         ack?.({ ok: false, error: err.message });

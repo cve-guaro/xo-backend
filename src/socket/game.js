@@ -211,15 +211,17 @@ async function clearRematchOffer(u1, u2) {
 const userSockets = new Map(); // userId -> Set<socket.id>
 function addUserSocket(userId, socket) {
   if (!userId) return;
-  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
-  userSockets.get(userId).add(socket.id);
+  const uid = String(userId);
+  if (!userSockets.has(uid)) userSockets.set(uid, new Set());
+  userSockets.get(uid).add(socket.id);
 }
 function removeUserSocket(userId, socketId) {
   if (!userId) return;
-  const set = userSockets.get(userId);
+  const uid = String(userId);
+  const set = userSockets.get(uid);
   if (!set) return;
   set.delete(socketId);
-  if (!set.size) userSockets.delete(userId);
+  if (!set.size) userSockets.delete(uid);
 }
 
 function isUserOnline(userId) {
@@ -1326,19 +1328,38 @@ function setupGameSocket(io) {
     // This ensures emitToUser() works even before find_match/friend_invite
     // Critical for: rematch_offer, friend_invite_received arriving on home page
     try {
-      const tkn = socket.handshake.auth?.token;
+      const tkn = socket.handshake.auth?.token || socket.handshake.query?.token;
       if (tkn) {
         const decoded = verifyToken(tkn);
-        if (decoded?.sub) {
-          const uid = decoded.sub || decoded.id;
-          rememberUser(uid);
-          rememberUserSocket(socket, uid);
-          if (DEBUG_MATCH) console.log(`[CONNECT] User ${uid} auto-registered on socket connect`);
+        const uid = decoded?.sub || decoded?.id || decoded?.userId;
+        if (uid) {
+          const uidStr = String(uid);
+          rememberUser(uidStr);
+          rememberUserSocket(socket, uidStr);
+          if (DEBUG_MATCH) console.log(`[CONNECT] User ${uidStr} auto-registered on socket connect`);
         }
       }
     } catch (e) {
       // Token invalid/expired — user just isn't auto-registered, no harm
     }
+
+    // Allow client to authenticate or update token after initial connect
+    socket.on("authenticate", ({ token }, ack) => {
+      try {
+        if (!token) return ack?.({ ok: false, error: "MISSING_TOKEN" });
+        const decoded = verifyToken(token);
+        const uid = decoded?.sub || decoded?.id || decoded?.userId;
+        if (uid) {
+          const uidStr = String(uid);
+          rememberUser(uidStr);
+          rememberUserSocket(socket, uidStr);
+          return ack?.({ ok: true, userId: uidStr });
+        }
+        return ack?.({ ok: false, error: "INVALID_TOKEN_PAYLOAD" });
+      } catch (err) {
+        return ack?.({ ok: false, error: "AUTH_FAILED" });
+      }
+    });
 
       socket.on("find_match", async ({ token, betAmount, betMin, betMax }, ack) => {
       const rid = shortId();

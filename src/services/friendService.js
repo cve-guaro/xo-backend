@@ -119,13 +119,15 @@ async function searchUsersForFriendship(userId, queryText, isOnlineFn) {
     );
 
     return rows.map((r) => {
-      const isOnline = isOnlineFn ? Boolean(isOnlineFn(r.id)) : false;
+      const isFriend = Boolean(r.is_friend);
+      // Privacy protection: only show real-time presence to mutual friends, never to strangers
+      const isOnline = isOnlineFn && isFriend ? Boolean(isOnlineFn(r.id)) : false;
       return {
         id: r.id,
         username: r.username,
         display_name: r.display_name || r.username,
         avatar: r.avatar,
-        is_friend: Boolean(r.is_friend),
+        is_friend: isFriend,
         is_online: isOnline,
       };
     });

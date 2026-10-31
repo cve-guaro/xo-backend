@@ -223,16 +223,32 @@ router.get('/transactions', auth, async (req, res) => {
     }));
 
     // Compute aggregate stats server-side
+    // Ethiopia Time is UTC+3 (Africa/Addis_Ababa)
+    const nowEAT = new Date(Date.now() + 3 * 3600 * 1000);
+    const todayStrEAT = nowEAT.toISOString().slice(0, 10);
+
     let depCount = 0, depSum = 0;
     let witCount = 0, witSum = 0;
     let prizeCount = 0, prizeSum = 0;
     let successCount = 0;
+    let todayDepSum = 0, todayWitSum = 0, todayCount = 0;
+
     for (const tx of transactions) {
       const isSuccess = ['success', 'completed', 'settled', 'paid'].includes(tx.status);
       if (isSuccess) successCount++;
       if (tx.type === 'deposit' && isSuccess) { depCount++; depSum += tx.amount; }
       if (tx.type === 'withdrawal' && isSuccess) { witCount++; witSum += tx.amount; }
       if (tx.type === 'prize' && isSuccess) { prizeCount++; prizeSum += tx.amount; }
+
+      // Check if created today in Ethiopian Timezone (UTC+3)
+      if (tx.createdAt) {
+        const txDateEAT = new Date(new Date(tx.createdAt).getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+        if (txDateEAT === todayStrEAT) {
+          todayCount++;
+          if (tx.type === 'deposit' && isSuccess) todayDepSum += tx.amount;
+          if (tx.type === 'withdrawal' && isSuccess) todayWitSum += tx.amount;
+        }
+      }
     }
 
     return res.json({
@@ -244,6 +260,11 @@ router.get('/transactions', auth, async (req, res) => {
         prizes: { count: prizeCount, total: prizeSum },
         net: depSum + prizeSum - witSum,
         successCount,
+        today: {
+          deposits: todayDepSum,
+          withdrawals: todayWitSum,
+          count: todayCount,
+        },
       },
     });
   } catch (err) {
