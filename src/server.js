@@ -1117,11 +1117,11 @@ process.on('unhandledRejection', (reason) => {
 
 async function startServer() {
   // Railway Public Networking is mapped specifically to Port 2000 (as shown in dashboard settings)
-  const PORT_2000 = 2000;
+  const primaryPort = parseInt(process.env.PORT, 10) || 2000;
 
-  // 1. Listen on Port 2000 as primary listener
-  server.listen(PORT_2000, '0.0.0.0', () => {
-    console.log(`[BOOT] Server listening immediately on Port 2000 (0.0.0.0) — Railway Public Domain match`);
+  // 1. Listen on primaryPort with full Socket.IO and WebSocket support
+  server.listen(primaryPort, '0.0.0.0', () => {
+    console.log(`[BOOT] Server listening on primary Port ${primaryPort} (0.0.0.0)`);
     
     // Ensure critical user schema first, then run full migrations in background
     ensureUserSchema().then(() => {
@@ -1131,25 +1131,12 @@ async function startServer() {
     });
   });
 
-  // 2. Also listen on process.env.PORT if specified and different from 2000
-  const envPort = parseInt(process.env.PORT, 10);
-  if (!isNaN(envPort) && envPort !== PORT_2000) {
+  // 2. Also listen on 2000 if primaryPort !== 2000 (backward compatibility)
+  if (primaryPort !== 2000) {
     try {
-      const envServer = http.createServer(app);
-      envServer.listen(envPort, '0.0.0.0', () => {
-        console.log(`[BOOT] Auxiliary listener active on env port ${envPort} (0.0.0.0)`);
-      }).on('error', (err) => {
-        console.warn(`[BOOT] Non-fatal auxiliary port ${envPort} warning:`, err.message);
-      });
-    } catch (_) {}
-  }
-
-  // 3. Fallback listener on port 8080 if neither is 8080
-  if (envPort !== 8080 && PORT_2000 !== 8080) {
-    try {
-      const fallback8080 = http.createServer(app);
-      fallback8080.listen(8080, '0.0.0.0', () => {
-        console.log('[BOOT] Auxiliary listener active on port 8080 (0.0.0.0)');
+      const aux2000 = http.createServer(app);
+      aux2000.listen(2000, '0.0.0.0', () => {
+        console.log('[BOOT] Auxiliary listener active on port 2000 (0.0.0.0)');
       }).on('error', () => {});
     } catch (_) {}
   }
