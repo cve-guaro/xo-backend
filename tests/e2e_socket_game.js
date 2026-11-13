@@ -18,11 +18,11 @@ const ROOT = path.join(__dirname, '..');
 const CLIENT_PATH = 'C:/Users/ThinkPad 14/OneDrive/Desktop/new vertion/Xoet/xoet-3/node_modules/socket.io-client';
 const { io } = require(CLIENT_PATH);
 const { Pool } = require('pg');
-const pool = new Pool({ connectionString: 'postgresql://postgres:postgres@localhost:5432/xoet_local' });
+const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL || process.env.DATABASE_URL || 'postgresql://postgres@localhost:5432/xoet_local' });
 
 const PORT = 2100;
 const BASE = `http://localhost:${PORT}`;
-const NUMBERS = ['0939484533', '0933037952'];
+const NUMBERS = ['0900000001', '0900000002'];
 const BET = 10;
 
 function health() {

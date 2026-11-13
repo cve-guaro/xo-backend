@@ -5,7 +5,7 @@
 const net = require('net');
 const { Pool } = require('pg');
 
-const pool = new Pool({ connectionString: 'postgresql://postgres:postgres@localhost:5432/xoet_local' });
+const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL || process.env.DATABASE_URL || 'postgresql://postgres@localhost:5432/xoet_local' });
 
 const USER_X = '00000000-0000-0000-0000-000000000099';
 const USER_O = '00000000-0000-0000-0000-000000000098';
