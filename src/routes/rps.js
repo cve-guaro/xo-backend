@@ -13,7 +13,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { authMiddleware, adminAuth } = require('../middleware/Auth');
+const { auth, adminAuth } = require('../middleware/Auth');
 const { pool } = require('../db/index');
 const { BET_TIERS, FEE_PERCENT, TIMINGS } = require('../games/rps/RPSGame');
 const { getQueueSizes, getActiveRoomCount, listActiveRooms } = require('../games/rps/RPSRoomManager');
@@ -21,7 +21,7 @@ const { getQueueSizes, getActiveRoomCount, listActiveRooms } = require('../games
 // ── GET /rps/config ──────────────────────────────────────────────────────
 // Public game configuration (bet tiers, fee %, timings).
 // Requires auth so we know the user is logged in.
-router.get('/config', authMiddleware, (req, res) => {
+router.get('/config', auth, (req, res) => {
   res.json({
     betTiers: BET_TIERS,
     feePercent: FEE_PERCENT,
@@ -48,7 +48,7 @@ router.get('/rooms', adminAuth, (req, res) => {
 
 // ── GET /rps/history ─────────────────────────────────────────────────────
 // Player's recent match history (last 20 matches).
-router.get('/history', authMiddleware, async (req, res) => {
+router.get('/history', auth, async (req, res) => {
   try {
     const userId = req.user.id || req.user.sub || req.user.userId;
     const limit = Math.min(Number(req.query.limit) || 20, 50);
