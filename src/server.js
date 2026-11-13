@@ -59,6 +59,8 @@ const { ensureFriendsTable } = require('./services/friendService');
 const authRoutes = require('./routes/auth');
 const { setupGameSocket } = require('./socket/game');
 const { setupSpinSocket } = require('./socket/spinRoom');
+const { setupRPSSocket } = require('./games/rps/rpsSocketHandler');
+const rpsRoutes = require('./routes/rps');
 const { platformDetection } = require('./middleware/Detection');
 const { systemLockdownCheck } = require('./middleware/Security');
 const { pool, redis } = require('./db/index');
@@ -393,6 +395,8 @@ app.use('/spin', require('./routes/spin'));
 app.use('/voice', require('./routes/voice'));
 app.use('/api/voice', require('./routes/voice'));
 app.use('/miniapp/v1', miniAppApiRoutes);
+app.use('/rps', rpsRoutes);
+app.use('/api/rps', rpsRoutes);
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
   const CACHE_KEY = 'cache:api_features';
@@ -459,6 +463,7 @@ app.get('/promo-popup/active', async (req, res) => {
 // ─── GAME SOCKET ───────────────────────────────────────────────────────────────
 setupGameSocket(io);
 setupSpinSocket(io);
+setupRPSSocket(io);
 
 // ─── TELEGRAM BOT ──────────────────────────────────────────────────────────────
 const { initTelegramBot } = require('./bot/telegram');
