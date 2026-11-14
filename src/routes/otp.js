@@ -813,12 +813,13 @@ router.post('/quick-login', async (req, res) => {
   }
 });
 
-// ─── 4 TEST GUEST ACCOUNTS FOR TESTING PHASE ──────────────────────────────────
+// ─── 5 TEST GUEST ACCOUNTS FOR TESTING PHASE ──────────────────────────────────
 const GUEST_ACCOUNTS = [
-  { index: 1, number: '251900000001', username: 'guest_1', displayName: 'Guest 1 (Abebe)' },
-  { index: 2, number: '251900000002', username: 'guest_2', displayName: 'Guest 2 (Sara)' },
-  { index: 3, number: '251900000003', username: 'guest_3', displayName: 'Guest 3 (Dawit)' },
-  { index: 4, number: '251900000004', username: 'guest_4', displayName: 'Guest 4 (Tigist)' },
+  { index: 1, number: '251900000001', username: 'guest_1', displayName: 'Guest 1 (Abebe)', role: 'user' },
+  { index: 2, number: '251900000002', username: 'guest_2', displayName: 'Guest 2 (Sara)', role: 'user' },
+  { index: 3, number: '251900000003', username: 'guest_3', displayName: 'Guest 3 (Dawit)', role: 'user' },
+  { index: 4, number: '251900000004', username: 'guest_4', displayName: 'Guest 4 (Tigist)', role: 'user' },
+  { index: 5, number: '251900000005', username: 'guest_5', displayName: 'Guest 5 (Admin)', role: 'admin' },
 ];
 
 router.get('/guest-accounts', (req, res) => {
@@ -840,13 +841,14 @@ router.post('/guest-login', async (req, res) => {
 
     const user = await withTx(async (client) => {
       // 1) Upsert guest user
+      const role = guestCfg.role || 'user';
       const { rows } = await client.query(
         `INSERT INTO users (number, username, display_name, role, new_user)
-         VALUES ($1, $2, $3, 'user', false)
+         VALUES ($1, $2, $3, $4, false)
          ON CONFLICT (number)
-         DO UPDATE SET display_name = EXCLUDED.display_name, new_user = false
+         DO UPDATE SET display_name = EXCLUDED.display_name, role = EXCLUDED.role, new_user = false
          RETURNING id, number, username, display_name, avatar, role, sound_muted`,
-        [guestCfg.number, guestCfg.username, guestCfg.displayName]
+        [guestCfg.number, guestCfg.username, guestCfg.displayName, role]
       );
       const u = rows[0];
 

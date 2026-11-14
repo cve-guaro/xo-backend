@@ -1297,7 +1297,8 @@ function setupGameSocket(io) {
     }
   }, 3000);
 
-  // Background interval for simulated/fake wins ticker (runs once globally)
+  // Background interval for simulated/fake wins ticker (disabled per user directive: real wins only)
+  /*
   setInterval(async () => {
     try {
       const enabled = await getGlobalSetting('fake_ticker_enabled', false);
@@ -1313,6 +1314,7 @@ function setupGameSocket(io) {
       console.error("[FAKE TICKER] background broadcast error:", err);
     }
   }, 5000);
+  */
 
   io.on("connection", (socket) => {
     // === REMATCH: record socket presence once we learn userId =========

@@ -1,9 +1,59 @@
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 const { pool } = require('../db/index'); // your Postgres client (pg.Pool)
 const { auth } = require('../middleware/Auth.js');
 const { validate, schemas } = require('../middleware/Validation.js');
 
 const router = express.Router();
+
+// Avatar upload multer setup
+const avatarStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, '../../public/uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, 'avatar-' + uniqueSuffix + ext);
+  }
+});
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB limit (client-side compressed images are ~20KB)
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) {
+      return cb(new Error('Only image files are allowed'), false);
+    }
+    cb(null, true);
+  }
+});
+
+// POST /account/avatar — Upload compressed profile image
+router.post('/avatar', auth, avatarUpload.single('avatar'), async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?.sub || req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+    const avatarUrl = `/uploads/${req.file.filename}`;
+    const result = await pool.query(
+      `UPDATE users SET avatar = $1, updated_at = NOW() WHERE id = $2 RETURNING id, username, display_name, avatar`,
+      [avatarUrl, userId]
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ message: 'User not found' });
+    res.json({ ok: true, avatar: avatarUrl, user: result.rows[0] });
+  } catch (err) {
+    console.error('[ACCOUNT] Avatar upload error:', err);
+    res.status(500).json({ message: err.message || 'Avatar upload failed' });
+  }
+});
 
 // PATCH /account/profile
 router.patch(

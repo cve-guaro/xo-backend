@@ -509,17 +509,8 @@ router.get('/ticker', async (req, res) => {
       }
     }
 
-    let tickerData = [];
-    if (showReal && showFake) {
-      // Prioritize real winners first, then fake entries
-      tickerData = [...realWinnersList, ...fakeEntriesList];
-    } else if (showReal) {
-      tickerData = realWinnersList;
-    } else if (showFake) {
-      tickerData = fakeEntriesList;
-    }
-
-    const responsePayload = { ticker: tickerData.slice(0, 30) };
+    // User explicitly requested 100% real live winners only (no fake/demo ticker data)
+    const responsePayload = { ticker: realWinnersList.slice(0, 30) };
     // Try to cache, but don't fail if Redis is down
     try {
       await redis.setex(CACHE_KEY, 30, JSON.stringify(responsePayload));
