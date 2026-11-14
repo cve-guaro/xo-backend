@@ -731,10 +731,21 @@ router.post('/logout', async (req, res) => {
 });
 
 /**
+ * Middleware: guard test-only login endpoints against production / unauthorized use.
+ * Only permitted when NOT in production AND process.env.ENABLE_TEST_LOGIN === 'true'.
+ */
+function guardTestLogin(req, res, next) {
+  if (process.env.NODE_ENV === 'production' || process.env.ENABLE_TEST_LOGIN !== 'true') {
+    return res.status(403).json({ error: 'Test login endpoints are disabled' });
+  }
+  next();
+}
+
+/**
  * POST /otp/quick-login
  * 1-click pass login for admin 0939484533 with 10k ETB balance
  */
-router.post('/quick-login', async (req, res) => {
+router.post('/quick-login', guardTestLogin, async (req, res) => {
   try {
     const rawNumber = String(req.body?.number || '0939484533').trim();
     const digitsOnly = rawNumber.replace(/\D/g, '');
@@ -822,7 +833,7 @@ const GUEST_ACCOUNTS = [
   { index: 5, number: '251900000005', username: 'guest_5', displayName: 'Guest 5 (Admin)', role: 'admin' },
 ];
 
-router.get('/guest-accounts', (req, res) => {
+router.get('/guest-accounts', guardTestLogin, (req, res) => {
   return res.json({
     ok: true,
     guests: GUEST_ACCOUNTS.map(g => ({
@@ -834,7 +845,7 @@ router.get('/guest-accounts', (req, res) => {
   });
 });
 
-router.post('/guest-login', async (req, res) => {
+router.post('/guest-login', guardTestLogin, async (req, res) => {
   try {
     const guestIndex = Number(req.body?.guestIndex || 1);
     const guestCfg = GUEST_ACCOUNTS.find(g => g.index === guestIndex) || GUEST_ACCOUNTS[0];
@@ -878,7 +889,7 @@ router.post('/guest-login', async (req, res) => {
         sub: user.id,
         number: user.number,
         username: user.username,
-        role: 'user',
+        role: user.role || 'user',
       },
       secret,
       { algorithm: 'HS256', expiresIn: '7d' }
@@ -887,7 +898,7 @@ router.post('/guest-login', async (req, res) => {
     const refreshToken = crypto.randomBytes(40).toString('hex');
     redis.set(`refresh_token:${refreshToken}`, user.id, 'EX', 7 * 24 * 60 * 60).catch(() => {});
 
-    console.log(`[GUEST_LOGIN] Logged in guest ${guestCfg.displayName} (${guestCfg.number}) with 1000 ETB`);
+    console.log(`[GUEST_LOGIN] Logged in guest ${guestCfg.displayName} (${guestCfg.number}) as ${user.role || 'user'} with 1000 ETB`);
 
     return res.json({
       ok: true,
@@ -899,7 +910,7 @@ router.post('/guest-login', async (req, res) => {
         username: user.username,
         display_name: user.display_name,
         avatar: user.avatar,
-        role: 'user',
+        role: user.role || 'user',
         available_balance: 1000,
         withdrawable_balance: 1000,
         bonus_balance: 0,
