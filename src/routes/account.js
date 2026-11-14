@@ -55,6 +55,65 @@ router.post('/avatar', auth, avatarUpload.single('avatar'), async (req, res) => 
   }
 });
 
+// DELETE /account/avatar — Remove profile image
+router.delete('/avatar', auth, async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?.sub || req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const cur = await pool.query(`SELECT avatar FROM users WHERE id = $1`, [userId]);
+    const oldAvatar = cur.rows[0]?.avatar;
+
+    const result = await pool.query(
+      `UPDATE users SET avatar = NULL, updated_at = NOW() WHERE id = $1 RETURNING id, username, display_name, avatar`,
+      [userId]
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ message: 'User not found' });
+
+    if (oldAvatar && oldAvatar.startsWith('/uploads/')) {
+      const filePath = path.join(uploadDir, path.basename(oldAvatar));
+      if (fs.existsSync(filePath)) {
+        fs.unlink(filePath, () => {});
+      }
+    }
+
+    res.json({ ok: true, avatar: null, user: result.rows[0] });
+  } catch (err) {
+    console.error('[ACCOUNT] Avatar deletion error:', err);
+    res.status(500).json({ message: err.message || 'Avatar deletion failed' });
+  }
+});
+
+router.post('/avatar/remove', auth, async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?.sub || req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const cur = await pool.query(`SELECT avatar FROM users WHERE id = $1`, [userId]);
+    const oldAvatar = cur.rows[0]?.avatar;
+
+    const result = await pool.query(
+      `UPDATE users SET avatar = NULL, updated_at = NOW() WHERE id = $1 RETURNING id, username, display_name, avatar`,
+      [userId]
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ message: 'User not found' });
+
+    if (oldAvatar && oldAvatar.startsWith('/uploads/')) {
+      const filePath = path.join(uploadDir, path.basename(oldAvatar));
+      if (fs.existsSync(filePath)) {
+        fs.unlink(filePath, () => {});
+      }
+    }
+
+    res.json({ ok: true, avatar: null, user: result.rows[0] });
+  } catch (err) {
+    console.error('[ACCOUNT] Avatar remove error:', err);
+    res.status(500).json({ message: err.message || 'Avatar removal failed' });
+  }
+});
+
 // PATCH /account/profile
 router.patch(
   "/profile",
