@@ -5,7 +5,21 @@
 const net = require('net');
 const { Pool } = require('pg');
 
-const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL || process.env.DATABASE_URL || 'postgresql://postgres@localhost:5432/xoet_local' });
+const testDbUrl = process.env.TEST_DATABASE_URL || 'postgresql://postgres@localhost:5432/xoet_local';
+try {
+  const parsed = new URL(testDbUrl);
+  const host = parsed.hostname;
+  if (host !== 'localhost' && host !== '127.0.0.1' && host !== '::1') {
+    console.error(`REFUSING TO RUN TESTS AGAINST NON-LOCAL DATABASE: ${host}`);
+    process.exit(1);
+  }
+} catch (err) {
+  if (err.message && err.message.includes('REFUSING')) throw err;
+  console.error('REFUSING TO RUN TESTS: invalid database URL');
+  process.exit(1);
+}
+
+const pool = new Pool({ connectionString: testDbUrl });
 
 const USER_X = '00000000-0000-0000-0000-000000000099';
 const USER_O = '00000000-0000-0000-0000-000000000098';
