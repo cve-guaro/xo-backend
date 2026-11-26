@@ -824,6 +824,17 @@ router.post('/quick-login', guardTestLogin, async (req, res) => {
   }
 });
 
+/**
+ * Middleware: allow guest test-user endpoints for live testing unless explicitly disabled.
+ * Set ENABLE_TEST_LOGIN=false in production to disable guest test accounts.
+ */
+function guardGuestTestLogin(req, res, next) {
+  if (process.env.ENABLE_TEST_LOGIN === 'false') {
+    return res.status(403).json({ error: 'Test login endpoints are disabled' });
+  }
+  next();
+}
+
 // ─── 5 TEST GUEST ACCOUNTS FOR TESTING PHASE ──────────────────────────────────
 const GUEST_ACCOUNTS = [
   { index: 1, number: '251900000001', username: 'guest_1', displayName: 'Guest 1 (Abebe)', role: 'user' },
@@ -833,7 +844,7 @@ const GUEST_ACCOUNTS = [
   { index: 5, number: '251900000005', username: 'guest_5', displayName: 'Guest 5 (Admin)', role: 'admin' },
 ];
 
-router.get('/guest-accounts', guardTestLogin, (req, res) => {
+router.get('/guest-accounts', guardGuestTestLogin, (req, res) => {
   return res.json({
     ok: true,
     guests: GUEST_ACCOUNTS.map(g => ({
@@ -845,7 +856,7 @@ router.get('/guest-accounts', guardTestLogin, (req, res) => {
   });
 });
 
-router.post('/guest-login', guardTestLogin, async (req, res) => {
+router.post('/guest-login', guardGuestTestLogin, async (req, res) => {
   try {
     const guestIndex = Number(req.body?.guestIndex || 1);
     const guestCfg = GUEST_ACCOUNTS.find(g => g.index === guestIndex) || GUEST_ACCOUNTS[0];
