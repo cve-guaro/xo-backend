@@ -94,11 +94,19 @@ router.get('/me', auth, async (req, res) => {
       }
     }
 
-    const { rows: gameCountRows } = await pool.query(`SELECT COUNT(*) AS total FROM games WHERE player_x = $1 OR player_o = $1`, [userId]);
-    const totalGames = gameCountRows[0]?.total || 0;
-
-    const { rows: winCountRows } = await pool.query(`SELECT COUNT(*) AS wins FROM games WHERE winner = $1`, [userId]);
-    const totalWins = winCountRows[0]?.wins || 0;
+    const { rows: countStats } = await pool.query(
+      `SELECT
+        (SELECT COUNT(*) FROM games WHERE player_x = $1 OR player_o = $1) AS xo_games,
+        (SELECT COUNT(*) FROM games WHERE winner = $1) AS xo_wins,
+        (SELECT COUNT(*) FROM spin_bets sb JOIN spin_rounds sr ON sb.round_id = sr.id WHERE sb.user_id = $1::uuid AND sb.is_bot = false AND sr.status IN ('paid', 'completed', 'finished')) AS spin_games,
+        (SELECT COUNT(*) FROM spin_rounds WHERE winner_user_id = $1::uuid AND status IN ('paid', 'completed', 'finished')) AS spin_wins,
+        (SELECT COUNT(*) FROM rps_games WHERE (player_1 = $1::uuid OR player_2 = $1::uuid) AND status IN ('completed', 'finished', 'paid')) AS rps_games,
+        (SELECT COUNT(*) FROM rps_games WHERE winner_id = $1::uuid AND status IN ('completed', 'finished', 'paid')) AS rps_wins`,
+      [userId]
+    );
+    const st = countStats[0] || {};
+    const totalGames = Number(st.xo_games || 0) + Number(st.spin_games || 0) + Number(st.rps_games || 0);
+    const totalWins = Number(st.xo_wins || 0) + Number(st.spin_wins || 0) + Number(st.rps_wins || 0);
 
     let accomplishments = [];
     try {

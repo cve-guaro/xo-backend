@@ -450,9 +450,10 @@ router.get('/podium', auth, async (req, res) => {
   }
 });
 
-// ─── GET /leaderboard/ticker — Live winner feed ──────────────────────────────
+// ─── GET /leaderboard/ticker — Live winner feed across all games (XO, RPS, Spin) ──
 router.get('/ticker', async (req, res) => {
-  const CACHE_KEY = 'cache:leaderboard_ticker';
+  const filter = (req.query.filter || 'all').toString().toLowerCase();
+  const CACHE_KEY = `cache:leaderboard_ticker:${filter}`;
   try {
     // Try Redis cache first, but don't fail if Redis is down
     try {
@@ -470,54 +471,177 @@ router.get('/ticker', async (req, res) => {
     let realWinnersList = [];
     let fakeEntriesList = [];
 
-    // 1. Get real winners if enabled
+    // 1. Get real winners from all 3 games (Tic-Tac-Toe, RPS, Spin & Win)
     if (showReal) {
-      const { rows: realWinners } = await pool.query(`
-        SELECT 
-          u.username,
-          g.prize_amount AS amount,
-          g.finished_at
-        FROM games g
-        JOIN users u ON u.id = g.winner
-        WHERE g.status IN ('completed', 'finished')
-          AND g.winner IS NOT NULL
-          AND g.prize_amount > 0
-        ORDER BY g.finished_at DESC
-        LIMIT 20
-      `);
+      // 1a. Tic-Tac-Toe
+      try {
+        const { rows: xoWins } = await pool.query(`
+          SELECT 
+            u.id AS user_id,
+            u.username,
+            u.avatar,
+            u.created_at,
+            COALESCE(g.prize_amount, 0) AS amount,
+            COALESCE(g.bet_amount, 10) AS bet_amount,
+            'xo' AS game_type,
+            'Tic-Tac-Toe 1v1' AS game_title,
+            COALESCE(g.finished_at, g.created_at) AS finished_at
+          FROM games g
+          JOIN users u ON u.id = g.winner
+          WHERE g.status IN ('completed', 'finished')
+            AND g.winner IS NOT NULL
+            AND g.prize_amount > 0
+          ORDER BY COALESCE(g.finished_at, g.created_at) DESC
+          LIMIT 25
+        `);
+        for (const w of xoWins) {
+          realWinnersList.push({
+            userId: w.user_id,
+            username: w.username,
+            avatar: w.avatar,
+            createdAt: w.created_at,
+            amount: Number(w.amount),
+            betAmount: Number(w.bet_amount || 10),
+            gameType: 'xo',
+            gameTitle: 'Tic-Tac-Toe 1v1',
+            finishedAt: w.finished_at,
+            type: 'real',
+          });
+        }
+      } catch (xoErr) {
+        console.warn('[TICKER] XO games query failed:', xoErr.message);
+      }
 
-      realWinnersList = realWinners.map(w => ({
-        username: w.username,
-        amount: Number(w.amount),
-        type: 'real',
-      }));
+      // 1b. Rock Paper Scissors
+      try {
+        const { rows: rpsWins } = await pool.query(`
+          SELECT 
+            u.id AS user_id,
+            u.username,
+            u.avatar,
+            u.created_at,
+            COALESCE(r.prize_amount, 0) AS amount,
+            COALESCE(r.stake_amount, 10) AS bet_amount,
+            'rps' AS game_type,
+            'Rock Paper Scissors' AS game_title,
+            COALESCE(r.finished_at, r.created_at, NOW()) AS finished_at
+          FROM rps_games r
+          JOIN users u ON u.id = r.winner_id
+          WHERE r.status IN ('completed', 'finished', 'paid')
+            AND r.winner_id IS NOT NULL
+            AND r.prize_amount > 0
+          ORDER BY COALESCE(r.finished_at, r.created_at) DESC
+          LIMIT 25
+        `);
+        for (const w of rpsWins) {
+          realWinnersList.push({
+            userId: w.user_id,
+            username: w.username,
+            avatar: w.avatar,
+            createdAt: w.created_at,
+            amount: Number(w.amount),
+            betAmount: Number(w.bet_amount || 10),
+            gameType: 'rps',
+            gameTitle: 'Rock Paper Scissors',
+            finishedAt: w.finished_at,
+            type: 'real',
+          });
+        }
+      } catch (rpsErr) {
+        console.warn('[TICKER] RPS games query failed (non-fatal):', rpsErr.message);
+      }
+
+      // 1c. Spin & Win
+      try {
+        const { rows: spinWins } = await pool.query(`
+          SELECT 
+            u.id AS user_id,
+            u.username,
+            u.avatar,
+            u.created_at,
+            COALESCE(s.prize_amount, 0) AS amount,
+            COALESCE(c.bet_amount, 10) AS bet_amount,
+            'spin' AS game_type,
+            'Wheel of Fortune' AS game_title,
+            COALESCE(s.resolved_at, s.created_at) AS finished_at
+          FROM spin_rounds s
+          JOIN users u ON u.id = s.winner_user_id
+          LEFT JOIN spin_room_configs c ON c.id = s.config_id
+          WHERE s.status IN ('paid', 'completed', 'finished')
+            AND s.winner_user_id IS NOT NULL
+            AND s.prize_amount > 0
+          ORDER BY COALESCE(s.resolved_at, s.created_at) DESC
+          LIMIT 25
+        `);
+        for (const w of spinWins) {
+          realWinnersList.push({
+            userId: w.user_id,
+            username: w.username,
+            avatar: w.avatar,
+            createdAt: w.created_at,
+            amount: Number(w.amount),
+            betAmount: Number(w.bet_amount || 10),
+            gameType: 'spin',
+            gameTitle: 'Wheel of Fortune',
+            finishedAt: w.finished_at,
+            type: 'real',
+          });
+        }
+      } catch (spinErr) {
+        console.warn('[TICKER] Spin rounds query failed (non-fatal):', spinErr.message);
+      }
     }
 
     // 2. Get fake entries if enabled
     if (showFake) {
-      const { rows: fakeEntries } = await pool.query(
-        `SELECT username, amount FROM fake_ticker_entries WHERE active = true`
-      );
-      if (fakeEntries.length > 0) {
-        fakeEntriesList = fakeEntries.map(f => ({
-          username: f.username,
-          amount: Number(f.amount),
-          type: 'fake',
-        }));
-        // Shuffle fake entries
-        fakeEntriesList.sort(() => Math.random() - 0.5);
+      try {
+        const { rows: fakeEntries } = await pool.query(
+          `SELECT username, amount FROM fake_ticker_entries WHERE active = true`
+        );
+        if (fakeEntries.length > 0) {
+          fakeEntriesList = fakeEntries.map(f => ({
+            username: f.username,
+            amount: Number(f.amount),
+            betAmount: Math.round(Number(f.amount) * 0.6),
+            gameType: 'xo',
+            gameTitle: 'Tic-Tac-Toe 1v1',
+            finishedAt: new Date(),
+            type: 'fake',
+          }));
+        }
+      } catch (fakeErr) {
+        console.warn('[TICKER] Fake entries query failed (non-fatal):', fakeErr.message);
       }
     }
 
-    // User explicitly requested 100% real live winners only (no fake/demo ticker data)
-    const responsePayload = { ticker: realWinnersList.slice(0, 30) };
-    // Try to cache, but don't fail if Redis is down
+    let combined = [...realWinnersList];
+    if (combined.length === 0 && showFake) {
+      combined = [...fakeEntriesList];
+    }
+
+    // Apply sorting filters: "all", "top_bets", "top_wins", "payout"
+    if (filter === 'top_bets') {
+      combined.sort((a, b) => (b.betAmount || 0) - (a.betAmount || 0));
+    } else if (filter === 'top_wins') {
+      combined.sort((a, b) => (b.amount || 0) - (a.amount || 0));
+    } else if (filter === 'payout') {
+      // Payout multiplier: amount / betAmount
+      combined.sort((a, b) => {
+        const multA = a.betAmount ? (a.amount / a.betAmount) : 0;
+        const multB = b.betAmount ? (b.amount / b.betAmount) : 0;
+        return multB - multA;
+      });
+    } else {
+      // Default: chronologically newest first
+      combined.sort((a, b) => new Date(b.finishedAt || 0).getTime() - new Date(a.finishedAt || 0).getTime());
+    }
+
+    const responsePayload = { ticker: combined.slice(0, 30) };
     try {
-      await redis.setex(CACHE_KEY, 30, JSON.stringify(responsePayload));
+      await redis.setex(CACHE_KEY, 5, JSON.stringify(responsePayload));
     } catch (cacheErr) {
       console.warn('[TICKER] Redis cache write failed (non-fatal):', cacheErr.message);
     }
-    // Limit to 30 entries
     res.json(responsePayload);
   } catch (err) {
     console.error('[LEADERBOARD] ticker error:', err);

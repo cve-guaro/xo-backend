@@ -220,6 +220,7 @@ const io = new Server(server, {
   connectTimeout: 45000,       // 45 seconds connection timeout
   transports: ["websocket", "polling"]
 });
+app.set('io', io);
 
 // Resilient Redis adapter — falls back to in-memory if Redis is rate-limited/down
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";

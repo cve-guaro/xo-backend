@@ -8,13 +8,15 @@ const { validate, schemas } = require('../middleware/Validation.js');
 
 const router = express.Router();
 
+// Avatar upload directory (module-scoped so DELETE avatar routes can access it)
+const uploadDir = path.join(__dirname, '../../public/uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
 // Avatar upload multer setup
 const avatarStorage = multer.diskStorage({
   destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, '../../public/uploads');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
     cb(null, uploadDir);
   },
   filename: function (req, file, cb) {

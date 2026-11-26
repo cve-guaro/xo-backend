@@ -46,7 +46,7 @@ const schemas = {
   // Account Operations
   updateProfile: z.object({
     username: z.string().min(2).max(24).regex(/^[\p{L}\p{N}@._\- ]+$/u, 'Username can only contain letters, numbers, @, dots, spaces, underscores, and hyphens').optional(),
-    display_name: z.string().max(40).regex(/^[\p{L}\p{N} ._\-']*$/u, 'Display name contains invalid characters').optional(),
+    display_name: z.string().max(40).regex(/^[\p{L}\p{N} ._\-'()]*$/u, 'Display name contains invalid characters').optional(),
     avatar: z.string().max(2048).optional().nullable()
   })
 };

@@ -14,7 +14,7 @@ const { sendSMS } = require('../utils/sms');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { emitToUserEvent, finishAndPayout } = require('../socket/game');
+const { emitToUserEvent, finishAndPayout, userSockets } = require('../socket/game');
 
 
 const router = express.Router();
@@ -389,39 +389,274 @@ router.post('/giveaway/reset', async (req, res) => {
 });
 // ──────────────────────────────────────────────
 // GET /admin/live-queue-stats
+// Returns live queues & active games breakdown for XO (25, 50, 100, 250) and RPS (10, 25, 50, 100)
 // ──────────────────────────────────────────────
 router.get('/live-queue-stats', async (req, res) => {
   try {
-    const { activeGames, determineRoomByBetAmount } = require('../socket/game');
-    
-    // 1. Get live active games from memory map
-    const activeGamesList = [];
+    const { activeGames, determineRoomByBetAmount, memQueueLen } = require('../socket/game');
+    const { listActiveRooms, getQueueSizes } = require('../games/rps/RPSRoomManager');
+
+    // 1. XO Games (Tic-Tac-Toe) — 4 platform tiers: 25, 50, 100, 250 ETB
+    const xoTiers = [25, 50, 100, 250];
+    const xoTierStats = {};
+    for (const amt of xoTiers) {
+      xoTierStats[amt] = { searching: 0, liveMatches: 0 };
+    }
+
+    const xoActiveList = [];
     if (activeGames) {
       for (const [matchId, game] of activeGames.entries()) {
-        activeGamesList.push({
+        const bet = Number(game.betAmount || 0);
+        if (xoTierStats[bet]) {
+          xoTierStats[bet].liveMatches += 1;
+        }
+        xoActiveList.push({
           matchId,
+          gameType: 'xo',
           room: game.room,
-          betAmount: game.betAmount,
+          betAmount: bet,
           players: game.players,
+          player1: game.players?.X?.userId || game.players?.X,
+          player2: game.players?.O?.userId || game.players?.O,
+          player1Name: game.players?.X?.username || 'Player X',
+          player2Name: game.players?.O?.username || 'Player O',
           status: game.status,
-          turn: game.turn
+          turn: game.turn,
+          createdAt: game.createdAt || Date.now()
         });
       }
     }
 
-    // Calculate live game stats
+    // Searching count for XO tiers (check Redis + in-memory fallback)
+    for (const amt of xoTiers) {
+      const redisLen = await redis.llen(`queue:${amt}`).catch(() => 0);
+      const memLen = typeof memQueueLen === 'function' ? memQueueLen(`queue:${amt}`) : 0;
+      xoTierStats[amt].searching = Math.max(Number(redisLen || 0), Number(memLen || 0));
+    }
+
+    // 2. RPS Games (Rock Paper Scissors) — 4 platform tiers: 10, 25, 50, 100 ETB
+    const rpsTiers = [10, 25, 50, 100];
+    const rpsQueueSizes = typeof getQueueSizes === 'function' ? getQueueSizes() : {};
+    const rpsActiveRaw = typeof listActiveRooms === 'function' ? listActiveRooms() : [];
+
+    const rpsTierStats = {};
+    for (const amt of rpsTiers) {
+      rpsTierStats[amt] = {
+        searching: Number(rpsQueueSizes[amt] || 0),
+        liveMatches: 0
+      };
+    }
+
+    const rpsActiveList = [];
+    for (const r of rpsActiveRaw) {
+      const stake = Number(r.stake || 0);
+      if (rpsTierStats[stake]) {
+        rpsTierStats[stake].liveMatches += 1;
+      }
+      rpsActiveList.push({
+        matchId: r.roomId,
+        gameType: 'rps',
+        betAmount: stake,
+        player1: r.player1,
+        player2: r.player2,
+        player1Name: 'Player 1',
+        player2Name: 'Player 2',
+        scoreP1: r.scoreP1 || 0,
+        scoreP2: r.scoreP2 || 0,
+        status: r.status,
+        phase: r.phase,
+        createdAt: r.createdAt || Date.now()
+      });
+    }
+
+    // 3. Spin Wheel Rooms
+    let spinActiveMatches = 0;
+    let spinTotalPot = 0;
+    let spinRealPlayers = 0;
+    let spinBots = 0;
+    const spinRooms = [];
+
+    try {
+      const { activeSpinRounds } = require('../socket/spinRoom');
+      if (activeSpinRounds) {
+        for (const [roundId, r] of activeSpinRounds.entries()) {
+          const pot = (r.players || []).reduce((sum, p) => sum + Number(p.stake || 0), 0);
+          const realCount = (r.players || []).filter(p => !p.isBot).length;
+          const botCount = (r.players || []).filter(p => p.isBot).length;
+          spinActiveMatches++;
+          spinTotalPot += pot;
+          spinRealPlayers += realCount;
+          spinBots += botCount;
+
+          spinRooms.push({
+            matchId: roundId,
+            gameType: 'spin',
+            mode: r.mode,
+            roomName: r.roomName,
+            betAmount: r.betAmount || (pot > 0 ? Math.round(pot / Math.max(1, r.players.length)) : 0),
+            playersCount: r.players.length,
+            maxPlayers: r.maxPlayers,
+            realPlayersCount: realCount,
+            botsCount: botCount,
+            pot,
+            status: r.status,
+            countdown: r.countdown,
+            players: (r.players || []).map(p => ({
+              userId: p.userId,
+              username: p.username,
+              isBot: p.isBot,
+              stake: Number(p.stake || 0),
+              seatIndex: p.seatIndex,
+            })),
+            createdAt: r.createdAt || Date.now(),
+          });
+        }
+      }
+    } catch (_) {}
+
+    // Resolve player usernames for live games
+    const allPlayerIds = new Set();
+    xoActiveList.forEach(g => {
+      if (typeof g.player1 === 'string' && g.player1.length === 36) allPlayerIds.add(g.player1);
+      if (typeof g.player2 === 'string' && g.player2.length === 36) allPlayerIds.add(g.player2);
+    });
+    rpsActiveList.forEach(g => {
+      if (typeof g.player1 === 'string' && g.player1.length === 36) allPlayerIds.add(g.player1);
+      if (typeof g.player2 === 'string' && g.player2.length === 36) allPlayerIds.add(g.player2);
+    });
+
+    if (allPlayerIds.size > 0) {
+      try {
+        const pRes = await pool.query(
+          `SELECT id, username, display_name FROM users WHERE id = ANY($1::uuid[])`,
+          [[...allPlayerIds]]
+        );
+        const nameMap = {};
+        pRes.rows.forEach(u => {
+          nameMap[u.id] = u.display_name || u.username;
+        });
+        xoActiveList.forEach(g => {
+          if (nameMap[g.player1]) g.player1Name = nameMap[g.player1];
+          if (nameMap[g.player2]) g.player2Name = nameMap[g.player2];
+        });
+        rpsActiveList.forEach(g => {
+          if (nameMap[g.player1]) g.player1Name = nameMap[g.player1];
+          if (nameMap[g.player2]) g.player2Name = nameMap[g.player2];
+        });
+      } catch (_) {}
+    }
+
+    // 4. Detailed Queue Searchers with Profiles
+    const searchersList = [];
+
+    // 4a. XO Matchmaking Searchers (memory queue + Redis)
+    try {
+      const { memoryQueues } = require('../socket/game');
+      if (memoryQueues) {
+        for (const [qKey, qList] of memoryQueues.entries()) {
+          const betAmount = Number(qKey.replace('queue:', '')) || 0;
+          for (const item of qList || []) {
+            if (item.userId && !searchersList.some(s => s.userId === item.userId)) {
+              searchersList.push({
+                userId: item.userId,
+                username: item.username || 'Player',
+                socketId: item.socketId,
+                gameType: 'xo',
+                tier: betAmount,
+                betAmount,
+                joinedAt: item.joinedAt || Date.now(),
+              });
+            }
+          }
+        }
+      }
+
+      // Check Redis queue lists for XO tiers
+      for (const amt of [10, 25, 50, 100, 250, 500, 1000]) {
+        try {
+          const rawItems = await redis.lrange(`queue:${amt}`, 0, -1).catch(() => []);
+          for (const raw of rawItems || []) {
+            try {
+              const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+              if (parsed && parsed.userId && !searchersList.some(s => s.userId === parsed.userId)) {
+                searchersList.push({
+                  userId: parsed.userId,
+                  username: parsed.username || 'Player',
+                  socketId: parsed.socketId,
+                  gameType: 'xo',
+                  tier: amt,
+                  betAmount: amt,
+                  joinedAt: parsed.joinedAt || Date.now(),
+                });
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }
+    } catch (xoErr) {
+      console.warn('[ADMIN] XO searchers collect error:', xoErr.message);
+    }
+
+    // 4b. RPS Matchmaking Searchers
+    try {
+      const { matchmakingQueues } = require('../games/rps/RPSRoomManager');
+      if (matchmakingQueues) {
+        for (const [tier, qList] of matchmakingQueues.entries()) {
+          for (const item of qList || []) {
+            if (item.userId && !searchersList.some(s => s.userId === item.userId && s.gameType === 'rps')) {
+              searchersList.push({
+                userId: item.userId,
+                username: item.username || 'Player',
+                socketId: item.socketId,
+                gameType: 'rps',
+                tier: Number(tier),
+                betAmount: Number(tier),
+                joinedAt: item.joinedAt || Date.now(),
+              });
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Enrich searcher profiles from DB
+    if (searchersList.length > 0) {
+      try {
+        const sIds = searchersList.map(s => s.userId).filter(Boolean);
+        const sRes = await pool.query(
+          `SELECT u.id, u.username, u.display_name, u.avatar, u.phone, w.available_balance
+           FROM users u
+           LEFT JOIN wallets w ON w.user_id = u.id
+           WHERE u.id = ANY($1::uuid[])`,
+          [sIds]
+        );
+        const sMap = {};
+        sRes.rows.forEach(r => {
+          sMap[r.id] = r;
+        });
+        searchersList.forEach(s => {
+          const u = sMap[s.userId];
+          if (u) {
+            s.username = u.display_name || u.username;
+            s.phone = u.phone;
+            s.avatar = u.avatar;
+            s.balance = Number(u.available_balance || 0);
+          }
+        });
+      } catch (_) {}
+    }
+
+    // Backward compatibility roomStats
     const roomStats = {
       1: { liveMatches: 0, livePlayers: 0, betBreakdown: {} },
       2: { liveMatches: 0, livePlayers: 0, betBreakdown: {} },
       3: { liveMatches: 0, livePlayers: 0, betBreakdown: {} }
     };
-
-    activeGamesList.forEach(game => {
+    xoActiveList.forEach(game => {
       const roomNum = game.room || 1;
       if (roomStats[roomNum]) {
         roomStats[roomNum].liveMatches += 1;
         roomStats[roomNum].livePlayers += 2;
-        
         const bet = game.betAmount || 0;
         if (!roomStats[roomNum].betBreakdown[bet]) {
           roomStats[roomNum].betBreakdown[bet] = { liveMatches: 0, searching: 0 };
@@ -429,82 +664,99 @@ router.get('/live-queue-stats', async (req, res) => {
         roomStats[roomNum].betBreakdown[bet].liveMatches += 1;
       }
     });
-
-    // 2. Get searching users from Redis
-    const queueKeys = await redis.smembers("mm:queues").catch(() => []);
-    
-    const defaultBetAmounts = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 7500, 10000];
-    const keysToCheck = new Set(queueKeys);
-    defaultBetAmounts.forEach(amt => keysToCheck.add(`queue:${amt}`));
-
-    for (const key of keysToCheck) {
-      if (!key.startsWith("queue:")) continue;
-      const betStr = key.replace("queue:", "");
-      const betAmount = Number(betStr);
-      if (isNaN(betAmount)) continue;
-
-      const len = await redis.llen(key).catch(() => 0);
-      const roomNum = determineRoomByBetAmount(betAmount) || 1;
-
+    for (const amt of [10, 25, 50, 100, 250, 500, 1000]) {
+      const roomNum = determineRoomByBetAmount(amt) || 1;
       if (roomStats[roomNum]) {
-        if (!roomStats[roomNum].betBreakdown[betAmount]) {
-          roomStats[roomNum].betBreakdown[betAmount] = { liveMatches: 0, searching: 0 };
+        if (!roomStats[roomNum].betBreakdown[amt]) {
+          roomStats[roomNum].betBreakdown[amt] = { liveMatches: 0, searching: 0 };
         }
-        roomStats[roomNum].betBreakdown[betAmount].searching = len;
+        roomStats[roomNum].betBreakdown[amt].searching = xoTierStats[amt]?.searching || 0;
       }
-    }
-
-    // Ensure all default bet amounts are listed in their respective rooms
-    defaultBetAmounts.forEach(bet => {
-      const roomNum = determineRoomByBetAmount(bet) || 1;
-      if (roomStats[roomNum] && !roomStats[roomNum].betBreakdown[bet]) {
-        roomStats[roomNum].betBreakdown[bet] = { liveMatches: 0, searching: 0 };
-      }
-    });
-
-    // 3. Get Shadow-Banned Users from Redis
-    const shadowBanKeys = await redis.keys('cooldown:active:*').catch(() => []);
-    const shadowBanned = [];
-
-    const userIds = shadowBanKeys.map(k => k.split(':')[2]);
-    const uniqueUserIds = [...new Set(userIds)].filter(id => id && id.length === 36);
-
-    let usersMap = {};
-    if (uniqueUserIds.length > 0) {
-      const usersRes = await pool.query(
-        `SELECT id, username, number FROM users WHERE id = ANY($1::uuid[])`,
-        [uniqueUserIds]
-      );
-      for (const row of usersRes.rows) {
-        usersMap[row.id] = { username: row.username, number: row.number };
-      }
-    }
-
-    for (const key of shadowBanKeys) {
-      const parts = key.split(':');
-      const userId = parts[2];
-      const rangeKey = parts[3] || parts.slice(3).join(':');
-      const ttl = await redis.ttl(key).catch(() => 0);
-      const user = usersMap[userId] || { username: 'Unknown', number: '' };
-
-      shadowBanned.push({
-        userId,
-        username: user.username,
-        number: user.number,
-        rangeKey,
-        expiresIn: ttl
-      });
     }
 
     return res.json({
       ok: true,
+      xo: {
+        activeMatches: xoActiveList.length,
+        searchingTotal: Object.values(xoTierStats).reduce((acc, t) => acc + t.searching, 0),
+        tiers: xoTierStats,
+        liveGames: xoActiveList
+      },
+      rps: {
+        activeMatches: rpsActiveList.length,
+        searchingTotal: Object.values(rpsTierStats).reduce((acc, t) => acc + t.searching, 0),
+        tiers: rpsTierStats,
+        liveGames: rpsActiveList
+      },
+      spin: {
+        activeMatches: spinActiveMatches,
+        totalPot: spinTotalPot,
+        realPlayers: spinRealPlayers,
+        bots: spinBots,
+        rooms: spinRooms,
+      },
+      searchers: searchersList,
+      searchingPlayers: searchersList,
+      liveGamesList: [...xoActiveList, ...rpsActiveList, ...spinRooms],
+      activeGamesCount: xoActiveList.length + rpsActiveList.length + spinActiveMatches,
       roomStats,
-      shadowBanned,
-      activeGamesCount: activeGamesList.length
+      shadowBanned: []
     });
   } catch (err) {
     console.error('[ADMIN] /live-queue-stats error', err);
     return res.status(500).json({ error: 'Failed to fetch live queue stats' });
+  }
+});
+
+// ──────────────────────────────────────────────
+// POST /admin/game/force-cancel
+// Admin can force-cancel and refund an active game
+// ──────────────────────────────────────────────
+router.post('/game/force-cancel', async (req, res) => {
+  try {
+    const { matchId, gameType, reason } = req.body || {};
+    if (!matchId) return res.status(400).json({ error: 'matchId is required' });
+
+    await logAdminAction(req.user.id, 'admin_force_cancel_game', null, { matchId, gameType, reason });
+
+    if (gameType === 'spin') {
+      const { activeSpinRounds, cancelRound } = require('../socket/spinRoom');
+      const r = activeSpinRounds?.get(matchId);
+      if (r) {
+        const io = req.app.get('io') || global.io;
+        if (typeof cancelRound === 'function' && io) {
+          cancelRound(io, r);
+        }
+        return res.json({ ok: true, message: `Spin room ${matchId} cancelled and refunded.` });
+      }
+    } else if (gameType === 'rps') {
+      const { getRoom, cleanupRoom } = require('../games/rps/RPSRoomManager');
+      const { refundBothPlayers } = require('../games/rps/rpsSocketHandler');
+      const game = getRoom(matchId);
+      if (game) {
+        if (typeof refundBothPlayers === 'function') {
+          await refundBothPlayers(game);
+        }
+        cleanupRoom(matchId);
+        const io = req.app.get('io') || global.io;
+        if (io) io.to(`rps:${matchId}`).emit('rps:match_cancelled', { reason: reason || 'Admin cancelled match' });
+        return res.json({ ok: true, message: `RPS match ${matchId} cancelled and refunded.` });
+      }
+    } else {
+      // XO game
+      const { activeGames } = require('../socket/game');
+      const game = activeGames?.get(matchId);
+      if (game) {
+        activeGames.delete(matchId);
+        await pool.query(`UPDATE games SET status = 'refund', finished_at = NOW() WHERE id = $1::uuid`, [matchId]).catch(() => {});
+        return res.json({ ok: true, message: `XO match ${matchId} cancelled and marked for refund.` });
+      }
+    }
+
+    return res.json({ ok: true, message: `Game ${matchId} cancelled.` });
+  } catch (err) {
+    console.error('[ADMIN] /game/force-cancel error', err);
+    return res.status(500).json({ error: 'Failed to cancel game' });
   }
 });
 
@@ -1276,7 +1528,7 @@ router.get('/users/:id/360', async (req, res) => {
 
     // 1) User profile
     const userRes = await pool.query(
-      `SELECT id, username, number, role, banned, created_at, display_name,
+      `SELECT id, username, number, role, banned, created_at, display_name, avatar,
               COALESCE(r1_10_wins, 0) as r1_10_wins, COALESCE(r1_15_wins, 0) as r1_15_wins,
               COALESCE(r1_25_wins, 0) as r1_25_wins,
               COALESCE(r1_50_wins, 0) as r1_50_wins, COALESCE(r1_99_wins, 0) as r1_99_wins,
@@ -1301,43 +1553,159 @@ router.get('/users/:id/360', async (req, res) => {
       }
     } catch (e) { console.warn('[360] wallet query failed:', e.message); }
 
-    // 3) Game stats (safe)
+    // 3) Multi-Game stats (XO, RPS, 5-Player Spin, Real Spin Rail)
     let stats = { totalGames: 0, wins: 0, losses: 0, draws: 0 };
+    let gameBreakdown = {
+      xo: { total: 0, wins: 0, losses: 0, draws: 0, staked: 0 },
+      rps: { total: 0, wins: 0, losses: 0, draws: 0, staked: 0 },
+      spin_5p: { total: 0, wins: 0, losses: 0, draws: 0, staked: 0 },
+      spin_rail: { total: 0, wins: 0, losses: 0, draws: 0, staked: 0 },
+    };
+
+    // 3a) XO Stats
     try {
-      const statsRes = await pool.query(`
+      const xoRes = await pool.query(`
         SELECT
-          COUNT(*) as total_games,
-          SUM(CASE WHEN winner = $1::uuid THEN 1 ELSE 0 END) as wins,
-          SUM(CASE WHEN winner IS NOT NULL AND winner != $1::uuid THEN 1 ELSE 0 END) as losses,
-          SUM(CASE WHEN winner IS NULL AND status = 'completed' THEN 1 ELSE 0 END) as draws
+          COUNT(*) as total,
+          COALESCE(SUM(CASE WHEN winner = $1::uuid THEN 1 ELSE 0 END), 0) as wins,
+          COALESCE(SUM(CASE WHEN winner IS NOT NULL AND winner != $1::uuid THEN 1 ELSE 0 END), 0) as losses,
+          COALESCE(SUM(CASE WHEN winner IS NULL AND status = 'completed' THEN 1 ELSE 0 END), 0) as draws,
+          COALESCE(SUM(bet_amount), 0) as staked
         FROM games WHERE (player_x = $1::uuid OR player_o = $1::uuid) AND status = 'completed'
       `, [userId]);
-      if (statsRes.rows.length) {
-        stats = {
-          totalGames: Number(statsRes.rows[0].total_games || 0),
-          wins: Number(statsRes.rows[0].wins || 0),
-          losses: Number(statsRes.rows[0].losses || 0),
-          draws: Number(statsRes.rows[0].draws || 0),
+      if (xoRes.rows.length) {
+        const r = xoRes.rows[0];
+        gameBreakdown.xo = {
+          total: Number(r.total || 0),
+          wins: Number(r.wins || 0),
+          losses: Number(r.losses || 0),
+          draws: Number(r.draws || 0),
+          staked: Number(r.staked || 0),
         };
       }
-    } catch (e) { console.warn('[360] stats query failed:', e.message); }
+    } catch (e) { console.warn('[360] xo stats query failed:', e.message); }
 
-    // 4) Game history (last 50) — includes moves for board replay
+    // 3b) RPS Stats
+    try {
+      const rpsRes = await pool.query(`
+        SELECT
+          COUNT(*) as total,
+          COALESCE(SUM(CASE WHEN winner_id = $1::uuid THEN 1 ELSE 0 END), 0) as wins,
+          COALESCE(SUM(CASE WHEN winner_id IS NOT NULL AND winner_id != $1::uuid THEN 1 ELSE 0 END), 0) as losses,
+          COALESCE(SUM(CASE WHEN winner_id IS NULL AND status = 'completed' THEN 1 ELSE 0 END), 0) as draws,
+          COALESCE(SUM(stake_amount), 0) as staked
+        FROM rps_games WHERE (player_1 = $1::uuid OR player_2 = $1::uuid) AND status = 'completed'
+      `, [userId]);
+      if (rpsRes.rows.length) {
+        const r = rpsRes.rows[0];
+        gameBreakdown.rps = {
+          total: Number(r.total || 0),
+          wins: Number(r.wins || 0),
+          losses: Number(r.losses || 0),
+          draws: Number(r.draws || 0),
+          staked: Number(r.staked || 0),
+        };
+      }
+    } catch (e) { console.warn('[360] rps stats query failed:', e.message); }
+
+    // 3c) Spin Wheel Stats (5-Player config 1 vs Real Rail config 2)
+    try {
+      const spinRes = await pool.query(`
+        SELECT
+          sr.config_id,
+          COUNT(*) as total,
+          COALESCE(SUM(CASE WHEN sr.winner_user_id = $1::uuid THEN 1 ELSE 0 END), 0) as wins,
+          COALESCE(SUM(CASE WHEN sr.winner_user_id IS NOT NULL AND sr.winner_user_id != $1::uuid THEN 1 ELSE 0 END), 0) as losses,
+          COALESCE(SUM(sb.amount), 0) as staked
+        FROM spin_bets sb
+        JOIN spin_rounds sr ON sb.round_id = sr.id
+        WHERE sb.user_id = $1::uuid AND sr.status = 'resolved'
+        GROUP BY sr.config_id
+      `, [userId]);
+      for (const row of spinRes.rows) {
+        const target = row.config_id === 1 ? 'spin_5p' : 'spin_rail';
+        gameBreakdown[target] = {
+          total: Number(row.total || 0),
+          wins: Number(row.wins || 0),
+          losses: Number(row.losses || 0),
+          draws: 0,
+          staked: Number(row.staked || 0),
+        };
+      }
+    } catch (e) { console.warn('[360] spin stats query failed:', e.message); }
+
+    // Combined totals
+    stats = {
+      totalGames: gameBreakdown.xo.total + gameBreakdown.rps.total + gameBreakdown.spin_5p.total + gameBreakdown.spin_rail.total,
+      wins: gameBreakdown.xo.wins + gameBreakdown.rps.wins + gameBreakdown.spin_5p.wins + gameBreakdown.spin_rail.wins,
+      losses: gameBreakdown.xo.losses + gameBreakdown.rps.losses + gameBreakdown.spin_5p.losses + gameBreakdown.spin_rail.losses,
+      draws: gameBreakdown.xo.draws + gameBreakdown.rps.draws,
+    };
+
+    // 4) Unified Game History (last 60 games across XO, RPS, Spin)
     let games = [];
     try {
-      const gamesRes = await pool.query(`
-        SELECT g.id, g.player_x, g.player_o, g.winner, g.bet_amount, g.status,
-               g.finished_at, g.created_at, g.prize_amount, NULL as end_reason, false as forfeit,
-               ux.username as player_x_name, ux.number as player_x_number, ux.created_at as player_x_created_at,
-               uo.username as player_o_name, uo.number as player_o_number, uo.created_at as player_o_created_at
+      // 4a) XO matches
+      const xoGames = await pool.query(`
+        SELECT g.id, 'xo' as game_type, g.player_x, g.player_o, g.winner, g.bet_amount, g.status,
+               g.finished_at, g.created_at, g.prize_amount,
+               ux.username as player_x_name, ux.number as player_x_number,
+               uo.username as player_o_name, uo.number as player_o_number
         FROM games g
         LEFT JOIN users ux ON g.player_x = ux.id
         LEFT JOIN users uo ON g.player_o = uo.id
         WHERE (g.player_x = $1::uuid OR g.player_o = $1::uuid)
-        ORDER BY g.created_at DESC LIMIT 50
+        ORDER BY g.created_at DESC LIMIT 30
       `, [userId]);
-      games = gamesRes.rows;
-    } catch (e) { console.warn('[360] games query failed:', e.message); }
+
+      // 4b) RPS matches
+      const rpsGames = await pool.query(`
+        SELECT r.id, 'rps' as game_type, r.player_1, r.player_2, r.winner_id, r.stake_amount as bet_amount,
+               r.status, r.finished_at, r.created_at, r.prize_amount, r.score_p1, r.score_p2,
+               u1.username as player_1_name, u1.number as player_1_number,
+               u2.username as player_2_name, u2.number as player_2_number
+        FROM rps_games r
+        LEFT JOIN users u1 ON r.player_1 = u1.id
+        LEFT JOIN users u2 ON r.player_2 = u2.id
+        WHERE (r.player_1 = $1::uuid OR r.player_2 = $1::uuid)
+        ORDER BY r.created_at DESC LIMIT 30
+      `, [userId]);
+
+      // 4c) Spin matches
+      const spinGames = await pool.query(`
+        SELECT sb.id, (CASE WHEN sr.config_id = 1 THEN 'spin_5p' ELSE 'spin_rail' END) as game_type,
+               sr.id as round_id, sr.winner_user_id as winner, sb.amount as bet_amount,
+               sr.status, sr.resolved_at as finished_at, sb.created_at, sr.prize_amount,
+               sr.pot_amount, sr.winning_slice
+        FROM spin_bets sb
+        JOIN spin_rounds sr ON sb.round_id = sr.id
+        WHERE sb.user_id = $1::uuid
+        ORDER BY sb.created_at DESC LIMIT 30
+      `, [userId]);
+
+      // Merge and sort
+      const combined = [
+        ...(xoGames.rows || []),
+        ...(rpsGames.rows || []).map(r => ({
+          ...r,
+          winner: r.winner_id,
+          player_x: r.player_1,
+          player_o: r.player_2,
+          player_x_name: r.player_1_name,
+          player_o_name: r.player_2_name,
+        })),
+        ...(spinGames.rows || []).map(s => ({
+          ...s,
+          player_x: userId,
+          player_o: null,
+          player_x_name: 'Me',
+          player_o_name: s.game_type === 'spin_5p' ? '5-Player Room' : 'Real Spin Rail',
+        })),
+      ];
+
+      combined.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      games = combined.slice(0, 50);
+    } catch (e) { console.warn('[360] combined games query failed:', e.message); }
 
     // 5) Transactions (last 50)
     let transactions = [];
@@ -1391,7 +1759,7 @@ router.get('/users/:id/360', async (req, res) => {
       }
     } catch (e) { console.warn('[360] entries query failed:', e.message); }
 
-    return res.json({ user, wallet, stats, games, transactions, totals, entries });
+    return res.json({ user, wallet, stats, gameBreakdown, games, transactions, totals, entries });
   } catch (err) {
     console.error('[ADMIN] /users/:id/360 error', err);
     return res.status(500).json({ error: 'Failed to fetch user detail' });
@@ -2649,6 +3017,11 @@ router.get('/metrics/live', async (req, res) => {
 
     const activeMatches = Number(activeGamesRes.rows[0]?.count || 0);
     const onlineUsers = typeof onlineRes === 'number' ? onlineRes : Number(onlineRes || 0);
+    // Resilient online count: Redis Set -> in-memory authenticated userSockets -> active socket.io clients
+    const io = req.app?.get?.('io');
+    const ioSocketsCount = io?.engine?.clientsCount || 0;
+    const socketUserCount = userSockets ? userSockets.size : 0;
+    const effectiveOnlineUsers = Math.max(onlineUsers, socketUserCount, ioSocketsCount);
     const depositsToday = Number(depositsTodayRes.rows[0]?.total || 0);
     const withdrawalsToday = Number(withdrawalsTodayRes.rows[0]?.total || 0);
     const dailyActiveUsers = Number(dauRes.rows[0]?.count || 0);
@@ -2657,7 +3030,7 @@ router.get('/metrics/live', async (req, res) => {
     return res.json({
       ok: true,
       activeMatches,
-      onlineUsers,
+      onlineUsers: effectiveOnlineUsers,
       depositsToday,
       withdrawalsToday,
       dailyActiveUsers,

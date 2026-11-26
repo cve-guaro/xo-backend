@@ -188,8 +188,13 @@ function opposite(s) { return s === "X" ? "O" : "X"; }
 const userRoom = (uid) => `user:${uid}`;
 
 function rememberUserSocket(socket, userId) {
-  socket.data = { ...(socket.data || {}), userId };
-  try { socket.join(userRoom(userId)); } catch { }
+  if (!userId) return;
+  const uid = String(userId);
+  socket.data = { ...(socket.data || {}), userId: uid };
+  addUserSocket(uid, socket);
+  try { socket.join(userRoom(uid)); } catch { }
+  // Track online users in Redis for admin dashboard
+  try { redis.sadd('online_users', uid).catch(() => { }); } catch { }
 }
 
 // === REMATCH: light user index (online sockets by userId) ===========
@@ -354,7 +359,19 @@ async function tx(fn) {
   finally { client.release(); }
 }
 
-// ── Robust Redis Double-Matchmaking Reservation Lock ────────────────
+// ── In-Memory Match Lock Fallback (used when Redis is offline or circuit breaker is open) ──
+const _memMatchLocks = new Map(); // key -> { token, expiresAt }
+function cleanMemMatchLocks() {
+  const now = Date.now();
+  for (const [k, v] of _memMatchLocks) {
+    if (v.expiresAt <= now) _memMatchLocks.delete(k);
+  }
+}
+
+// ── In-Memory Fallback for Friend Invitations ──────────────────────────────
+const _memFriendInvites = new Map(); // pairKey -> { senderId, senderName, targetId, betAmount, gameType, expiresAt }
+
+// ── Robust Redis / In-Memory Double-Matchmaking Reservation Lock ────────────────
 async function acquireMatchLocks(userId1, userId2, ttlMs = 10000) {
   const [inGame1, inGame2] = await Promise.all([
     redis.get(`in_game:${userId1}`).catch(() => null),
@@ -382,24 +399,53 @@ async function acquireMatchLocks(userId1, userId2, ttlMs = 10000) {
   const k2 = `matching:${userId2}`;
   const [firstKey, secondKey] = String(userId1) < String(userId2) ? [k1, k2] : [k2, k1];
 
-  const ok1 = await redis.set(firstKey, token, "NX", "PX", ttlMs);
-  if (ok1 !== "OK") {
+  // Try Redis first if Redis is up
+  if (isRedisUp()) {
+    try {
+      const ok1 = await redis.set(firstKey, token, "NX", "PX", ttlMs);
+      if (ok1 === "OK") {
+        const ok2 = await redis.set(secondKey, token, "NX", "PX", ttlMs);
+        if (ok2 === "OK") {
+          return {
+            ok: true,
+            release: async () => {
+              await Promise.all([
+                redis.del(k1).catch(() => {}),
+                redis.del(k2).catch(() => {})
+              ]);
+            }
+          };
+        }
+        await redis.del(firstKey).catch(() => {});
+        return { ok: false, reason: "ALREADY_LOCKING" };
+      }
+      return { ok: false, reason: "ALREADY_LOCKING" };
+    } catch (_) {
+      // Redis command failed — fall through to in-memory lock
+    }
+  }
+
+  // In-memory lock fallback when Redis is offline
+  cleanMemMatchLocks();
+  const now = Date.now();
+  const l1 = _memMatchLocks.get(firstKey);
+  const l2 = _memMatchLocks.get(secondKey);
+  if ((l1 && l1.expiresAt > now) || (l2 && l2.expiresAt > now)) {
     return { ok: false, reason: "ALREADY_LOCKING" };
   }
 
-  const ok2 = await redis.set(secondKey, token, "NX", "PX", ttlMs);
-  if (ok2 !== "OK") {
-    await redis.del(firstKey).catch(() => {});
-    return { ok: false, reason: "ALREADY_LOCKING" };
-  }
+  _memMatchLocks.set(firstKey, { token, expiresAt: now + ttlMs });
+  _memMatchLocks.set(secondKey, { token, expiresAt: now + ttlMs });
 
   return {
     ok: true,
     release: async () => {
+      if (_memMatchLocks.get(firstKey)?.token === token) _memMatchLocks.delete(firstKey);
+      if (_memMatchLocks.get(secondKey)?.token === token) _memMatchLocks.delete(secondKey);
       await Promise.all([
         redis.del(k1).catch(() => {}),
         redis.del(k2).catch(() => {})
-      ]);
+      ]).catch(() => {});
     }
   };
 }
@@ -2382,7 +2428,7 @@ function setupGameSocket(io) {
     // -------------------------------------------------------
     // FRIEND INVITE (lookup + send)
     // -------------------------------------------------------
-    socket.on("friend_invite", async ({ token: tkn, targetUsername, betAmount: rawBet }) => {
+    socket.on("friend_invite", async ({ token: tkn, targetUsername, betAmount: rawBet, gameType: rawGameType }) => {
       try {
         const decoded = verifyToken(tkn);
         const senderId = decoded.sub || decoded.id;
@@ -2391,6 +2437,7 @@ function setupGameSocket(io) {
 
         const safeBet = Number(rawBet) || 0;
         const isLookupOnly = safeBet <= 0;
+        const gameType = (rawGameType === 'rps') ? 'rps' : 'xo';
 
         // Validate bet only when actually sending an invite (not lookup)
         if (!isLookupOnly && (!Number.isFinite(safeBet) || safeBet <= 0)) {
@@ -2409,8 +2456,8 @@ function setupGameSocket(io) {
         if (target.id === senderId) return socket.emit("friend_invite_result", { ok: false, reason: "cannot_invite_self" });
 
         // Online detection: check userSockets map + active socket connections
-        const targetOnline = userSockets.has(target.id);
-        const inGame = await redis.get(`in_game:${target.id}`).catch(() => null);
+        const targetOnline = userSockets.has(target.id) || (io.sockets && Array.from(io.sockets.sockets.values()).some(s => String(s.data?.userId) === String(target.id) && !s.disconnected));
+        const inGame = isRedisUp() ? await redis.get(`in_game:${target.id}`).catch(() => null) : null;
         const status = inGame ? "in_game" : (targetOnline ? "online" : "offline");
 
         // Sender balance + caps
@@ -2434,11 +2481,13 @@ function setupGameSocket(io) {
           if (senderBalance < safeBet || targetBalance < safeBet) {
             return socket.emit("friend_invite_result", { ok: false, reason: "insufficient_balance" });
           }
-          if (safeBet === 10 && ((sender.r1_10_wins || 0) >= 15 || (target.r1_10_wins || 0) >= 15)) {
-            return socket.emit("friend_invite_result", { ok: false, reason: "tier_locked" });
-          }
-          if (safeBet === 15 && ((sender.r1_15_wins || 0) >= 15 || (target.r1_15_wins || 0) >= 15)) {
-            return socket.emit("friend_invite_result", { ok: false, reason: "tier_locked" });
+          if (gameType === 'xo') {
+            if (safeBet === 10 && ((sender.r1_10_wins || 0) >= 15 || (target.r1_10_wins || 0) >= 15)) {
+              return socket.emit("friend_invite_result", { ok: false, reason: "tier_locked" });
+            }
+            if (safeBet === 15 && ((sender.r1_15_wins || 0) >= 15 || (target.r1_15_wins || 0) >= 15)) {
+              return socket.emit("friend_invite_result", { ok: false, reason: "tier_locked" });
+            }
           }
         }
 
@@ -2450,6 +2499,7 @@ function setupGameSocket(io) {
           senderCaps,
           targetCaps,
           betAmount: safeBet,
+          gameType,
         });
 
         // Only send the actual invite if a real bet was specified and target is online
@@ -2457,18 +2507,30 @@ function setupGameSocket(io) {
           // Race condition guard: use sorted pair key so A→B and B→A share the same lock
           const pairKey = [senderId, target.id].sort().join(":");
           const inviteKey = `friend_inv:${pairKey}`;
-          const existing = await redis.get(inviteKey).catch(() => null);
 
-          if (existing) {
-            // An invite already exists for this pair — check if it's the OTHER player inviting US
-            const existingData = JSON.parse(existing);
+          // Check for existing mutual invite
+          let existingData = _memFriendInvites.get(pairKey);
+          if ((!existingData || existingData.expiresAt <= Date.now()) && isRedisUp()) {
+            const raw = await redis.get(inviteKey).catch(() => null);
+            if (raw) {
+              try { existingData = JSON.parse(raw); } catch {}
+            }
+          }
+
+          if (existingData && existingData.expiresAt > Date.now()) {
             if (existingData.senderId === target.id) {
               // Mutual invite! Auto-accept: the first sender's invite wins
-              await redis.del(inviteKey);
-              console.log(`[FRIEND MATCH] Mutual invite detected: ${senderId} <-> ${target.id}, auto-starting match`);
+              _memFriendInvites.delete(pairKey);
+              if (isRedisUp()) await redis.del(inviteKey).catch(() => {});
+              console.log(`[FRIEND MATCH] Mutual invite detected: ${senderId} <-> ${target.id}, auto-starting match (${existingData.gameType || 'xo'})`);
               try {
-                const result = await startDirectMatch(io, existingData.senderId, senderId, safeBet);
-                console.log(`[FRIEND MATCH] Mutual match started: ${result.matchId}`);
+                if (existingData.gameType === 'rps') {
+                  const { startDirectRPSMatch } = require('../games/rps/rpsSocketHandler');
+                  await startDirectRPSMatch(io, existingData.senderId, senderId, safeBet);
+                } else {
+                  const result = await startDirectMatch(io, existingData.senderId, senderId, safeBet);
+                  console.log(`[FRIEND MATCH XO] Mutual match started: ${result.matchId}`);
+                }
               } catch (e) {
                 console.error("[FRIEND MATCH] Mutual match failed:", e.message);
                 socket.emit("error", { message: e.message || "Failed to start friend match" });
@@ -2478,25 +2540,65 @@ function setupGameSocket(io) {
             // Same sender re-sending — just update the TTL
           }
 
-          await redis.set(inviteKey, JSON.stringify({ senderId, senderName: senderUsername, targetId: target.id, betAmount: safeBet }), "PX", 45000);
-          emitToUser(io, target.id, "friend_invite_received", { fromUserId: senderId, fromUsername: senderUsername, betAmount: safeBet });
+          const inviteObj = {
+            senderId,
+            senderName: senderUsername,
+            targetId: target.id,
+            betAmount: safeBet,
+            gameType,
+            expiresAt: Date.now() + 45000,
+          };
+
+          _memFriendInvites.set(pairKey, inviteObj);
+          if (isRedisUp()) {
+            await redis.set(inviteKey, JSON.stringify(inviteObj), "PX", 45000).catch(() => {});
+          }
+
+          emitToUser(io, target.id, "friend_invite_received", {
+            fromUserId: senderId,
+            fromUsername: senderUsername,
+            betAmount: safeBet,
+            gameType,
+          });
         }
-      } catch (e) { socket.emit("friend_invite_result", { ok: false, reason: "invite_failed" }); }
+      } catch (e) {
+        console.error("[FRIEND MATCH] friend_invite error:", e.message);
+        socket.emit("friend_invite_result", { ok: false, reason: "invite_failed" });
+      }
     });
 
     // -------------------------------------------------------
     // FRIEND INVITE RESPONSE (accept/decline)
     // -------------------------------------------------------
-    socket.on("friend_invite_response", async ({ token: tkn, senderId, accept, betAmount }) => {
+    socket.on("friend_invite_response", async ({ token: tkn, senderId, accept, betAmount, gameType: clientGameType }) => {
       try {
         const decoded = verifyToken(tkn);
         const responderId = decoded.sub || decoded.id;
         rememberUser(responderId);
+        rememberUserSocket(socket, responderId);
+
         const pairKey = [senderId, responderId].sort().join(":");
         const inviteKey = `friend_inv:${pairKey}`;
-        const raw = await redis.get(inviteKey);
-        if (!raw) return socket.emit("error", { message: "Invite expired" });
-        await redis.del(inviteKey);
+
+        let inviteData = _memFriendInvites.get(pairKey);
+        if ((!inviteData || inviteData.expiresAt <= Date.now()) && isRedisUp()) {
+          const raw = await redis.get(inviteKey).catch(() => null);
+          if (raw) {
+            try { inviteData = JSON.parse(raw); } catch {}
+          }
+        }
+
+        if (!inviteData || inviteData.expiresAt <= Date.now()) {
+          _memFriendInvites.delete(pairKey);
+          return socket.emit("error", { message: "Invite expired" });
+        }
+
+        _memFriendInvites.delete(pairKey);
+        if (isRedisUp()) await redis.del(inviteKey).catch(() => {});
+
+        const effectiveGameType = inviteData.gameType || clientGameType || 'xo';
+        const effectiveBet = Number(inviteData.betAmount || betAmount);
+
         if (!accept) {
           // Fetch responder username so sender sees who declined
           const responderRes = await pool.query(`SELECT username FROM users WHERE id=$1`, [responderId]);
@@ -2504,9 +2606,19 @@ function setupGameSocket(io) {
           emitToUser(io, senderId, "friend_invite_declined", { byUserId: responderId, byUsername: responderName });
           return;
         }
-        const result = await startDirectMatch(io, senderId, responderId, Number(betAmount));
-        console.log(`[FRIEND MATCH] Started: ${result.matchId}`);
-      } catch (e) { socket.emit("error", { message: e.message || "Failed to start friend match" }); }
+
+        if (effectiveGameType === 'rps') {
+          const { startDirectRPSMatch } = require('../games/rps/rpsSocketHandler');
+          const rpsResult = await startDirectRPSMatch(io, senderId, responderId, effectiveBet);
+          console.log(`[FRIEND MATCH RPS] Started: ${rpsResult.roomId}`);
+        } else {
+          const result = await startDirectMatch(io, senderId, responderId, effectiveBet);
+          console.log(`[FRIEND MATCH XO] Started: ${result.matchId}`);
+        }
+      } catch (e) {
+        console.error("[FRIEND MATCH] Error starting match:", e.message);
+        socket.emit("error", { message: e.message || "Failed to start friend match" });
+      }
     });
 
     // ---------------- Moves ----------------
@@ -2642,6 +2754,14 @@ function setupGameSocket(io) {
       const qKey = socketSearching.get(socket.id);
       const { userId, matchId, symbol } = socket.data || {};
       if (userId) removeUserSocket(userId, socket.id);
+
+      // Remove from Redis online_users set when user has no more active sockets
+      if (userId) {
+        const remaining = userSockets.get(String(userId)) || userSockets.get(userId);
+        if (!remaining || remaining.size === 0) {
+          try { redis.srem('online_users', String(userId)).catch(() => { }); } catch { }
+        }
+      }
 
       // If searching → remove from this queue and clear timer
       if (qKey) {
@@ -2877,4 +2997,6 @@ module.exports = {
   finishAndPayout,
   isUserOnline,
   userSockets,
+  memoryQueues,
+  memQueueLen,
 };

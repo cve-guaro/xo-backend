@@ -972,13 +972,46 @@ function setupSpinSocket(io) {
               startCountdown(io, round);
             }
           } else if (round.mode === "5_PLAYER") {
-            // 5-Player room: real users join by themselves
+            const fivepBotsEnabled = await getGlobalSetting("spin_5p_bots_enabled", true);
             if (round.players.length >= round.maxPlayers) {
               // 5 seats full: start short 5-second countdown to lock
               if (!round.countdownInterval) {
                 round.countdown = 5;
                 startCountdown(io, round);
               }
+            } else if (fivepBotsEnabled && !round.botCancelFn && round.status === "waiting") {
+              // Stagger bots to fill empty seats smoothly (approx 2.5s - 10s)
+              const needed = round.maxPlayers - round.players.length;
+              const botDelays = [
+                2500 + Math.random() * 2000,   // Bot 1: ~2.5 - 4.5s
+                5000 + Math.random() * 2000,   // Bot 2: ~5 - 7s
+                7500 + Math.random() * 2000,   // Bot 3: ~7.5 - 9.5s
+                10000 + Math.random() * 2000,  // Bot 4: ~10 - 12s
+              ];
+              round.botCancelFn = scheduleBotFill({
+                maxBots: needed,
+                currentPlayerCount: round.players.length,
+                maxPlayers: round.maxPlayers,
+                staggerDelaysMs: botDelays,
+                onBotJoin: async (bot) => {
+                  if (round.status !== "waiting" || round.players.length >= round.maxPlayers) return;
+                  try {
+                    await addPlayerToRound(io, round, {
+                      userId: bot.id,
+                      username: bot.username,
+                      isBot: true,
+                      avatar: null,
+                      stake: round.betAmount || 100,
+                    });
+                    if (round.players.length >= round.maxPlayers && !round.countdownInterval) {
+                      round.countdown = 5;
+                      startCountdown(io, round);
+                    }
+                  } catch (err) {
+                    console.error(`${LOG_PREFIX} 5-Player Bot join failed:`, err.message);
+                  }
+                },
+              });
             }
           }
         }
@@ -1401,9 +1434,56 @@ function setupSpinSocket(io) {
     socket.on("spin:get_state", async (data, ack) => {
       try {
         const { roundId } = data || {};
-        if (!roundId) return ack?.({ ok: false, error: "MISSING_ROUND_ID" });
-        const round = activeSpinRounds.get(roundId);
-        if (!round) return ack?.({ ok: false, error: "ROUND_NOT_FOUND" });
+        if (!roundId) {
+          // If no roundId provided, find the currently active RAIL round
+          for (const [id, r] of activeSpinRounds) {
+            if (r.mode === "RAIL" && (r.status === "waiting" || r.status === "locked" || r.status === "spinning")) {
+              return ack?.({ ok: true, data: buildRoomState(r) });
+            }
+          }
+          return ack?.({ ok: false, error: "MISSING_ROUND_ID" });
+        }
+        let round = activeSpinRounds.get(roundId);
+        if (!round) {
+          // Check DB to see if round resolved or ended while user was on another tab
+          try {
+            const dbRes = await pool.query(
+              `SELECT id, status, winning_slice, winner_user_id, pot_amount, prize_amount, players, mode
+               FROM spin_rounds WHERE id = $1::uuid`,
+              [roundId]
+            );
+            if (dbRes.rows.length > 0) {
+              const row = dbRes.rows[0];
+              const players = Array.isArray(row.players) ? row.players : (typeof row.players === "string" ? JSON.parse(row.players) : []);
+              const winnerUser = players.find(p => String(p.userId) === String(row.winner_user_id));
+              return ack?.({
+                ok: true,
+                data: {
+                  roundId: row.id,
+                  status: (row.status === "locked" || row.status === "paid") ? "resolved" : row.status,
+                  winningSlice: row.winning_slice,
+                  winnerId: row.winner_user_id,
+                  winnerName: winnerUser?.username || "Winner",
+                  prizeAmount: Number(row.prize_amount || row.pot_amount || 0),
+                  pot: Number(row.pot_amount || 0),
+                  players,
+                  mode: row.mode,
+                  countdown: 0,
+                }
+              });
+            }
+          } catch (dbErr) {
+            console.error(`${LOG_PREFIX} spin:get_state db query error:`, dbErr.message);
+          }
+
+          // If round is completely finished/cleaned up in RAIL mode, attach to live active RAIL round
+          for (const [id, r] of activeSpinRounds) {
+            if (r.mode === "RAIL" && (r.status === "waiting" || r.status === "locked" || r.status === "spinning")) {
+              return ack?.({ ok: true, data: buildRoomState(r) });
+            }
+          }
+          return ack?.({ ok: false, error: "ROUND_NOT_FOUND" });
+        }
         ack?.({ ok: true, data: buildRoomState(round) });
       } catch (err) {
         ack?.({ ok: false, error: err.message });

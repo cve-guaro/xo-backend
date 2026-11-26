@@ -256,4 +256,5 @@ module.exports = {
   getQueueSizes,
   getActiveRoomCount,
   listActiveRooms,
+  matchmakingQueues,
 };
