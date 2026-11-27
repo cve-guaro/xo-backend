@@ -20,9 +20,16 @@ function getWeekBounds() {
   return { weekStart: sunday, weekEnd: saturday };
 }
 
+// Short-TTL in-process caches to avoid sequential DB storms on Redis fallback
+const _weeklyLeaderboardCache = new Map();
+let _leaderboardSettingsCache = { data: null, expiresAt: 0 };
+
 // ─── Helper: Get global settings ────────
 async function getSettings(keys) {
   try {
+    if (keys.length === 1 && keys[0] === 'leaderboard_enabled' && _leaderboardSettingsCache.data && Date.now() < _leaderboardSettingsCache.expiresAt) {
+      return _leaderboardSettingsCache.data;
+    }
     const { rows } = await pool.query(
       'SELECT key, value FROM global_settings WHERE key = ANY($1)',
       [keys]
@@ -30,6 +37,9 @@ async function getSettings(keys) {
     const config = {};
     for (const r of rows) {
       config[r.key] = r.value;
+    }
+    if (keys.length === 1 && keys[0] === 'leaderboard_enabled') {
+      _leaderboardSettingsCache = { data: config, expiresAt: Date.now() + 15000 };
     }
     return config;
   } catch (err) {
@@ -66,17 +76,22 @@ router.get('/weekly', auth, async (req, res) => {
 
     const CACHE_KEY = `leaderboard:weekly:${search}:${page}:${limit}`;
     let cachedGlobal = null;
-    try {
-      const cached = await redis.get(CACHE_KEY);
-      if (cached) cachedGlobal = JSON.parse(cached);
-    } catch (e) { console.error('Redis err', e) }
+    const memEntry = _weeklyLeaderboardCache.get(CACHE_KEY);
+    if (memEntry && Date.now() < memEntry.expiresAt) {
+      cachedGlobal = memEntry.payload;
+    } else {
+      try {
+        const cached = await redis.get(CACHE_KEY);
+        if (cached) cachedGlobal = JSON.parse(cached);
+      } catch (e) { console.error('Redis err', e); }
+    }
 
     let total = 0, realListBase = [], top3Base = [];
 
     if (cachedGlobal) {
       ({ total, realListBase, top3Base } = cachedGlobal);
     } else {
-      // 1. Get total count for pagination
+      // 1. Build queries (count, paginated list, top 3 podium) and run them in parallel
       let countQuery = `
         SELECT COUNT(DISTINCT g.winner) AS total
         FROM games g
@@ -91,10 +106,8 @@ router.get('/weekly', auth, async (req, res) => {
         countQuery += ` AND (u.username ILIKE $3 OR u.phone_number ILIKE $3)`;
         countParams.push(`%${search}%`);
       }
-      const countRes = await pool.query(countQuery, countParams);
-      total = parseInt(countRes.rows[0]?.total || 0);
 
-      // 2. Get paginated list
+      // 2. Paginated list
       let itemsQuery = `
         SELECT 
           u.id::text as id,
@@ -124,34 +137,7 @@ router.get('/weekly', auth, async (req, res) => {
       `;
       itemsParams.push(limit, offset);
 
-      let rows = [];
-      try {
-        const queryRes = await pool.query(itemsQuery, itemsParams);
-        rows = queryRes.rows;
-      } catch (err) {
-        if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
-          console.warn('[LEADERBOARD] payment_transactions missing, falling back to count * 50');
-          const fallbackItemsQuery = itemsQuery.replace(
-            /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
-            'COUNT(*) * 50 AS win_amount'
-          );
-          const queryRes = await pool.query(fallbackItemsQuery, itemsParams);
-          rows = queryRes.rows;
-        } else {
-          throw err;
-        }
-      }
-
-      realListBase = rows.map((r, idx) => ({
-        id: r.id,
-        username: r.username,
-        avatar: r.avatar,
-        wins: Number(r.wins),
-        winAmount: Number(r.win_amount || 0),
-        rank: offset + idx + 1
-      }));
-
-      // 3. Always fetch top 3 global winners for podium
+      // 3. Top 3 global winners for podium
       const top3Query = `
         SELECT 
           u.id::text as id,
@@ -173,22 +159,57 @@ router.get('/weekly', auth, async (req, res) => {
         LIMIT 3
       `;
 
-      let top3Rows = [];
-      try {
-        const top3Res = await pool.query(top3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
-        top3Rows = top3Res.rows;
-      } catch (err) {
-        if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
-          const fallbackTop3Query = top3Query.replace(
-            /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
-            'COUNT(*) * 50 AS win_amount'
-          );
-          const top3Res = await pool.query(fallbackTop3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
-          top3Rows = top3Res.rows;
-        } else {
+      const fetchItems = async () => {
+        try {
+          const queryRes = await pool.query(itemsQuery, itemsParams);
+          return queryRes.rows;
+        } catch (err) {
+          if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
+            console.warn('[LEADERBOARD] payment_transactions missing, falling back to count * 50');
+            const fallbackItemsQuery = itemsQuery.replace(
+              /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
+              'COUNT(*) * 50 AS win_amount'
+            );
+            const queryRes = await pool.query(fallbackItemsQuery, itemsParams);
+            return queryRes.rows;
+          }
           throw err;
         }
-      }
+      };
+
+      const fetchTop3 = async () => {
+        try {
+          const top3Res = await pool.query(top3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
+          return top3Res.rows;
+        } catch (err) {
+          if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
+            const fallbackTop3Query = top3Query.replace(
+              /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
+              'COUNT(*) * 50 AS win_amount'
+            );
+            const top3Res = await pool.query(fallbackTop3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
+            return top3Res.rows;
+          }
+          throw err;
+        }
+      };
+
+      const [countRes, rows, top3Rows] = await Promise.all([
+        pool.query(countQuery, countParams),
+        fetchItems(),
+        fetchTop3(),
+      ]);
+
+      total = parseInt(countRes.rows[0]?.total || 0);
+
+      realListBase = rows.map((r, idx) => ({
+        id: r.id,
+        username: r.username,
+        avatar: r.avatar,
+        wins: Number(r.wins),
+        winAmount: Number(r.win_amount || 0),
+        rank: offset + idx + 1
+      }));
 
       top3Base = top3Rows.map((r, idx) => ({
         id: r.id,
@@ -199,8 +220,11 @@ router.get('/weekly', auth, async (req, res) => {
         rank: idx + 1
       }));
 
+      const cachePayload = { total, realListBase, top3Base };
+      if (_weeklyLeaderboardCache.size > 50) _weeklyLeaderboardCache.clear();
+      _weeklyLeaderboardCache.set(CACHE_KEY, { payload: cachePayload, expiresAt: Date.now() + 15000 });
       try {
-        await redis.setex(CACHE_KEY, 30, JSON.stringify({ total, realListBase, top3Base }));
+        await redis.setex(CACHE_KEY, 30, JSON.stringify(cachePayload));
       } catch (e) { console.error('Redis set err', e); }
     }
 

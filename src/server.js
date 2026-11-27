@@ -398,14 +398,29 @@ app.use('/api/voice', require('./routes/voice'));
 app.use('/miniapp/v1', miniAppApiRoutes);
 app.use('/rps', rpsRoutes);
 app.use('/api/rps', rpsRoutes);
+// Short-TTL in-process caches prevent DB stamps if Redis is busy or circuit-broken
+let _featuresMemCache = { data: null, expiresAt: 0 };
+let _promoMemCache = { data: null, expiresAt: 0 };
+
 // Public route to fetch feature flags and system status
 app.get('/api/features', async (req, res) => {
   const CACHE_KEY = 'cache:api_features';
+  const now = Date.now();
   try {
+    if (_featuresMemCache.data && now < _featuresMemCache.expiresAt) {
+      res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
+      return res.json(_featuresMemCache.data);
+    }
+
     // Try Redis cache first, but don't fail if Redis is down
     try {
       const cached = await redis.get(CACHE_KEY);
-      if (cached) return res.json(JSON.parse(cached));
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        _featuresMemCache = { data: parsed, expiresAt: now + 15000 };
+        res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
+        return res.json(parsed);
+      }
     } catch (cacheErr) {
       console.warn('[FEATURES] Redis cache read failed (falling through to DB):', cacheErr.message);
     }
@@ -413,13 +428,15 @@ app.get('/api/features', async (req, res) => {
     const { rows } = await pool.query("SELECT key, value FROM global_settings WHERE key LIKE 'feature_%' OR key IN ('system_emergency_lockout', 'lockdown_whitelist')");
     const features = {};
     rows.forEach(r => features[r.key] = r.value);
-    
+    _featuresMemCache = { data: features, expiresAt: Date.now() + 15000 };
+
     // Try to cache, but don't fail if Redis is down
     try {
       await redis.setex(CACHE_KEY, 30, JSON.stringify(features));
     } catch (cacheErr) {
       console.warn('[FEATURES] Redis cache write failed (non-fatal):', cacheErr.message);
     }
+    res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     res.json(features);
   } catch (err) {
     console.error('[FEATURES] Failed to fetch features:', err.message);
@@ -430,10 +447,21 @@ app.get('/api/features', async (req, res) => {
 // Public route: fetch active promotion popup (no auth needed)
 app.get('/promo-popup/active', async (req, res) => {
   const CACHE_KEY = 'cache:promo_popup_active';
+  const now = Date.now();
   try {
+    if (_promoMemCache.data && now < _promoMemCache.expiresAt) {
+      res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
+      return res.json(_promoMemCache.data);
+    }
+
     try {
       const cached = await redis.get(CACHE_KEY);
-      if (cached) return res.json(JSON.parse(cached));
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        _promoMemCache = { data: parsed, expiresAt: now + 15000 };
+        res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
+        return res.json(parsed);
+      }
     } catch (cacheErr) {
       console.warn('[PROMO] Redis cache read failed (falling through to DB):', cacheErr.message);
     }
@@ -449,11 +477,13 @@ app.get('/promo-popup/active', async (req, res) => {
     `);
     
     const responseData = rows.length === 0 ? { ok: true, popup: null } : { ok: true, popup: rows[0] };
+    _promoMemCache = { data: responseData, expiresAt: Date.now() + 15000 };
     try {
       await redis.setex(CACHE_KEY, 30, JSON.stringify(responseData));
     } catch (cacheErr) {
       console.warn('[PROMO] Redis cache write failed (non-fatal):', cacheErr.message);
     }
+    res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     return res.json(responseData);
   } catch (err) {
     console.error('[PUBLIC] GET /promo-popup/active err', err);

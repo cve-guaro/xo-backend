@@ -6,6 +6,32 @@ const { redeemPromoCode } = require('../models/payments.service');
 
 const router = express.Router();
 
+// Avoid repeating daily DAU insert checks on every /user/me poll
+let _dauDay = '';
+const _dauLoggedUsers = new Set();
+
+function trackDailyUserEntry(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== _dauDay) {
+    _dauDay = today;
+    _dauLoggedUsers.clear();
+  }
+  if (_dauLoggedUsers.has(userId)) return;
+  if (_dauLoggedUsers.size > 10000) _dauLoggedUsers.clear();
+  _dauLoggedUsers.add(userId);
+  pool.query(`
+    INSERT INTO user_entries (user_id)
+    SELECT $1::uuid
+    WHERE NOT EXISTS (
+      SELECT 1 FROM user_entries
+      WHERE user_id = $1::uuid AND created_at >= CURRENT_DATE
+    )
+  `, [userId]).catch(err => {
+    _dauLoggedUsers.delete(userId);
+    console.error('[DAU_LOG_ERR]', err);
+  });
+}
+
 /**
  * POST /user/promocodes/redeem
  */
@@ -51,15 +77,7 @@ router.post('/promocodes/redeem', auth, async (req, res) => {
 router.get('/me', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-
-    pool.query(`
-      INSERT INTO user_entries (user_id)
-      SELECT $1::uuid
-      WHERE NOT EXISTS (
-        SELECT 1 FROM user_entries
-        WHERE user_id = $1::uuid AND created_at >= CURRENT_DATE
-      )
-    `, [userId]).catch(err => console.error('[DAU_LOG_ERR]', err));
+    trackDailyUserEntry(userId);
 
     const query = `
       SELECT 
@@ -73,7 +91,18 @@ router.get('/me', auth, async (req, res) => {
       LIMIT 1;
     `;
 
-    const { rows } = await pool.query(query, [userId]);
+    const statsQuery = `SELECT
+        (SELECT COUNT(*) FROM games WHERE player_x = $1 OR player_o = $1) AS xo_games,
+        (SELECT COUNT(*) FROM games WHERE winner = $1) AS xo_wins,
+        (SELECT COUNT(*) FROM spin_bets sb JOIN spin_rounds sr ON sb.round_id = sr.id WHERE sb.user_id = $1::uuid AND sb.is_bot = false AND sr.status IN ('paid', 'completed', 'finished')) AS spin_games,
+        (SELECT COUNT(*) FROM spin_rounds WHERE winner_user_id = $1::uuid AND status IN ('paid', 'completed', 'finished')) AS spin_wins,
+        (SELECT COUNT(*) FROM rps_games WHERE (player_1 = $1::uuid OR player_2 = $1::uuid) AND status IN ('completed', 'finished', 'paid')) AS rps_games,
+        (SELECT COUNT(*) FROM rps_games WHERE winner_id = $1::uuid AND status IN ('completed', 'finished', 'paid')) AS rps_wins`;
+
+    const [{ rows }, { rows: countStats }] = await Promise.all([
+      pool.query(query, [userId]),
+      pool.query(statsQuery, [userId]),
+    ]);
     if (!rows.length) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -93,17 +122,6 @@ router.get('/me', auth, async (req, res) => {
         console.warn('[AUTO_GIVEAWAY_HEAL_ERR]', giveawayErr.message);
       }
     }
-
-    const { rows: countStats } = await pool.query(
-      `SELECT
-        (SELECT COUNT(*) FROM games WHERE player_x = $1 OR player_o = $1) AS xo_games,
-        (SELECT COUNT(*) FROM games WHERE winner = $1) AS xo_wins,
-        (SELECT COUNT(*) FROM spin_bets sb JOIN spin_rounds sr ON sb.round_id = sr.id WHERE sb.user_id = $1::uuid AND sb.is_bot = false AND sr.status IN ('paid', 'completed', 'finished')) AS spin_games,
-        (SELECT COUNT(*) FROM spin_rounds WHERE winner_user_id = $1::uuid AND status IN ('paid', 'completed', 'finished')) AS spin_wins,
-        (SELECT COUNT(*) FROM rps_games WHERE (player_1 = $1::uuid OR player_2 = $1::uuid) AND status IN ('completed', 'finished', 'paid')) AS rps_games,
-        (SELECT COUNT(*) FROM rps_games WHERE winner_id = $1::uuid AND status IN ('completed', 'finished', 'paid')) AS rps_wins`,
-      [userId]
-    );
     const st = countStats[0] || {};
     const totalGames = Number(st.xo_games || 0) + Number(st.spin_games || 0) + Number(st.rps_games || 0);
     const totalWins = Number(st.xo_wins || 0) + Number(st.spin_wins || 0) + Number(st.rps_wins || 0);
