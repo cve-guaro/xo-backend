@@ -1649,12 +1649,6 @@ function setupSpinSocket(io) {
             console.error(`${LOG_PREFIX} spin:get_state db query error:`, dbErr.message);
           }
 
-          // If round is completely finished/cleaned up in RAIL mode, attach to live active RAIL round
-          for (const [id, r] of activeSpinRounds) {
-            if (r.mode === "RAIL" && (r.status === "waiting" || r.status === "locked" || r.status === "spinning")) {
-              return ack?.({ ok: true, data: buildRoomState(r) });
-            }
-          }
           return ack?.({ ok: false, error: "ROUND_NOT_FOUND" });
         }
         ack?.({ ok: true, data: buildRoomState(round) });
