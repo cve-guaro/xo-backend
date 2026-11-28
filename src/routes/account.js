@@ -447,63 +447,92 @@ router.patch("/welcome-seen", auth, async (req, res) => {
   }
 });
 
+let _accountGlobalConfigCache = { data: null, expiresAt: 0 };
+const ACCOUNT_CONFIG_TTL_MS = 15_000;
+
+async function getGlobalAccountConfig() {
+  const now = Date.now();
+  if (_accountGlobalConfigCache.data && now < _accountGlobalConfigCache.expiresAt) {
+    return _accountGlobalConfigCache.data;
+  }
+
+  const settingsPromise = pool.query(`
+    SELECT key, value FROM global_settings 
+    WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled', 'rooms_locked')
+  `);
+  const popupPromise = pool.query(`
+    SELECT image_url, display_duration, expires_at, is_active 
+    FROM promo_popups 
+    WHERE is_active = true 
+    ORDER BY created_at DESC 
+    LIMIT 1
+  `);
+  const pendingPromise = pool.query(`
+    SELECT 1 FROM leaderboard_snapshots 
+    WHERE prize_status = 'pending' 
+    LIMIT 1
+  `).then(r => r.rows.length > 0).catch((e) => {
+    console.warn('[CONFIG] Error fetching pending snapshot flag:', e.message);
+    return false;
+  });
+
+  const [settingsRes, popupRes, payoutPending] = await Promise.all([
+    settingsPromise,
+    popupPromise,
+    pendingPromise,
+  ]);
+
+  const config = {};
+  for (const r of settingsRes.rows) {
+    // Postgres jsonb might already be parsed depending on driver, but we'll be safe
+    config[r.key] = typeof r.value === 'string' ? JSON.parse(r.value) : r.value;
+  }
+
+  const payload = {
+    config,
+    promoPopupConfig: popupRes.rows.length > 0 ? popupRes.rows[0] : null,
+    payoutPending,
+  };
+  _accountGlobalConfigCache = { data: payload, expiresAt: now + ACCOUNT_CONFIG_TTL_MS };
+  return payload;
+}
+
+async function fetchUserPreviousWeekWin(userId) {
+  if (!userId) return null;
+  try {
+    const lastSnapshotRes = await pool.query(`
+      SELECT id, rank, prize_amount, week_start, week_end 
+      FROM leaderboard_snapshots 
+      WHERE user_id = $1 AND prize_status = 'approved' AND rank <= 3
+      ORDER BY week_start DESC 
+      LIMIT 1
+    `, [userId]);
+
+    if (lastSnapshotRes.rows.length > 0) {
+      const snap = lastSnapshotRes.rows[0];
+      return {
+        snapshotId: snap.id,
+        rank: Number(snap.rank),
+        prize: Number(snap.prize_amount),
+        weekStart: snap.week_start,
+        weekEnd: snap.week_end
+      };
+    }
+  } catch (e) {
+    console.warn('[CONFIG] Error fetching last week win snapshot:', e.message);
+  }
+  return null;
+}
+
 // GET /account/config -> Returns public/user-level settings
 router.get("/config", auth, async (req, res) => {
   try {
     const userId = req.user?.id || req.user?.sub || req.user?.userId;
 
-    const settingsRes = await pool.query(`
-      SELECT key, value FROM global_settings 
-      WHERE key IN ('current_giveaway_version', 'welcome_bonus_active', 'welcome_bonus_amount', 'referral_enabled', 'rooms_locked')
-    `);
-    
-    // Also fetch the active promo popup
-    const popupRes = await pool.query(`
-      SELECT image_url, display_duration, expires_at, is_active 
-      FROM promo_popups 
-      WHERE is_active = true 
-      ORDER BY created_at DESC 
-      LIMIT 1
-    `);
-    const config = {};
-    for (const r of settingsRes.rows) {
-      // Postgres jsonb might already be parsed depending on driver, but we'll be safe
-      config[r.key] = typeof r.value === 'string' ? JSON.parse(r.value) : r.value;
-    }
-
-    // Check if the current user has an unacknowledged win (top 3) from last week's snapshot
-    let previousWeekWin = null;
-    let payoutPending = false;
-    try {
-      const lastSnapshotRes = await pool.query(`
-        SELECT id, rank, prize_amount, week_start, week_end 
-        FROM leaderboard_snapshots 
-        WHERE user_id = $1 AND prize_status = 'approved' AND rank <= 3
-        ORDER BY week_start DESC 
-        LIMIT 1
-      `, [userId]);
-      
-      if (lastSnapshotRes.rows.length > 0) {
-        const snap = lastSnapshotRes.rows[0];
-        previousWeekWin = {
-          snapshotId: snap.id,
-          rank: Number(snap.rank),
-          prize: Number(snap.prize_amount),
-          weekStart: snap.week_start,
-          weekEnd: snap.week_end
-        };
-      }
-
-      // Check if there are any pending snapshots (i.e. manual review is in progress)
-      const pendingRes = await pool.query(`
-        SELECT 1 FROM leaderboard_snapshots 
-        WHERE prize_status = 'pending' 
-        LIMIT 1
-      `);
-      payoutPending = pendingRes.rows.length > 0;
-    } catch (e) {
-      console.warn('[CONFIG] Error fetching last week win snapshot:', e.message);
-    }
+    const [{ config, promoPopupConfig, payoutPending }, previousWeekWin] = await Promise.all([
+      getGlobalAccountConfig(),
+      fetchUserPreviousWeekWin(userId),
+    ]);
     
     // Cache for 60s — this endpoint is called from 3 UI locations on every page load
     // and the data (giveaway version, rooms_locked, etc.) changes very rarely.
@@ -514,7 +543,7 @@ router.get("/config", auth, async (req, res) => {
       welcome_bonus_active: config.welcome_bonus_active === true || config.welcome_bonus_active === 'true',
       welcome_bonus_amount: Number(config.welcome_bonus_amount || 10),
       referral_enabled: config.referral_enabled !== false && config.referral_enabled !== 'false', // default true if not set
-      promo_popup_config: popupRes.rows.length > 0 ? popupRes.rows[0] : null,
+      promo_popup_config: promoPopupConfig,
       previousWeekWin,
       payoutPending,
       rooms_locked: config.rooms_locked === true || config.rooms_locked === 'true' // default false if not set
@@ -647,6 +676,10 @@ router.post('/redeem-code', auth, async (req, res) => {
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
+router.invalidateAccountConfigCache = () => {
+  _accountGlobalConfigCache = { data: null, expiresAt: 0 };
+};
 
 module.exports = router;
 

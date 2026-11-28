@@ -14,6 +14,7 @@
 --   DROP INDEX CONCURRENTLY IF EXISTS idx_spin_bets_user_bot_round;
 --   DROP INDEX CONCURRENTLY IF EXISTS idx_spin_rounds_winner_status;
 --   DROP INDEX CONCURRENTLY IF EXISTS idx_payment_tx_user_status_bank;
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_leaderboard_snapshots_user_status_rank;
 -- ============================================================================
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_notifications_user_read_created
@@ -27,4 +28,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_spin_rounds_winner_status
   WHERE winner_user_id IS NOT NULL;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_payment_tx_user_status_bank
-  ON public.payment_transactions (user_id, status, bank);
+  ON public.payment_transactions (user_id, status, bank)
+  INCLUDE (amount);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leaderboard_snapshots_user_status_rank
+  ON public.leaderboard_snapshots (user_id, prize_status, rank, week_start DESC);

@@ -10,6 +10,64 @@ const router = express.Router();
 let _dauDay = '';
 const _dauLoggedUsers = new Set();
 
+// Short-TTL in-memory cache for historical match counts ONLY (never cache wallet balances)
+const _userStatsCache = new Map();
+const USER_STATS_TTL_MS = 15_000;
+const USER_STATS_MAX = 5000;
+
+async function getUserMatchStats(userId) {
+  const key = String(userId);
+  const now = Date.now();
+  const cached = _userStatsCache.get(key);
+  if (cached && now < cached.expiresAt) {
+    return cached.stats;
+  }
+
+  const coreStatsQuery = `SELECT
+      (SELECT COUNT(*) FROM games WHERE player_x = $1 OR player_o = $1) AS xo_games,
+      (SELECT COUNT(*) FROM games WHERE winner = $1) AS xo_wins,
+      (SELECT COUNT(*) FROM spin_bets sb JOIN spin_rounds sr ON sb.round_id = sr.id WHERE sb.user_id = $1::uuid AND sb.is_bot = false AND sr.status IN ('paid', 'completed', 'finished')) AS spin_games,
+      (SELECT COUNT(*) FROM spin_rounds WHERE winner_user_id = $1::uuid AND status IN ('paid', 'completed', 'finished')) AS spin_wins`;
+
+  const rpsStatsQuery = `SELECT
+      (SELECT COUNT(*) FROM rps_games WHERE (player_1 = $1::uuid OR player_2 = $1::uuid) AND status IN ('completed', 'finished', 'paid')) AS rps_games,
+      (SELECT COUNT(*) FROM rps_games WHERE winner_id = $1::uuid AND status IN ('completed', 'finished', 'paid')) AS rps_wins`;
+
+  const [coreRes, rpsRes] = await Promise.all([
+    pool.query(coreStatsQuery, [userId]),
+    pool.query(rpsStatsQuery, [userId])
+      .then((r) => ({ ok: true, row: r.rows[0] || {} }))
+      .catch((err) => {
+        if (err.code === '42P01' || (err.message && err.message.includes('rps_games') && err.message.includes('does not exist'))) {
+          return { ok: false, row: { rps_games: 0, rps_wins: 0 } };
+        }
+        throw err;
+      }),
+  ]);
+
+  const core = coreRes.rows[0] || {};
+  const rps = rpsRes.row || {};
+  const stats = {
+    xo_games: Number(core.xo_games || 0),
+    xo_wins: Number(core.xo_wins || 0),
+    spin_games: Number(core.spin_games || 0),
+    spin_wins: Number(core.spin_wins || 0),
+    rps_games: Number(rps.rps_games || 0),
+    rps_wins: Number(rps.rps_wins || 0),
+  };
+
+  // Only cache when rps_games query succeeded cleanly (so applying migration_009 takes effect immediately)
+  if (rpsRes.ok) {
+    if (_userStatsCache.size >= USER_STATS_MAX) {
+      const oldestKey = _userStatsCache.keys().next().value;
+      _userStatsCache.delete(oldestKey);
+    }
+    _userStatsCache.set(key, { stats, expiresAt: now + USER_STATS_TTL_MS });
+  }
+
+  return stats;
+}
+
 function trackDailyUserEntry(userId) {
   const today = new Date().toISOString().slice(0, 10);
   if (today !== _dauDay) {
@@ -91,17 +149,9 @@ router.get('/me', auth, async (req, res) => {
       LIMIT 1;
     `;
 
-    const statsQuery = `SELECT
-        (SELECT COUNT(*) FROM games WHERE player_x = $1 OR player_o = $1) AS xo_games,
-        (SELECT COUNT(*) FROM games WHERE winner = $1) AS xo_wins,
-        (SELECT COUNT(*) FROM spin_bets sb JOIN spin_rounds sr ON sb.round_id = sr.id WHERE sb.user_id = $1::uuid AND sb.is_bot = false AND sr.status IN ('paid', 'completed', 'finished')) AS spin_games,
-        (SELECT COUNT(*) FROM spin_rounds WHERE winner_user_id = $1::uuid AND status IN ('paid', 'completed', 'finished')) AS spin_wins,
-        (SELECT COUNT(*) FROM rps_games WHERE (player_1 = $1::uuid OR player_2 = $1::uuid) AND status IN ('completed', 'finished', 'paid')) AS rps_games,
-        (SELECT COUNT(*) FROM rps_games WHERE winner_id = $1::uuid AND status IN ('completed', 'finished', 'paid')) AS rps_wins`;
-
-    const [{ rows }, { rows: countStats }] = await Promise.all([
+    const [{ rows }, st] = await Promise.all([
       pool.query(query, [userId]),
-      pool.query(statsQuery, [userId]),
+      getUserMatchStats(userId),
     ]);
     if (!rows.length) {
       return res.status(404).json({ error: 'User not found' });
@@ -109,20 +159,23 @@ router.get('/me', auth, async (req, res) => {
 
     let user = rows[0];
 
-    // Auto-heal missing welcome bonus if never claimed
+    // Auto-heal missing welcome bonus if never claimed and welcome bonus is active
     if (Number(user.claimed_giveaway_version || 0) < 1) {
       try {
-        const { applyNewUserGiveaways } = require('../models/payments.service');
-        await applyNewUserGiveaways(userId);
-        const refetch = await pool.query(query, [userId]);
-        if (refetch.rows.length) {
-          user = refetch.rows[0];
+        const welcomeActive = await getGlobalSetting('welcome_bonus_active', true);
+        const isWelcomeActive = welcomeActive === true || welcomeActive === 'true' || welcomeActive === 1 || welcomeActive === '1';
+        if (isWelcomeActive) {
+          const { applyNewUserGiveaways } = require('../models/payments.service');
+          await applyNewUserGiveaways(userId);
+          const refetch = await pool.query(query, [userId]);
+          if (refetch.rows.length) {
+            user = refetch.rows[0];
+          }
         }
       } catch (giveawayErr) {
         console.warn('[AUTO_GIVEAWAY_HEAL_ERR]', giveawayErr.message);
       }
     }
-    const st = countStats[0] || {};
     const totalGames = Number(st.xo_games || 0) + Number(st.spin_games || 0) + Number(st.rps_games || 0);
     const totalWins = Number(st.xo_wins || 0) + Number(st.spin_wins || 0) + Number(st.rps_wins || 0);
 
@@ -254,4 +307,5 @@ router.get('/referral-stats', auth, async (req, res) => {
 });
 
 
+router._clearUserStatsCache = () => _userStatsCache.clear();
 module.exports = router;

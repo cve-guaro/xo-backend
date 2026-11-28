@@ -8,6 +8,19 @@ const jwt = require('jsonwebtoken');
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || process.env.JWT_PUBLIC_KEY;
 
+// Short-TTL bounded in-memory cache for unread badge count (10s)
+const _unreadCountCache = new Map();
+const UNREAD_COUNT_TTL_MS = 10_000;
+const UNREAD_COUNT_MAX = 5000;
+
+function invalidateUnreadCountCache(userId) {
+  if (userId) {
+    _unreadCountCache.delete(String(userId));
+  } else {
+    _unreadCountCache.clear();
+  }
+}
+
 // ──────────────────────────────────────────────
 // Middleware: extract userId from JWT for user routes
 // ──────────────────────────────────────────────
@@ -34,28 +47,34 @@ router.get('/user', authUser, async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 50), 100);
     const offset = Number(req.query.offset || 0);
 
-    let { rows } = await pool.query(`
+    const listQuery = `
       SELECT id, type, title, message, read, meta, created_at
       FROM notifications
       WHERE user_id = $1
       ORDER BY created_at DESC
       LIMIT $2 OFFSET $3
-    `, [req.userId, limit, offset]);
+    `;
+    const countQuery = `SELECT COUNT(*) as total FROM notifications WHERE user_id = $1`;
+
+    let [listRes, countRes] = await Promise.all([
+      pool.query(listQuery, [req.userId, limit, offset]),
+      pool.query(countQuery, [req.userId]),
+    ]);
+    let { rows } = listRes;
 
     if (rows.length === 0 && offset === 0) {
       await pool.query(`
         INSERT INTO notifications (user_id, type, title, message, meta)
         VALUES ($1, 'welcome', '👋 Welcome to XO Ethiopia!', 'Play XO and Spin games to win real prizes daily. Good luck!', '{}'::jsonb)
       `, [req.userId]).catch(() => {});
+      invalidateUnreadCountCache(req.userId);
 
-      const retry = await pool.query(`
-        SELECT id, type, title, message, read, meta, created_at
-        FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
-      `, [req.userId, limit, offset]);
-      rows = retry.rows;
+      [listRes, countRes] = await Promise.all([
+        pool.query(listQuery, [req.userId, limit, offset]),
+        pool.query(countQuery, [req.userId]),
+      ]);
+      rows = listRes.rows;
     }
-
-    const countRes = await pool.query(`SELECT COUNT(*) as total FROM notifications WHERE user_id = $1`, [req.userId]);
 
     return res.json({
       ok: true,
@@ -75,8 +94,21 @@ router.get('/user', authUser, async (req, res) => {
 // GET /notifications/user/unread-count — badge number
 router.get('/user/unread-count', authUser, async (req, res) => {
   try {
+    const uid = String(req.userId);
+    const now = Date.now();
+    const cached = _unreadCountCache.get(uid);
+    if (cached && now < cached.expiresAt) {
+      return res.json({ ok: true, count: cached.count });
+    }
+
     const { rows } = await pool.query(`SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND read = false`, [req.userId]);
-    return res.json({ ok: true, count: Number(rows[0].count) });
+    const count = Number(rows[0].count);
+    if (_unreadCountCache.size >= UNREAD_COUNT_MAX) {
+      const oldestKey = _unreadCountCache.keys().next().value;
+      _unreadCountCache.delete(oldestKey);
+    }
+    _unreadCountCache.set(uid, { count, expiresAt: now + UNREAD_COUNT_TTL_MS });
+    return res.json({ ok: true, count });
   } catch (err) {
     return res.status(500).json({ error: 'Failed' });
   }
@@ -86,6 +118,7 @@ router.get('/user/unread-count', authUser, async (req, res) => {
 router.patch('/user/:id/read', authUser, async (req, res) => {
   try {
     await pool.query(`UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2`, [req.params.id, req.userId]);
+    invalidateUnreadCountCache(req.userId);
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: 'Failed' });
@@ -96,6 +129,7 @@ router.patch('/user/:id/read', authUser, async (req, res) => {
 router.patch('/user/read-all', authUser, async (req, res) => {
   try {
     await pool.query(`UPDATE notifications SET read = true WHERE user_id = $1 AND read = false`, [req.userId]);
+    invalidateUnreadCountCache(req.userId);
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: 'Failed' });
@@ -121,6 +155,7 @@ router.post('/admin/send', adminAuth, async (req, res) => {
         INSERT INTO notifications (user_id, type, title, message, meta)
         VALUES ($1, $2, $3, $4, $5)
       `, [uid, type || 'admin_message', title, message, meta ? JSON.stringify(meta) : null]);
+      invalidateUnreadCountCache(uid);
       sent++;
     }
 
@@ -154,6 +189,7 @@ router.post('/admin/send-by-phone', adminAuth, async (req, res) => {
       INSERT INTO notifications (user_id, type, title, message, meta)
       VALUES ($1, $2, $3, $4, $5)
     `, [user.id, type || 'admin_message', title, message, meta ? JSON.stringify(meta) : null]);
+    invalidateUnreadCountCache(user.id);
 
     return res.json({ ok: true, sent: 1, user: { id: user.id, username: user.username, number: user.number } });
   } catch (err) {
@@ -172,6 +208,7 @@ router.post('/admin/broadcast', adminAuth, async (req, res) => {
       INSERT INTO notifications (user_id, type, title, message, meta)
       SELECT id, $1, $2, $3, $4 FROM users WHERE banned = false
     `, [type || 'broadcast', title, message, meta ? JSON.stringify(meta) : null]);
+    invalidateUnreadCountCache();
 
     return res.json({ ok: true, sent: result.rowCount });
   } catch (err) {
@@ -235,4 +272,5 @@ router.get('/admin/refund-log', adminAuth, async (req, res) => {
   }
 });
 
+router.invalidateUnreadCountCache = invalidateUnreadCountCache;
 module.exports = router;

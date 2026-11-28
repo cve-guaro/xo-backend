@@ -23,6 +23,27 @@ function getWeekBounds() {
 // Short-TTL in-process caches to avoid sequential DB storms on Redis fallback
 const _weeklyLeaderboardCache = new Map();
 let _leaderboardSettingsCache = { data: null, expiresAt: 0 };
+let _payoutPendingCache = { value: false, expiresAt: 0 };
+
+async function getPayoutPendingFlag() {
+  const now = Date.now();
+  if (now < _payoutPendingCache.expiresAt) {
+    return _payoutPendingCache.value;
+  }
+  try {
+    const pendingRes = await pool.query(`
+      SELECT 1 FROM leaderboard_snapshots 
+      WHERE prize_status = 'pending' 
+      LIMIT 1
+    `);
+    const val = pendingRes.rows.length > 0;
+    _payoutPendingCache = { value: val, expiresAt: now + 15_000 };
+    return val;
+  } catch (e) {
+    console.warn('[LEADERBOARD] Error fetching pending snapshot:', e.message);
+    return false;
+  }
+}
 
 // ─── Helper: Get global settings ────────
 async function getSettings(keys) {
@@ -103,60 +124,124 @@ router.get('/weekly', auth, async (req, res) => {
       `;
       const countParams = [weekStart.toISOString(), weekEnd.toISOString()];
       if (search) {
-        countQuery += ` AND (u.username ILIKE $3 OR u.phone_number ILIKE $3)`;
+        countQuery += ` AND (u.username ILIKE $3 OR u.number ILIKE $3)`;
         countParams.push(`%${search}%`);
       }
 
-      // 2. Paginated list
-      let itemsQuery = `
-        SELECT 
-          u.id::text as id,
-          u.username,
-          u.avatar,
-          COUNT(*) AS wins,
-          COALESCE((
-            SELECT SUM(amount) FROM payment_transactions 
-            WHERE user_id = u.id AND bank IN ('GAME_WIN', 'SPIN_PRIZE', 'WIN') AND status = 'success'
-          ), COUNT(*) * 50) AS win_amount
-        FROM games g
-        JOIN users u ON u.id = g.winner
-        WHERE g.status IN ('completed', 'finished')
-          AND g.winner IS NOT NULL
-          AND COALESCE(u.is_bot, false) = false
-          AND g.created_at >= $1 AND g.created_at <= $2
-      `;
+      // 2. Paginated list (CTE + grouped LEFT JOIN eliminates correlated subquery N+1)
       const itemsParams = [weekStart.toISOString(), weekEnd.toISOString()];
+      let searchClause = '';
       if (search) {
-        itemsQuery += ` AND (u.username ILIKE $3 OR u.phone_number ILIKE $3)`;
+        searchClause = ` AND (u.username ILIKE $3 OR u.number ILIKE $3)`;
         itemsParams.push(`%${search}%`);
       }
-      itemsQuery += `
-        GROUP BY u.id, u.username, u.avatar
-        ORDER BY wins DESC, MAX(g.created_at) ASC
-        LIMIT $${itemsParams.length + 1} OFFSET $${itemsParams.length + 2}
-      `;
+      const limitParamIdx = itemsParams.length + 1;
+      const offsetParamIdx = itemsParams.length + 2;
       itemsParams.push(limit, offset);
 
-      // 3. Top 3 global winners for podium
+      const itemsCte = `
+        WITH ranked AS (
+          SELECT
+            u.id,
+            u.username,
+            u.avatar,
+            COUNT(*) AS wins,
+            MAX(g.created_at) AS last_win_at
+          FROM games g
+          JOIN users u ON u.id = g.winner
+          WHERE g.status IN ('completed', 'finished')
+            AND g.winner IS NOT NULL
+            AND COALESCE(u.is_bot, false) = false
+            AND g.created_at >= $1 AND g.created_at <= $2
+            ${searchClause}
+          GROUP BY u.id, u.username, u.avatar
+          ORDER BY wins DESC, MAX(g.created_at) ASC
+          LIMIT $${limitParamIdx} OFFSET $${offsetParamIdx}
+        )
+      `;
+
+      const itemsQuery = `
+        ${itemsCte}
+        SELECT
+          ranked.id::text AS id,
+          ranked.username,
+          ranked.avatar,
+          ranked.wins,
+          COALESCE(pt.win_sum, ranked.wins * 50) AS win_amount
+        FROM ranked
+        LEFT JOIN (
+          SELECT user_id, SUM(amount) AS win_sum
+          FROM payment_transactions
+          WHERE user_id IN (SELECT id FROM ranked)
+            AND bank IN ('GAME_WIN', 'SPIN_PRIZE', 'WIN')
+            AND status = 'success'
+          GROUP BY user_id
+        ) pt ON pt.user_id = ranked.id
+        ORDER BY ranked.wins DESC, ranked.last_win_at ASC
+      `;
+
+      const fallbackItemsQuery = `
+        ${itemsCte}
+        SELECT
+          ranked.id::text AS id,
+          ranked.username,
+          ranked.avatar,
+          ranked.wins,
+          ranked.wins * 50 AS win_amount
+        FROM ranked
+        ORDER BY ranked.wins DESC, ranked.last_win_at ASC
+      `;
+
+      // 3. Top 3 global winners for podium (skipped when page === 1 && !search && limit >= 3)
+      const canDeriveTop3FromItems = (page === 1 && !search && limit >= 3);
+      const top3Cte = `
+        WITH ranked AS (
+          SELECT
+            u.id,
+            u.username,
+            u.avatar,
+            COUNT(*) AS wins,
+            MAX(g.created_at) AS last_win_at
+          FROM games g
+          JOIN users u ON u.id = g.winner
+          WHERE g.status IN ('completed', 'finished')
+            AND g.winner IS NOT NULL
+            AND COALESCE(u.is_bot, false) = false
+            AND g.created_at >= $1 AND g.created_at <= $2
+          GROUP BY u.id, u.username, u.avatar
+          ORDER BY wins DESC, MAX(g.created_at) ASC
+          LIMIT 3
+        )
+      `;
       const top3Query = `
-        SELECT 
-          u.id::text as id,
-          u.username,
-          u.avatar,
-          COUNT(*) AS wins,
-          COALESCE((
-            SELECT SUM(amount) FROM payment_transactions 
-            WHERE user_id = u.id AND bank IN ('GAME_WIN', 'SPIN_PRIZE', 'WIN') AND status = 'success'
-          ), COUNT(*) * 50) AS win_amount
-        FROM games g
-        JOIN users u ON u.id = g.winner
-        WHERE g.status IN ('completed', 'finished')
-          AND g.winner IS NOT NULL
-          AND COALESCE(u.is_bot, false) = false
-          AND g.created_at >= $1 AND g.created_at <= $2
-        GROUP BY u.id, u.username, u.avatar
-        ORDER BY wins DESC, MAX(g.created_at) ASC
-        LIMIT 3
+        ${top3Cte}
+        SELECT
+          ranked.id::text AS id,
+          ranked.username,
+          ranked.avatar,
+          ranked.wins,
+          COALESCE(pt.win_sum, ranked.wins * 50) AS win_amount
+        FROM ranked
+        LEFT JOIN (
+          SELECT user_id, SUM(amount) AS win_sum
+          FROM payment_transactions
+          WHERE user_id IN (SELECT id FROM ranked)
+            AND bank IN ('GAME_WIN', 'SPIN_PRIZE', 'WIN')
+            AND status = 'success'
+          GROUP BY user_id
+        ) pt ON pt.user_id = ranked.id
+        ORDER BY ranked.wins DESC, ranked.last_win_at ASC
+      `;
+      const fallbackTop3Query = `
+        ${top3Cte}
+        SELECT
+          ranked.id::text AS id,
+          ranked.username,
+          ranked.avatar,
+          ranked.wins,
+          ranked.wins * 50 AS win_amount
+        FROM ranked
+        ORDER BY ranked.wins DESC, ranked.last_win_at ASC
       `;
 
       const fetchItems = async () => {
@@ -166,10 +251,6 @@ router.get('/weekly', auth, async (req, res) => {
         } catch (err) {
           if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
             console.warn('[LEADERBOARD] payment_transactions missing, falling back to count * 50');
-            const fallbackItemsQuery = itemsQuery.replace(
-              /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
-              'COUNT(*) * 50 AS win_amount'
-            );
             const queryRes = await pool.query(fallbackItemsQuery, itemsParams);
             return queryRes.rows;
           }
@@ -183,10 +264,6 @@ router.get('/weekly', auth, async (req, res) => {
           return top3Res.rows;
         } catch (err) {
           if (err.code === '42P01' || (err.message && err.message.includes('payment_transactions'))) {
-            const fallbackTop3Query = top3Query.replace(
-              /COALESCE\([\s\S]*?COUNT\(\*\)\s*\*\s*50\)\s*AS\s*win_amount/,
-              'COUNT(*) * 50 AS win_amount'
-            );
             const top3Res = await pool.query(fallbackTop3Query, [weekStart.toISOString(), weekEnd.toISOString()]);
             return top3Res.rows;
           }
@@ -197,7 +274,7 @@ router.get('/weekly', auth, async (req, res) => {
       const [countRes, rows, top3Rows] = await Promise.all([
         pool.query(countQuery, countParams),
         fetchItems(),
-        fetchTop3(),
+        canDeriveTop3FromItems ? Promise.resolve(null) : fetchTop3(),
       ]);
 
       total = parseInt(countRes.rows[0]?.total || 0);
@@ -211,14 +288,16 @@ router.get('/weekly', auth, async (req, res) => {
         rank: offset + idx + 1
       }));
 
-      top3Base = top3Rows.map((r, idx) => ({
-        id: r.id,
-        username: r.username,
-        avatar: r.avatar,
-        wins: Number(r.wins),
-        winAmount: Number(r.win_amount || 0),
-        rank: idx + 1
-      }));
+      top3Base = canDeriveTop3FromItems
+        ? realListBase.slice(0, 3).map((u, idx) => ({ ...u, rank: idx + 1 }))
+        : top3Rows.map((r, idx) => ({
+            id: r.id,
+            username: r.username,
+            avatar: r.avatar,
+            wins: Number(r.wins),
+            winAmount: Number(r.win_amount || 0),
+            rank: idx + 1
+          }));
 
       const cachePayload = { total, realListBase, top3Base };
       if (_weeklyLeaderboardCache.size > 50) _weeklyLeaderboardCache.clear();
@@ -231,14 +310,12 @@ router.get('/weekly', auth, async (req, res) => {
     const realList = realListBase.map(u => ({ ...u, isMe: u.id === userId }));
     const top3 = top3Base.map(u => ({ ...u, isMe: u.id === userId }));
 
-    // Find current user's rank
+    // Find current user's rank + snapshot state in parallel
     const meInList = realList.find(u => u.isMe);
-    let myRank = null;
 
-    if (meInList) {
-      myRank = meInList;
-    } else {
-      // Calculate user's wins
+    const resolveMyRank = async () => {
+      if (meInList) return meInList;
+
       const { rows: myData } = await pool.query(`
         SELECT COUNT(*) AS wins
         FROM games g
@@ -248,33 +325,8 @@ router.get('/weekly', auth, async (req, res) => {
       `, [userId, weekStart.toISOString(), weekEnd.toISOString()]);
 
       const myWins = Number(myData[0]?.wins || 0);
-
-      if (myWins > 0) {
-        // Count real users above
-        const { rows: realAbove } = await pool.query(`
-          SELECT COUNT(DISTINCT g.winner) AS cnt
-          FROM games g
-          WHERE g.winner != $1
-            AND g.status IN ('completed', 'finished')
-            AND g.created_at >= $2 AND g.created_at <= $3
-          GROUP BY g.winner
-          HAVING COUNT(*) > $4
-        `, [userId, weekStart.toISOString(), weekEnd.toISOString(), myWins]);
-
-        const rankCount = realAbove.length || 0;
-        const actualRank = rankCount + 1;
-        const { rows: meInfo } = await pool.query(`SELECT username, avatar FROM users WHERE id = $1`, [userId]);
-
-        myRank = {
-          id: userId,
-          username: meInfo[0]?.username || 'You',
-          avatar: meInfo[0]?.avatar || null,
-          wins: myWins,
-          rank: actualRank,
-          isMe: true,
-        };
-      } else {
-        myRank = {
+      if (myWins <= 0) {
+        return {
           id: userId,
           username: 'You',
           avatar: null,
@@ -283,7 +335,64 @@ router.get('/weekly', auth, async (req, res) => {
           isMe: true,
         };
       }
-    }
+
+      const [{ rows: realAbove }, { rows: meInfo }] = await Promise.all([
+        pool.query(`
+          SELECT COUNT(*)::int AS cnt FROM (
+            SELECT g.winner
+            FROM games g
+            WHERE g.winner != $1
+              AND g.status IN ('completed', 'finished')
+              AND g.created_at >= $2 AND g.created_at <= $3
+            GROUP BY g.winner
+            HAVING COUNT(*) > $4
+          ) sub
+        `, [userId, weekStart.toISOString(), weekEnd.toISOString(), myWins]),
+        pool.query(`SELECT username, avatar FROM users WHERE id = $1`, [userId]),
+      ]);
+
+      const rankCount = Number(realAbove[0]?.cnt || 0);
+      return {
+        id: userId,
+        username: meInfo[0]?.username || 'You',
+        avatar: meInfo[0]?.avatar || null,
+        wins: myWins,
+        rank: rankCount + 1,
+        isMe: true,
+      };
+    };
+
+    const fetchLastSnapshot = async () => {
+      try {
+        const lastSnapshotRes = await pool.query(`
+          SELECT id, rank, prize_amount, week_start, week_end 
+          FROM leaderboard_snapshots 
+          WHERE user_id = $1 AND prize_status = 'approved' AND rank <= 3
+          ORDER BY week_start DESC 
+          LIMIT 1
+        `, [userId]);
+
+        if (lastSnapshotRes.rows.length > 0) {
+          const snap = lastSnapshotRes.rows[0];
+          return {
+            snapshotId: snap.id,
+            rank: Number(snap.rank),
+            prize: Number(snap.prize_amount),
+            weekStart: snap.week_start,
+            weekEnd: snap.week_end
+          };
+        }
+      } catch (e) {
+        console.warn('[LEADERBOARD] Error fetching last week win snapshot:', e.message);
+      }
+      return null;
+    };
+
+    const [myRank, previousWeekWin, payoutPending] = await Promise.all([
+      resolveMyRank(),
+      fetchLastSnapshot(),
+      getPayoutPendingFlag(),
+    ]);
 
     // Prizes list
     const prizes = [
@@ -296,40 +405,6 @@ router.get('/weekly', auth, async (req, res) => {
     const nextSunday = new Date(weekEnd);
     nextSunday.setUTCMilliseconds(nextSunday.getUTCMilliseconds() + 1);
     const secondsRemaining = Math.max(0, Math.floor((nextSunday.getTime() - Date.now()) / 1000));
-
-    // Check if the current user has an unacknowledged win (top 3) from last week's snapshot
-    let previousWeekWin = null;
-    let payoutPending = false;
-    try {
-      const lastSnapshotRes = await pool.query(`
-        SELECT id, rank, prize_amount, week_start, week_end 
-        FROM leaderboard_snapshots 
-        WHERE user_id = $1 AND prize_status = 'approved' AND rank <= 3
-        ORDER BY week_start DESC 
-        LIMIT 1
-      `, [userId]);
-      
-      if (lastSnapshotRes.rows.length > 0) {
-        const snap = lastSnapshotRes.rows[0];
-        previousWeekWin = {
-          snapshotId: snap.id,
-          rank: Number(snap.rank),
-          prize: Number(snap.prize_amount),
-          weekStart: snap.week_start,
-          weekEnd: snap.week_end
-        };
-      }
-
-      // Check if there are any pending snapshots (i.e. manual review is in progress)
-      const pendingRes = await pool.query(`
-        SELECT 1 FROM leaderboard_snapshots 
-        WHERE prize_status = 'pending' 
-        LIMIT 1
-      `);
-      payoutPending = pendingRes.rows.length > 0;
-    } catch (e) {
-      console.warn('[LEADERBOARD] Error fetching last week win snapshot:', e.message);
-    }
 
     res.json({
       leaderboard: realList,
@@ -927,5 +1002,11 @@ router.get('/alltime', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch alltime leaderboard' });
   }
 });
+
+router._clearLeaderboardCaches = () => {
+  _weeklyLeaderboardCache.clear();
+  _leaderboardSettingsCache = { data: null, expiresAt: 0 };
+  _payoutPendingCache = { value: false, expiresAt: 0 };
+};
 
 module.exports = router;
