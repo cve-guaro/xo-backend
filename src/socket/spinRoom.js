@@ -13,9 +13,18 @@ const { pool, redis, getGlobalSetting } = require("../db/index");
 const { debitWager, creditWinnings, refundWager, calculateSpinPrize } = require("../services/spinWalletService");
 const { scheduleBotFill, getBot } = require("./spinBot");
 const { createRealHouseScheduler } = require("./spinHouseScheduler");
+const { getUserActiveGame, registerActiveGameProviders } = require("../services/activeGameService");
+const {
+  cleanupSpinRoundInteractions,
+  createSpinInvite,
+  respondToSpinInvite,
+  createSpinFriendRequest,
+  respondToSpinFriendRequest,
+} = require("../services/friendService");
 
 const LOG_PREFIX = "[SPIN_ROOM]";
 const JWT_SECRET = process.env.JWT_SECRET;
+const INACTIVE_SPIN_STATUSES = new Set(["resolved", "paid", "cancelled"]);
 
 // ── In-memory state ────────────────────────────────────────────────────────
 // activeSpinRounds: Map<roundId, RoundState>
@@ -23,6 +32,53 @@ const activeSpinRounds = new Map();
 
 // playerToRound: Map<userId, roundId> — prevents double-joining
 const playerToRound = new Map();
+
+function getUserSpinRound(userId) {
+  if (!userId) return null;
+  const uid = String(userId);
+  const candidateIds = [
+    playerToRound.get(uid),
+    playerToRound.get(`${uid}:1`),
+    playerToRound.get(`${uid}:2`),
+  ].filter(Boolean);
+
+  for (const rid of candidateIds) {
+    const round = activeSpinRounds.get(rid);
+    if (
+      round &&
+      !INACTIVE_SPIN_STATUSES.has(round.status) &&
+      Array.isArray(round.players) &&
+      round.players.some((p) => !p.isBot && String(p.userId) === uid)
+    ) {
+      return round;
+    }
+  }
+
+  for (const round of activeSpinRounds.values()) {
+    if (!round || INACTIVE_SPIN_STATUSES.has(round.status)) continue;
+    if (Array.isArray(round.players) && round.players.some((p) => !p.isBot && String(p.userId) === uid)) {
+      return round;
+    }
+  }
+  return null;
+}
+
+function isPlayerInSpin(userId) {
+  return Boolean(getUserSpinRound(userId));
+}
+
+function isUserInSpinRound(userId, roundId) {
+  if (!userId || !roundId) return false;
+  const uid = String(userId);
+  const round = activeSpinRounds.get(String(roundId));
+  if (!round || INACTIVE_SPIN_STATUSES.has(round.status)) return false;
+  return Array.isArray(round.players) && round.players.some((p) => !p.isBot && String(p.userId) === uid);
+}
+
+registerActiveGameProviders({
+  getSpinActiveRound: getUserSpinRound,
+  isUserInCurrentSpinRound: isUserInSpinRound,
+});
 
 // ── Round state shape ──────────────────────────────────────────────────────
 // {
@@ -647,6 +703,7 @@ function cleanupRound(round) {
     round.watchdogTimer = null;
   }
   activeSpinRounds.delete(round.id);
+  cleanupSpinRoundInteractions(round.id);
   console.log(`${LOG_PREFIX} Cleaned up round=${round.id}`);
 }
 
@@ -780,6 +837,86 @@ async function addPlayerToRound(io, round, { userId, username, isBot, avatar, st
   return { seatIndex, roundId: round.id };
 }
 
+function ensureSocketUserRoom(socket, userId) {
+  if (!socket || !userId) return;
+  const uid = String(userId);
+  socket.data = { ...(socket.data || {}), userId: uid };
+  try {
+    socket.join?.(`user:${uid}`);
+  } catch {}
+}
+
+function isTargetUserOnline(io, targetUserId) {
+  const uid = String(targetUserId);
+  try {
+    const { isUserOnline } = require("./game");
+    if (isUserOnline(uid)) return true;
+  } catch {}
+  const room = io?.sockets?.adapter?.rooms?.get(`user:${uid}`);
+  if (room && room.size > 0) return true;
+  if (io?.sockets?.sockets) {
+    for (const s of io.sockets.sockets.values()) {
+      if (s && !s.disconnected && String(s.data?.userId) === uid) return true;
+    }
+  }
+  return false;
+}
+
+function emitToSpinUser(io, targetUserId, event, payload) {
+  const uid = String(targetUserId);
+  const roomName = `user:${uid}`;
+  try {
+    const { userSockets } = require("./game");
+    const sids = userSockets?.get(uid);
+    if (sids && io?.sockets?.sockets) {
+      for (const sid of sids) {
+        const s = io.sockets.sockets.get(sid);
+        if (s) {
+          try { s.join?.(roomName); } catch {}
+        }
+      }
+    }
+  } catch {}
+
+  if (io && typeof io.to === "function") {
+    io.to(roomName).emit(event, payload);
+    return;
+  }
+
+  try {
+    const { emitToUserEvent } = require("./game");
+    emitToUserEvent?.(uid, event, payload);
+  } catch {}
+}
+
+function resolveSocketAuthUser(socket, data) {
+  const authToken =
+    data?.token ||
+    socket.handshake?.auth?.token ||
+    socket.handshake?.query?.token;
+
+  if (authToken) {
+    try {
+      const decoded = verifyToken(authToken);
+      const userId = decoded?.sub || decoded?.userId || decoded?.id;
+      if (!userId) return null;
+      const uid = String(userId);
+      ensureSocketUserRoom(socket, uid);
+      return { userId: uid, decoded };
+    } catch {
+      return null;
+    }
+  }
+
+  if (socket.data?.userId) {
+    const uid = String(socket.data.userId);
+    ensureSocketUserRoom(socket, uid);
+    return { userId: uid, decoded: {} };
+  }
+
+  return null;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ██  SOCKET.IO SETUP
 // ══════════════════════════════════════════════════════════════════════════════
@@ -807,6 +944,16 @@ function setupSpinSocket(io) {
   }, 60_000);
 
   io.on("connection", (socket) => {
+    // Ensure socket joins personal user room on connect when handshake token is provided
+    try {
+      const handshakeToken = socket.handshake?.auth?.token || socket.handshake?.query?.token;
+      if (handshakeToken) {
+        const decoded = verifyToken(handshakeToken);
+        const uid = decoded?.sub || decoded?.userId || decoded?.id;
+        if (uid) ensureSocketUserRoom(socket, uid);
+      }
+    } catch {}
+
     // ── spin:join ──────────────────────────────────────────────────────
     socket.on("spin:join", async (data, ack) => {
       try {
@@ -823,8 +970,10 @@ function setupSpinSocket(io) {
           return ack?.({ ok: false, error: "AUTH_FAILED" });
         }
 
-        const userId = decoded.sub || decoded.userId || decoded.id;
-        if (!userId) return ack?.({ ok: false, error: "AUTH_FAILED" });
+        const rawUserId = decoded.sub || decoded.userId || decoded.id;
+        if (!rawUserId) return ack?.({ ok: false, error: "AUTH_FAILED" });
+        const userId = String(rawUserId);
+        ensureSocketUserRoom(socket, userId);
 
         // Check if Spin game is globally enabled
         const isEnabled = await getGlobalSetting("spin_game_enabled", true);
@@ -844,7 +993,7 @@ function setupSpinSocket(io) {
         if (playerToRound.has(playerKey)) {
           const existingRoundId = playerToRound.get(playerKey);
           const existingRound = activeSpinRounds.get(existingRoundId);
-          if (existingRound && existingRound.status !== "resolved" && existingRound.status !== "paid" && existingRound.status !== "cancelled") {
+          if (existingRound && !INACTIVE_SPIN_STATUSES.has(existingRound.status)) {
             // Reconnect to existing round
             socket.join(`spin:${existingRoundId}`);
             socket.data = { ...(socket.data || {}), spinRoundId: existingRoundId, userId };
@@ -852,13 +1001,32 @@ function setupSpinSocket(io) {
           }
           // Stale mapping — clean up
           playerToRound.delete(playerKey);
-          playerToRound.delete(userId);
+          if (playerToRound.get(userId) === existingRoundId) {
+            playerToRound.delete(userId);
+          }
         }
 
-        // Check if player is in an XO game
-        const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
-        if (inGame) {
-          return ack?.({ ok: false, error: "ALREADY_IN_GAME" });
+        // Unified active-game guard across Spin, XO, and RPS
+        const activeGame = await getUserActiveGame(userId);
+        if (activeGame.inGame) {
+          if (activeGame.gameType === "spin") {
+            const currentSpin = activeSpinRounds.get(activeGame.roomId);
+            if (currentSpin && currentSpin.configId === config.id && !INACTIVE_SPIN_STATUSES.has(currentSpin.status)) {
+              socket.join(`spin:${currentSpin.id}`);
+              socket.data = { ...(socket.data || {}), spinRoundId: currentSpin.id, userId };
+              return ack?.({ ok: true, reconnect: true, data: buildRoomState(currentSpin) });
+            }
+            return ack?.({
+              ok: false,
+              error: "ALREADY_IN_SPIN_ROUND",
+              message: "You are already in an active Spin round",
+            });
+          }
+          return ack?.({
+            ok: false,
+            error: "ALREADY_IN_GAME",
+            message: `You are already in an active ${String(activeGame.gameType || "game").toUpperCase()} game`,
+          });
         }
 
         // Check Granular 3-Switch Spin Locks
@@ -1141,11 +1309,14 @@ function setupSpinSocket(io) {
 
         if (!round) {
           playerToRound.delete(userId);
+          playerToRound.delete(`${userId}:1`);
+          playerToRound.delete(`${userId}:2`);
           return ack?.({ ok: true });
         }
 
-        const playerIdx = round.players.findIndex(p => p.userId === userId && !p.isBot);
+        const playerIdx = round.players.findIndex(p => String(p.userId) === String(userId) && !p.isBot);
         if (playerIdx === -1) {
+          playerToRound.delete(`${userId}:${round.configId}`);
           playerToRound.delete(userId);
           return ack?.({ ok: true });
         }
@@ -1155,6 +1326,7 @@ function setupSpinSocket(io) {
         // If round is already locked, spinning, resolved, or paid: do not splice players array or refund,
         // because outcome and winning slice index are already fixed. Just detach user.
         if (round.status !== "waiting" && round.status !== "pre_countdown") {
+          playerToRound.delete(`${userId}:${round.configId}`);
           playerToRound.delete(userId);
           socket.leave(`spin:${round.id}`);
           console.log(`${LOG_PREFIX} User ${userId} detached from in-progress/completed round ${round.id} (status: ${round.status})`);
@@ -1359,6 +1531,7 @@ function setupSpinSocket(io) {
 
     // ── Handle voice chat relay ─────────────────────────────────────────
     socket.on("spin:voice_chunk", (data) => {
+      if (!data || !data.chunk) return;
       const userId = socket.data?.userId || data?.userId;
       let roundId = socket.data?.spinRoundId || data?.roundId;
       if (!userId) return;
@@ -1389,7 +1562,7 @@ function setupSpinSocket(io) {
 
       // Host is the first player who joined
       const host = round.players[0];
-      if (!host || host.userId !== userId) {
+      if (!host || String(host.userId) !== String(userId)) {
         return ack?.({ ok: false, error: "NOT_HOST" });
       }
 
@@ -1397,7 +1570,7 @@ function setupSpinSocket(io) {
       if (!targetUserId) return ack?.({ ok: false, error: "INVALID_TARGET" });
 
       // Find target player
-      const targetPlayer = round.players.find(p => p.userId === targetUserId);
+      const targetPlayer = round.players.find(p => String(p.userId) === String(targetUserId));
       if (!targetPlayer) return ack?.({ ok: false, error: "PLAYER_NOT_IN_ROOM" });
       if (targetPlayer.isBot) return ack?.({ ok: false, error: "CANNOT_MUTE_BOT" });
 
@@ -1493,46 +1666,275 @@ function setupSpinSocket(io) {
     // ── spin:invite_friend ──────────────────────────────────────────────
     socket.on("spin:invite_friend", async (data, ack) => {
       try {
-        const { targetUserId, mode, entryAmount, token } = data || {};
-        const authToken = token || socket.handshake.auth?.token;
-        if (!authToken) return ack?.({ ok: false, error: "AUTH_FAILED" });
+        const authUser = resolveSocketAuthUser(socket, data);
+        if (!authUser) return ack?.({ ok: false, error: "AUTH_FAILED", message: "Authentication failed" });
+        const { userId: senderId, decoded } = authUser;
 
-        let decoded;
-        try { decoded = verifyToken(authToken); } catch { return ack?.({ ok: false, error: "AUTH_FAILED" }); }
-        const senderId = decoded.sub || decoded.userId || decoded.id;
+        const { targetUserId, mode, entryAmount, roundId } = data || {};
+        if (!targetUserId) return ack?.({ ok: false, error: "MISSING_TARGET", message: "Target user is required" });
 
-        if (!targetUserId) return ack?.({ ok: false, error: "MISSING_TARGET" });
-        if (String(senderId) === String(targetUserId)) {
-          return ack?.({ ok: false, error: "CANNOT_INVITE_SELF" });
+        const targetUidStr = String(targetUserId);
+        if (senderId === targetUidStr) {
+          return ack?.({ ok: false, error: "CANNOT_INVITE_SELF", message: "You cannot invite yourself" });
         }
 
-        const { isUserOnline, emitToUserEvent } = require("./game");
-        const targetUidStr = String(targetUserId);
-        const online = isUserOnline(targetUidStr);
-        if (!online) {
-          return ack?.({ ok: false, error: "USER_OFFLINE", message: "User is currently offline" });
+        if (!isTargetUserOnline(io, targetUidStr)) {
+          return ack?.({ ok: false, error: "TARGET_OFFLINE", message: "User is currently offline" });
+        }
+
+        const activeRound = getUserSpinRound(senderId);
+        const effectiveRoundId = String(roundId || socket.data?.spinRoundId || activeRound?.id || `lobby:${senderId}`);
+
+        const inviteResult = await createSpinInvite({
+          senderId,
+          targetUserId: targetUidStr,
+          roundId: effectiveRoundId,
+          mode: mode || activeRound?.mode || "5_PLAYER",
+          entryAmount: Number(entryAmount) || activeRound?.betAmount || 100,
+        });
+
+        if (!inviteResult.ok) {
+          return ack?.(inviteResult);
         }
 
         // Fetch sender info
-        const senderRes = await pool.query(
-          `SELECT username, display_name FROM users WHERE id=$1`,
-          [senderId]
-        );
-        const senderName = senderRes.rows[0]?.display_name || senderRes.rows[0]?.username || decoded.username || "A Friend";
+        const senderRes = await pool
+          .query(`SELECT username, display_name FROM users WHERE id = $1`, [senderId])
+          .catch(() => ({ rows: [] }));
+        const senderName =
+          senderRes.rows[0]?.display_name ||
+          senderRes.rows[0]?.username ||
+          decoded?.username ||
+          "A Friend";
 
         // Emit invite to target user's personal room
-        emitToUserEvent(targetUidStr, "spin:invite_received", {
+        emitToSpinUser(io, targetUidStr, "spin:invite_received", {
+          inviteId: inviteResult.invite.inviteId,
+          roundId: inviteResult.invite.roundId,
           fromUserId: senderId,
           fromUsername: senderName,
-          mode: mode || "5_PLAYER",
-          entryAmount: Number(entryAmount) || 100,
+          mode: inviteResult.invite.mode,
+          entryAmount: inviteResult.invite.entryAmount,
           timestamp: Date.now(),
         });
 
-        ack?.({ ok: true, targetUserId: targetUidStr });
+        ack?.({
+          ok: true,
+          targetUserId: targetUidStr,
+          data: {
+            inviteId: inviteResult.invite.inviteId,
+            roundId: inviteResult.invite.roundId,
+            targetUserId: targetUidStr,
+          },
+        });
       } catch (err) {
         console.error(`${LOG_PREFIX} spin:invite_friend error:`, err.message);
-        ack?.({ ok: false, error: err.message });
+        ack?.({ ok: false, error: "INVITE_FAILED", message: err.message });
+      }
+    });
+
+    // ── spin:invite_response (+ legacy aliases spin:invite_accept / spin:invite_decline) ──
+    async function handleInviteResponse(socket, data, ack, forcedAccepted = null) {
+      try {
+        const authUser = resolveSocketAuthUser(socket, data);
+        if (!authUser) return ack?.({ ok: false, error: "AUTH_FAILED", message: "Authentication failed" });
+        const { userId: responderId, decoded } = authUser;
+
+        const isAccepted = forcedAccepted !== null ? forcedAccepted : data?.accepted;
+        if (typeof isAccepted !== "boolean") {
+          return ack?.({ ok: false, error: "INVALID_ACCEPTED", message: "accepted boolean is required" });
+        }
+
+        // Legacy spin:invite_accept / spin:invite_decline pass inviter ID in targetUserId
+        const senderId =
+          data?.senderId ||
+          data?.fromUserId ||
+          (forcedAccepted !== null ? data?.targetUserId : undefined);
+
+        const result = respondToSpinInvite({
+          inviteId: data?.inviteId,
+          roundId: data?.roundId,
+          senderId,
+          responderId,
+          accepted: isAccepted,
+        });
+
+        if (!result.ok) {
+          return ack?.(result);
+        }
+
+        const responderRes = await pool
+          .query(`SELECT username, display_name FROM users WHERE id = $1`, [responderId])
+          .catch(() => ({ rows: [] }));
+        const byUsername =
+          responderRes.rows[0]?.display_name ||
+          responderRes.rows[0]?.username ||
+          decoded?.username ||
+          data?.fromUsername ||
+          "Player";
+
+        if (result.accepted) {
+          emitToSpinUser(io, result.invite.senderId, "spin:invite_accepted", {
+            inviteId: result.invite.inviteId,
+            roundId: result.invite.roundId,
+            targetUserId: responderId,
+            byUsername,
+          });
+        } else {
+          emitToSpinUser(io, result.invite.senderId, "spin:invite_declined", {
+            inviteId: result.invite.inviteId,
+            roundId: result.invite.roundId,
+            targetUserId: responderId,
+            byUsername,
+            rejectionCount: result.rejectionCount,
+            blocked: result.blocked,
+          });
+        }
+
+        ack?.({
+          ok: true,
+          accepted: result.accepted,
+          inviteId: result.invite.inviteId,
+          roundId: result.invite.roundId,
+          rejectionCount: result.rejectionCount,
+          blocked: result.blocked,
+        });
+      } catch (err) {
+        console.error(`${LOG_PREFIX} spin:invite_response error:`, err.message);
+        ack?.({ ok: false, error: "INVITE_RESPONSE_FAILED", message: err.message });
+      }
+    }
+
+    socket.on("spin:invite_response", (data, ack) => handleInviteResponse(socket, data, ack, null));
+    socket.on("spin:invite_accept", (data, ack) => handleInviteResponse(socket, data, ack, true));
+    socket.on("spin:invite_decline", (data, ack) => handleInviteResponse(socket, data, ack, false));
+
+    // ── spin:friend_request ─────────────────────────────────────────────
+    socket.on("spin:friend_request", async (data, ack) => {
+      try {
+        const authUser = resolveSocketAuthUser(socket, data);
+        if (!authUser) return ack?.({ ok: false, error: "AUTH_FAILED", message: "Authentication failed" });
+        const { userId: senderId, decoded } = authUser;
+
+        const { targetUserId, roundId } = data || {};
+        if (!targetUserId) return ack?.({ ok: false, error: "MISSING_TARGET", message: "Target user is required" });
+
+        const targetUidStr = String(targetUserId);
+        if (senderId === targetUidStr) {
+          return ack?.({ ok: false, error: "CANNOT_ADD_SELF", message: "Cannot add yourself as a friend" });
+        }
+
+        if (!isTargetUserOnline(io, targetUidStr)) {
+          return ack?.({ ok: false, error: "TARGET_OFFLINE", message: "User is currently offline" });
+        }
+
+        const activeRound = getUserSpinRound(senderId);
+        const effectiveRoundId = String(roundId || socket.data?.spinRoundId || activeRound?.id || `lobby:${senderId}`);
+
+        const reqResult = await createSpinFriendRequest({
+          senderId,
+          targetUserId: targetUidStr,
+          roundId: effectiveRoundId,
+        });
+
+        if (!reqResult.ok) {
+          return ack?.(reqResult);
+        }
+
+        const senderRes = await pool
+          .query(`SELECT username, display_name FROM users WHERE id = $1`, [senderId])
+          .catch(() => ({ rows: [] }));
+        const senderName =
+          senderRes.rows[0]?.display_name ||
+          senderRes.rows[0]?.username ||
+          decoded?.username ||
+          "Player";
+
+        emitToSpinUser(io, targetUidStr, "spin:friend_request_received", {
+          requestId: reqResult.request.requestId,
+          roundId: reqResult.request.roundId,
+          fromUserId: senderId,
+          fromUsername: senderName,
+          timestamp: Date.now(),
+        });
+
+        ack?.({
+          ok: true,
+          request: reqResult.request,
+          data: {
+            requestId: reqResult.request.requestId,
+            roundId: reqResult.request.roundId,
+            targetUserId: targetUidStr,
+          },
+        });
+      } catch (err) {
+        console.error(`${LOG_PREFIX} spin:friend_request error:`, err.message);
+        ack?.({ ok: false, error: "FRIEND_REQUEST_FAILED", message: err.message });
+      }
+    });
+
+    // ── spin:friend_request_response ────────────────────────────────────
+    socket.on("spin:friend_request_response", async (data, ack) => {
+      try {
+        const authUser = resolveSocketAuthUser(socket, data);
+        if (!authUser) return ack?.({ ok: false, error: "AUTH_FAILED", message: "Authentication failed" });
+        const { userId: responderId, decoded } = authUser;
+
+        const rawAccepted = data?.accepted !== undefined ? data.accepted : data?.accept;
+        if (typeof rawAccepted !== "boolean") {
+          return ack?.({ ok: false, error: "INVALID_ACCEPTED", message: "accepted boolean is required" });
+        }
+
+        const result = await respondToSpinFriendRequest({
+          requestId: data?.requestId,
+          roundId: data?.roundId,
+          senderId: data?.senderId || data?.fromUserId,
+          responderId,
+          accepted: rawAccepted,
+        });
+
+        if (!result.ok) {
+          return ack?.(result);
+        }
+
+        const responderRes = await pool
+          .query(`SELECT username, display_name FROM users WHERE id = $1`, [responderId])
+          .catch(() => ({ rows: [] }));
+        const byUsername =
+          responderRes.rows[0]?.display_name ||
+          responderRes.rows[0]?.username ||
+          decoded?.username ||
+          "Player";
+
+        if (result.accepted) {
+          emitToSpinUser(io, result.request.senderId, "spin:friend_request_accepted", {
+            requestId: result.request.requestId,
+            roundId: result.request.roundId,
+            targetUserId: responderId,
+            byUsername,
+          });
+        } else {
+          emitToSpinUser(io, result.request.senderId, "spin:friend_request_declined", {
+            requestId: result.request.requestId,
+            roundId: result.request.roundId,
+            targetUserId: responderId,
+            byUsername,
+            rejectionCount: result.rejectionCount,
+            blocked: result.blocked,
+          });
+        }
+
+        ack?.({
+          ok: true,
+          accepted: result.accepted,
+          requestId: result.request.requestId,
+          roundId: result.request.roundId,
+          rejectionCount: result.rejectionCount,
+          blocked: result.blocked,
+        });
+      } catch (err) {
+        console.error(`${LOG_PREFIX} spin:friend_request_response error:`, err.message);
+        ack?.({ ok: false, error: "FRIEND_REQUEST_RESPONSE_FAILED", message: err.message });
       }
     });
   });
@@ -1541,5 +1943,10 @@ function setupSpinSocket(io) {
 module.exports = {
   setupSpinSocket,
   activeSpinRounds,
+  playerToRound,
   getSpinConfigs,
+  getUserSpinRound,
+  isPlayerInSpin,
+  isUserInSpinRound,
+  cancelRound,
 };

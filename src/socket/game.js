@@ -6,6 +6,7 @@ const { deductStake } = require("../models/stake");
 require('dotenv').config();
 const { creditPrize } = require('../models/payments.service')
 const { recordFriendship } = require('../services/friendService');
+const { getUserActiveGame, registerActiveGameProviders } = require('../services/activeGameService');
 
 // ---- Debug helpers -------------------------------------------------
 // Opt-in only. Previously defaulted ON whenever NODE_ENV !== 'production', which floods
@@ -132,6 +133,20 @@ function getInitialTimerForBetAmount(betAmount) {
 const queueTimers = new Map();        // socket.id -> timeoutId
 const activeGames = new Map();        // matchId -> game
 const socketSearching = new Map();    // socket.id -> queueKey
+
+registerActiveGameProviders({
+  getXOActiveGame: (uid) => {
+    for (const [matchId, g] of activeGames.entries()) {
+      if (!g || g.finished) continue;
+      const xId = g.players?.X !== undefined && g.players?.X !== null ? String(g.players.X) : null;
+      const oId = g.players?.O !== undefined && g.players?.O !== null ? String(g.players.O) : null;
+      if (xId === uid || oId === uid) {
+        return { id: g.id || matchId, status: g.status || "live" };
+      }
+    }
+    return null;
+  },
+});
 
 // ── IN-MEMORY FALLBACK QUEUE (used when Redis circuit breaker is open) ──────
 // Mirrors Redis queue operations so matchmaking works even during Redis outages.
@@ -373,25 +388,34 @@ const _memFriendInvites = new Map(); // pairKey -> { senderId, senderName, targe
 
 // ── Robust Redis / In-Memory Double-Matchmaking Reservation Lock ────────────────
 async function acquireMatchLocks(userId1, userId2, ttlMs = 10000) {
-  const [inGame1, inGame2] = await Promise.all([
+  const [inGame1, inGame2, active1, active2] = await Promise.all([
     redis.get(`in_game:${userId1}`).catch(() => null),
-    redis.get(`in_game:${userId2}`).catch(() => null)
+    redis.get(`in_game:${userId2}`).catch(() => null),
+    getUserActiveGame(userId1),
+    getUserActiveGame(userId2),
   ]);
 
-  if (inGame1) {
-    if (activeGames.has(inGame1)) {
-      return { ok: false, reason: "IN_GAME", details: { userId1: true, userId2: false } };
-    } else {
-      await redis.del(`in_game:${userId1}`).catch(() => {});
-    }
+  const u1ActiveNonResults =
+    (inGame1 && activeGames.has(inGame1)) ||
+    (active1.inGame && (active1.gameType === "spin" || active1.gameType === "rps" || activeGames.has(active1.roomId)));
+  const u2ActiveNonResults =
+    (inGame2 && activeGames.has(inGame2)) ||
+    (active2.inGame && (active2.gameType === "spin" || active2.gameType === "rps" || activeGames.has(active2.roomId)));
+
+  if (u1ActiveNonResults || u2ActiveNonResults) {
+    return {
+      ok: false,
+      reason: "IN_GAME",
+      details: { userId1: Boolean(u1ActiveNonResults), userId2: Boolean(u2ActiveNonResults) },
+    };
   }
 
-  if (inGame2) {
-    if (activeGames.has(inGame2)) {
-      return { ok: false, reason: "IN_GAME", details: { userId1: false, userId2: true } };
-    } else {
-      await redis.del(`in_game:${userId2}`).catch(() => {});
-    }
+  // Only clean up stale XO in_game keys; never delete RPS or Spin keys
+  if (inGame1 && !activeGames.has(inGame1) && !String(inGame1).startsWith("rps") && !String(inGame1).startsWith("spin")) {
+    await redis.del(`in_game:${userId1}`).catch(() => {});
+  }
+  if (inGame2 && !activeGames.has(inGame2) && !String(inGame2).startsWith("rps") && !String(inGame2).startsWith("spin")) {
+    await redis.del(`in_game:${userId2}`).catch(() => {});
   }
 
   const token = uuidv4();
@@ -1541,7 +1565,7 @@ function setupGameSocket(io) {
         const ctx = `rid=${rid} sid=${socket.id} uid=${userId} bet=${searchAmount} isWeb=${isWeb}`;
         dbg(ctx, "verified token and room");
 
-        // already in a game? -> NON-ERROR resume
+        // already in a game? -> NON-ERROR resume for XO, or block if in Spin/RPS
         const inGame = await redis.get(`in_game:${userId}`).catch(() => null);
         if (inGame) {
           const activeGame = activeGames.get(inGame);
@@ -1582,10 +1606,22 @@ function setupGameSocket(io) {
               opponentUsername
             });
             return;
-          } else {
-            dbg(ctx, "Stale in_game key found in Redis, cleaning up", { inGame });
-            await redis.del(`in_game:${userId}`).catch(() => {});
           }
+        }
+
+        const otherActive = await getUserActiveGame(userId);
+        if (otherActive.inGame && (otherActive.gameType === "spin" || otherActive.gameType === "rps")) {
+          if (typeof ack === "function") ack({ ok: false, error: "ALREADY_IN_GAME", gameType: otherActive.gameType });
+          socket.emit("error", {
+            code: "ALREADY_IN_GAME",
+            message: `You are already in an active ${otherActive.gameType.toUpperCase()} game.`
+          });
+          return;
+        }
+
+        if (inGame && !String(inGame).startsWith("rps") && !String(inGame).startsWith("spin")) {
+          dbg(ctx, "Stale XO in_game key found in Redis, cleaning up", { inGame });
+          await redis.del(`in_game:${userId}`).catch(() => {});
         }
 
         const queueKey = `queue:${searchAmount}`;
@@ -2455,10 +2491,16 @@ function setupGameSocket(io) {
         const target = targetRes.rows[0];
         if (target.id === senderId) return socket.emit("friend_invite_result", { ok: false, reason: "cannot_invite_self" });
 
-        // Online detection: check userSockets map + active socket connections
+        // Online detection + unified active-game guard (XO, Spin, RPS)
         const targetOnline = userSockets.has(target.id) || (io.sockets && Array.from(io.sockets.sockets.values()).some(s => String(s.data?.userId) === String(target.id) && !s.disconnected));
-        const inGame = isRedisUp() ? await redis.get(`in_game:${target.id}`).catch(() => null) : null;
-        const status = inGame ? "in_game" : (targetOnline ? "online" : "offline");
+        const [targetActive, senderActive] = await Promise.all([
+          getUserActiveGame(target.id),
+          getUserActiveGame(senderId),
+        ]);
+        if (!isLookupOnly && senderActive.inGame && (senderActive.gameType !== "xo" || activeGames.has(senderActive.roomId))) {
+          return socket.emit("friend_invite_result", { ok: false, reason: "sender_in_game", gameType: senderActive.gameType });
+        }
+        const status = targetActive.inGame ? "in_game" : (targetOnline ? "online" : "offline");
 
         // Sender balance + caps
         const senderRes = await pool.query(
@@ -2493,7 +2535,12 @@ function setupGameSocket(io) {
 
         socket.emit("friend_invite_result", {
           ok: true,
-          target: { id: target.id, username: target.username, status },
+          target: {
+            id: target.id,
+            username: target.username,
+            status,
+            activeGameType: targetActive.inGame ? targetActive.gameType : null,
+          },
           senderBalance,
           targetBalance,
           senderCaps,
@@ -2605,6 +2652,19 @@ function setupGameSocket(io) {
           const responderName = responderRes.rows[0]?.username || 'Your friend';
           emitToUser(io, senderId, "friend_invite_declined", { byUserId: responderId, byUsername: responderName });
           return;
+        }
+
+        const [senderActive, responderActive] = await Promise.all([
+          getUserActiveGame(senderId),
+          getUserActiveGame(responderId),
+        ]);
+        const senderBlocked = senderActive.inGame && (senderActive.gameType !== "xo" || activeGames.has(senderActive.roomId));
+        const responderBlocked = responderActive.inGame && (responderActive.gameType !== "xo" || activeGames.has(responderActive.roomId));
+        if (senderBlocked || responderBlocked) {
+          return socket.emit("error", {
+            code: "ALREADY_IN_GAME",
+            message: "One of the players is already in an active game",
+          });
         }
 
         if (effectiveGameType === 'rps') {
