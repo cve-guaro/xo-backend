@@ -33,9 +33,11 @@ for (const tier of BET_TIERS) {
 // ── Room lifecycle ───────────────────────────────────────────────────────
 
 /**
- * isPlayerInGame(userId) → roomId | null
+ * getPlayerRoomId(userId) → roomId | null
+ * Returns the active roomId for a player (pruning stale/finished entries).
  */
-function isPlayerInGame(userId) {
+function getPlayerRoomId(userId) {
+  if (!userId) return null;
   const uid = String(userId);
   const roomId = playerToRoom.get(uid);
   if (!roomId) return null;
@@ -49,12 +51,41 @@ function isPlayerInGame(userId) {
 }
 
 /**
+ * isPlayerInQueue(userId) → boolean
+ * Checks matchmaking queues while pruning expired (>120s) entries.
+ */
+function isPlayerInQueue(userId) {
+  if (!userId) return false;
+  const uid = String(userId);
+  const now = Date.now();
+  for (const [, queue] of matchmakingQueues) {
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (now - queue[i].joinedAt > 120_000) {
+        queue.splice(i, 1);
+        continue;
+      }
+      if (queue[i].userId === uid) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * isPlayerInGame(userId) → boolean
+ * Checks both active rooms (playerToRoom) and matchmaking queues.
+ */
+function isPlayerInGame(userId) {
+  if (!userId) return false;
+  return Boolean(getPlayerRoomId(userId)) || isPlayerInQueue(userId);
+}
+
+/**
  * createRoom(player1Id, stakeAmount) → game
  * Creates a room waiting for player 2.
  */
 function createRoom(player1Id, stakeAmount) {
   const uid = String(player1Id);
-  if (isPlayerInGame(uid)) {
+  if (getPlayerRoomId(uid)) {
     throw new Error('ALREADY_IN_GAME');
   }
 
@@ -79,7 +110,7 @@ function createRoom(player1Id, stakeAmount) {
  */
 function joinRoom(roomId, player2Id) {
   const uid = String(player2Id);
-  if (isPlayerInGame(uid)) {
+  if (getPlayerRoomId(uid)) {
     throw new Error('ALREADY_IN_GAME');
   }
 
@@ -107,7 +138,7 @@ function getRoom(roomId) {
  * getPlayerGame(userId) → game | null
  */
 function getPlayerGame(userId) {
-  const roomId = isPlayerInGame(String(userId));
+  const roomId = getPlayerRoomId(userId);
   if (!roomId) return null;
   return activeRooms.get(roomId) || null;
 }
@@ -142,7 +173,7 @@ function enqueue(userId, socketId, stakeAmount) {
     throw new Error(`INVALID_BET: ${stake} is not in [${BET_TIERS.join(', ')}]`);
   }
 
-  if (isPlayerInGame(uid)) {
+  if (getPlayerRoomId(uid)) {
     throw new Error('ALREADY_IN_GAME');
   }
 
@@ -245,6 +276,7 @@ function listActiveRooms() {
 module.exports = {
   activeRooms,
   playerToRoom,
+  getPlayerRoomId,
   isPlayerInGame,
   createRoom,
   joinRoom,

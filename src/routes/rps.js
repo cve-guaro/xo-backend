@@ -46,6 +46,42 @@ router.get('/rooms', adminAuth, (req, res) => {
   });
 });
 
+function formatMatches(rows, userId) {
+  return rows.map((r) => {
+    const isP1 = String(r.player_1) === String(userId);
+    const opponentName = isP1
+      ? (r.p2_display_name || r.p2_username || 'Opponent')
+      : (r.p1_display_name || r.p1_username || 'Opponent');
+    const stakeAmount = Number(r.stake_amount || 0);
+    const potAmount = Number(r.pot_amount || 0);
+    const feeAmount = Number(r.fee_amount || 0);
+    const prizeAmount = Number(r.prize_amount || 0);
+    const scoreP1 = Number(r.score_p1 || 0);
+    const scoreP2 = Number(r.score_p2 || 0);
+    const bestOf = Number(r.best_of || 3);
+
+    return {
+      ...r,
+      stake_amount: stakeAmount,
+      pot_amount: potAmount,
+      fee_amount: feeAmount,
+      prize_amount: prizeAmount,
+      score_p1: scoreP1,
+      score_p2: scoreP2,
+      best_of: bestOf,
+      // CamelCase aliases for frontend consumers (history.tsx / transactions.tsx)
+      winnerId: r.winner_id,
+      betAmount: stakeAmount,
+      stakeAmount,
+      potAmount,
+      feeAmount,
+      prizeAmount,
+      opponentName,
+      createdAt: r.created_at,
+    };
+  });
+}
+
 // ── GET /rps/history ─────────────────────────────────────────────────────
 // Player's recent match history (last 20 matches).
 router.get('/history', auth, async (req, res) => {
@@ -71,8 +107,12 @@ router.get('/history', auth, async (req, res) => {
       LIMIT $2 OFFSET $3
     `, [userId, limit, offset]);
 
-    res.json({ ok: true, matches: rows });
+    const formatted = formatMatches(rows, userId);
+    res.json({ ok: true, matches: formatted, games: formatted });
   } catch (err) {
+    if (err.code === '42P01' || (err.message && err.message.includes('rps_games') && err.message.includes('does not exist'))) {
+      return res.json({ ok: true, matches: [], games: [] });
+    }
     console.error('[RPS] /history error:', err.message);
     res.status(500).json({ ok: false, error: 'Failed to fetch match history' });
   }

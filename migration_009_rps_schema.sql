@@ -60,6 +60,23 @@ CREATE TABLE IF NOT EXISTS public.rps_games (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Idempotent column & unique index upgrades for DBs seeded from full_schema.sql
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS fee_percent INTEGER NOT NULL DEFAULT 20;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS wins_needed INTEGER NOT NULL DEFAULT 2;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS bonus_used_p1 INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS bonus_used_p2 INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS withdrawable_used_p1 INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS withdrawable_used_p2 INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS locked_used_p1 INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS locked_used_p2 INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS prize_amount INTEGER DEFAULT 0;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS payout_idempotency_key VARCHAR(128);
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE public.rps_games ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rps_games_room_id ON public.rps_games(room_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rps_games_payout_idem ON public.rps_games(payout_idempotency_key) WHERE payout_idempotency_key IS NOT NULL;
+
 -- Hot-path indexes
 CREATE INDEX IF NOT EXISTS idx_rps_games_status ON public.rps_games(status);
 CREATE INDEX IF NOT EXISTS idx_rps_games_player_1 ON public.rps_games(player_1);

@@ -29,17 +29,60 @@ const { pool, redis } = require('../../db/index');
 const { deductStake } = require('../../models/stake');
 const { ledgerFirstCredit } = require('../../models/ledgerFirstCredit');
 const {
-  PHASES, TIMINGS, BET_TIERS, FEE_PERCENT,
-  startMatch, startRound, lockChoice, handleTimeout,
+  PHASES, TIMINGS, BET_TIERS, VALID_BETS, FEE_PERCENT,
+  createGame, startMatch, startRound, lockChoice, handleTimeout,
   handleDisconnect, cancelGame, generatePayoutIdempotencyKey,
 } = require('./RPSGame');
 const {
-  enqueue, dequeue, getRoom, cleanupRoom, isPlayerInGame,
-  getQueueSizes, listActiveRooms,
+  activeRooms, playerToRoom,
+  enqueue, dequeue, getRoom, getPlayerRoomId, getPlayerGame,
+  cleanupRoom, isPlayerInGame, getQueueSizes, listActiveRooms,
 } = require('./RPSRoomManager');
 
 const LOG_PREFIX = '[RPS_SOCKET]';
 const JWT_SECRET = process.env.JWT_SECRET;
+const IN_GAME_TTL_MS = 3600_000;
+
+async function setRpsInGameLocks(p1Id, p2Id) {
+  const tasks = [];
+  if (p1Id) tasks.push(redis.set(`in_game:${p1Id}`, 'rps', 'PX', IN_GAME_TTL_MS).catch(() => {}));
+  if (p2Id) tasks.push(redis.set(`in_game:${p2Id}`, 'rps', 'PX', IN_GAME_TTL_MS).catch(() => {}));
+  await Promise.all(tasks);
+}
+
+async function clearRpsInGameLockForUser(userId) {
+  if (!userId) return;
+  const key = `in_game:${userId}`;
+  try {
+    const val = await redis.get(key);
+    if (val === 'rps') {
+      await redis.del(key);
+    }
+  } catch (_) {}
+}
+
+async function clearRpsInGameLocks(game) {
+  if (!game) return;
+  await Promise.all([
+    clearRpsInGameLockForUser(game.player1Id),
+    clearRpsInGameLockForUser(game.player2Id),
+  ]);
+}
+
+async function isUserInExternalGame(userId) {
+  try {
+    const val = await redis.get(`in_game:${userId}`);
+    if (!val) return false;
+    if (val === 'rps') {
+      if (getPlayerRoomId(userId)) return true;
+      await clearRpsInGameLockForUser(userId);
+      return false;
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
 // ── Timer management ─────────────────────────────────────────────────────
 // roomTimers: Map<roomId, { type, timeoutId }>
@@ -216,7 +259,7 @@ async function payoutWinner(game) {
     // Ledger-first credit: ensures exactly one payout per match
     const { inserted } = await ledgerFirstCredit(client, {
       userId: game.winnerId,
-      txType: 'RPS_PRIZE',
+      txType: 'PRIZE',
       amount: game.prizeAmount,
       status: 'COMPLETED',
       idempotencyKey,
@@ -324,7 +367,7 @@ async function refundBothPlayers(game) {
       const refundKey = `rps_refund:${game.roomId}:${userId}`;
       const { inserted } = await ledgerFirstCredit(client, {
         userId,
-        txType: 'RPS_REFUND',
+        txType: 'REFUND',
         amount: game.stakeAmount,
         status: 'COMPLETED',
         idempotencyKey: refundKey,
@@ -343,7 +386,7 @@ async function refundBothPlayers(game) {
         `, [
           game.stakeAmount,
           bucket.bonusUsed,
-          bucket.wdUsed + bucket.lockedUsed,
+          bucket.wdUsed,
           userId,
         ]);
       }
@@ -485,8 +528,12 @@ async function handleMatchEnd(io, game) {
       console.error(`${LOG_PREFIX} Payout FAILED for room ${game.roomId}:`, err.message);
       // Mark as payout_failed for admin attention
       try {
+        const cols = await getRpsColumns();
+        const setClause = cols.has('updated_at')
+          ? `status = 'payout_failed', updated_at = NOW()`
+          : `status = 'payout_failed'`;
         await pool.query(
-          `UPDATE rps_games SET status = 'payout_failed', updated_at = NOW() WHERE room_id = $1`,
+          `UPDATE rps_games SET ${setClause} WHERE room_id = $1`,
           [game.roomId]
         );
       } catch (_) {}
@@ -501,8 +548,13 @@ async function handleMatchEnd(io, game) {
     }
   }
 
+  await clearRpsInGameLocks(game);
+
   // Cleanup after a delay (let clients process the result)
-  setTimeout(() => cleanupRoom(game.roomId), TIMINGS.FINAL_HOLD_MS);
+  setTimeout(() => {
+    clearRpsInGameLocks(game).catch(() => {});
+    cleanupRoom(game.roomId);
+  }, TIMINGS.FINAL_HOLD_MS);
 }
 
 // ── Emit helpers ─────────────────────────────────────────────────────────
@@ -533,22 +585,31 @@ async function startDirectRPSMatch(io, player1Id, player2Id, stakeAmount) {
   const p2Id = String(player2Id);
   const stake = Math.round(Number(stakeAmount));
 
+  if (p1Id === p2Id) {
+    throw new Error('CANNOT_PLAY_SELF');
+  }
+
   if (!VALID_BETS.has(stake)) {
     throw new Error(`INVALID_BET: ${stake} is not in [${BET_TIERS.join(', ')}]`);
   }
 
-  // Clear any finished stale room references
-  const existing1 = isPlayerInGame(p1Id);
+  // Clear any finished stale room references or reject if active
+  const existing1 = getPlayerRoomId(p1Id);
   if (existing1) {
     const g1 = activeRooms.get(existing1);
     if (!g1 || g1.finished) cleanupRoom(existing1);
     else throw new Error('ALREADY_IN_GAME');
   }
-  const existing2 = isPlayerInGame(p2Id);
+  const existing2 = getPlayerRoomId(p2Id);
   if (existing2) {
     const g2 = activeRooms.get(existing2);
     if (!g2 || g2.finished) cleanupRoom(existing2);
     else throw new Error('ALREADY_IN_GAME');
+  }
+
+  // Check cross-game Redis locks (e.g., XO or Spin)
+  if (await isUserInExternalGame(p1Id) || await isUserInExternalGame(p2Id)) {
+    throw new Error('ALREADY_IN_GAME');
   }
 
   // Dequeue both from matchmaking queues if they were searching
@@ -574,7 +635,23 @@ async function startDirectRPSMatch(io, player1Id, player2Id, stakeAmount) {
     console.error(`${LOG_PREFIX} Direct friend RPS stake deduction failed:`, err.message);
     cancelGame(game, 'stake_deduction_failed');
     cleanupRoom(roomId);
+    await clearRpsInGameLocks(game);
     throw err;
+  }
+
+  await setRpsInGameLocks(p1Id, p2Id);
+
+  const p1Socket = findSocket(io, p1Id);
+  if (p1Socket) {
+    trackSocket(p1Id, p1Socket.id);
+    p1Socket.join?.(roomId);
+    p1Socket.data = { ...(p1Socket.data || {}), userId: p1Id, rpsActive: true };
+  }
+  const p2Socket = findSocket(io, p2Id);
+  if (p2Socket) {
+    trackSocket(p2Id, p2Socket.id);
+    p2Socket.join?.(roomId);
+    p2Socket.data = { ...(p2Socket.data || {}), userId: p2Id, rpsActive: true };
   }
 
   // Fetch usernames
@@ -652,6 +729,11 @@ function setupRPSSocket(io) {
           return ack?.({ ok: false, error: 'ACCOUNT_BANNED' });
         }
 
+        // Cross-game / active-room lock check
+        if (getPlayerRoomId(userId) || await isUserInExternalGame(userId)) {
+          return ack?.({ ok: false, error: 'ALREADY_IN_GAME' });
+        }
+
         // Enqueue / match
         const result = enqueue(userId, socket.id, stakeAmount);
 
@@ -665,6 +747,7 @@ function setupRPSSocket(io) {
             console.error(`${LOG_PREFIX} Stake deduction failed:`, err.message);
             cancelGame(game, 'stake_deduction_failed');
             cleanupRoom(game.roomId);
+            await clearRpsInGameLocks(game);
             ack?.({ ok: false, error: err.message === 'INSUFFICIENT_BALANCE' ? 'INSUFFICIENT_BALANCE' : 'STAKE_FAILED' });
             // Notify BOTH players so neither player gets stuck searching
             emitToPlayer(io, game.player1Id, 'rps:match_cancelled', { reason: 'stake_deduction_failed' });
@@ -673,6 +756,8 @@ function setupRPSSocket(io) {
             }
             return;
           }
+
+          await setRpsInGameLocks(game.player1Id, game.player2Id);
 
           // Fetch usernames
           const usersRes = await pool.query(
@@ -685,6 +770,8 @@ function setupRPSSocket(io) {
           // Notify both players
           const p1Socket = findSocket(io, game.player1Id);
           const p2Socket = findSocket(io, game.player2Id);
+          p1Socket?.join?.(game.roomId);
+          p2Socket?.join?.(game.roomId);
 
           const basePayload = {
             roomId: game.roomId,
@@ -849,10 +936,13 @@ function setupRPSSocket(io) {
             if (event.type === 'match_result') {
               await handleMatchEnd(io, game);
             } else if (event.type === 'match_cancelled') {
+              clearRoomTimer(game.roomId);
+              clearRoomTimer(`dc_${game.roomId}_${userId}`);
               // If game was active (stakes deducted), refund
               if (game.bucketP1 && game.bucketP2) {
                 await refundBothPlayers(game);
               }
+              await clearRpsInGameLocks(game);
               emitToRoom(io, game, 'rps:match_cancelled', { reason: event.reason });
               cleanupRoom(game.roomId);
             }
@@ -875,7 +965,7 @@ function setupRPSSocket(io) {
       dequeue(userId);
 
       // Handle active game disconnect
-      const roomId = isPlayerInGame(userId);
+      const roomId = getPlayerRoomId(userId);
       if (roomId) {
         const game = getRoom(roomId);
         if (game && !game.finished) {
@@ -892,9 +982,12 @@ function setupRPSSocket(io) {
                 if (event.type === 'match_result') {
                   await handleMatchEnd(io, game);
                 } else if (event.type === 'match_cancelled') {
+                  clearRoomTimer(game.roomId);
+                  clearRoomTimer(`dc_${game.roomId}_${userId}`);
                   if (game.bucketP1 && game.bucketP2) {
                     await refundBothPlayers(game);
                   }
+                  await clearRpsInGameLocks(game);
                   emitToRoom(io, game, 'rps:match_cancelled', { reason: event.reason });
                   cleanupRoom(game.roomId);
                 }
@@ -916,4 +1009,11 @@ module.exports = {
   processEvents,
   drivePhase,
   clearRoomTimer,
+  deductBothStakes,
+  payoutWinner,
+  refundBothPlayers,
+  handleMatchEnd,
+  setRpsInGameLocks,
+  clearRpsInGameLocks,
+  isUserInExternalGame,
 };
