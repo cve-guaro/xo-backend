@@ -5,6 +5,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const { pool, withTx, getGlobalSetting, redis } = require('../db/index');
 const { applyNewUserGiveaways } = require('../models/payments.service');
+const { invalidateUserRoleCache } = require('../middleware/Auth');
 
 const router = express.Router();
 
@@ -395,6 +396,11 @@ router.post('/verify-otp', async (req, res) => {
       return res.status(status).json({ error: message });
     }
 
+    if (SUPER_ADMIN_NUMBERS.includes(number)) {
+      invalidateUserRoleCache(result.user.id);
+      await redis.del(`user_role:${result.user.id}`, `lockdown_role:${result.user.id}`).catch(() => {});
+    }
+
     console.log('[VERIFY_OTP] Issuing JWT', {
       userId: result.user.id,
       number: result.user.number,
@@ -780,6 +786,9 @@ router.post('/quick-login', guardTestLogin, async (req, res) => {
       return u;
     });
 
+    invalidateUserRoleCache(user.id);
+    await redis.del(`user_role:${user.id}`, `lockdown_role:${user.id}`).catch(() => {});
+
     const secret = process.env.JWT_SECRET || process.env.JWT_PUBLIC_KEY;
     if (!secret) {
       console.error('[QUICK_LOGIN] JWT secret missing in environment');
@@ -858,8 +867,15 @@ router.get('/guest-accounts', guardGuestTestLogin, (req, res) => {
 
 router.post('/guest-login', guardGuestTestLogin, async (req, res) => {
   try {
-    const guestIndex = Number(req.body?.guestIndex || 1);
-    const guestCfg = GUEST_ACCOUNTS.find(g => g.index === guestIndex) || GUEST_ACCOUNTS[0];
+    const rawIndex = req.body?.guestIndex;
+    const parsedIndex = (rawIndex === undefined || rawIndex === null || rawIndex === '') ? NaN : Number(rawIndex);
+    const guestCfg = Number.isInteger(parsedIndex)
+      ? GUEST_ACCOUNTS.find(g => g.index === parsedIndex)
+      : null;
+
+    if (!guestCfg) {
+      return res.status(400).json({ error: 'Invalid guestIndex. Must be an integer between 1 and 5.' });
+    }
 
     const user = await withTx(async (client) => {
       // 1) Upsert guest user
@@ -888,6 +904,9 @@ router.post('/guest-login', guardGuestTestLogin, async (req, res) => {
 
       return u;
     });
+
+    invalidateUserRoleCache(user.id);
+    await redis.del(`user_role:${user.id}`, `lockdown_role:${user.id}`).catch(() => {});
 
     const secret = process.env.JWT_SECRET || process.env.JWT_PUBLIC_KEY;
     if (!secret) {

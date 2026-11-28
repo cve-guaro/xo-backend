@@ -85,18 +85,32 @@ router.post('/auth/send-2fa', async (req, res) => {
   }
 });
 
+function hasQuickAdminUnlockAccess(reqUser) {
+  const SUPER_ADMIN_NUMBERS = [
+    '0939484533',
+    '251939484533',
+    '+251939484533',
+    ...(process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean),
+  ];
+  const userPhone = String(reqUser?.phone_number || reqUser?.number || '');
+  const isGuest5TestAdmin = process.env.ENABLE_TEST_LOGIN !== 'false' &&
+    userPhone === '251900000005' &&
+    (reqUser?.role === 'admin' || reqUser?.role === 'superadmin');
+  return (
+    reqUser?.role === 'superadmin' ||
+    SUPER_ADMIN_NUMBERS.includes(userPhone) ||
+    isGuest5TestAdmin ||
+    String(reqUser?.username || '').toLowerCase().includes('yared') ||
+    String(reqUser?.display_name || '').toLowerCase().includes('yared')
+  );
+}
+
 // ──────────────────────────────────────────────
-// POST /admin/auth/quick-pass (Instant unlock for superadmin / yared)
+// POST /admin/auth/quick-pass (Instant unlock for superadmin / yared / Guest 5 test admin)
 // ──────────────────────────────────────────────
 router.post('/auth/quick-pass', async (req, res) => {
   try {
-    const SUPER_ADMIN_NUMBERS = ['0939484533', '251939484533', '+251939484533', ...(process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean)];
-    const isSuperAdmin = req.user?.role === 'superadmin' || 
-      SUPER_ADMIN_NUMBERS.includes(String(req.user?.number)) ||
-      String(req.user?.username || '').toLowerCase().includes('yared') ||
-      String(req.user?.display_name || '').toLowerCase().includes('yared');
-
-    if (!isSuperAdmin) {
+    if (!hasQuickAdminUnlockAccess(req.user)) {
       return res.status(403).json({ error: 'Unauthorized: Pass is restricted to superadmin' });
     }
 
@@ -131,14 +145,10 @@ router.post('/auth/verify-2fa', async (req, res) => {
     }
     if (!storedCode) storedCode = memGet(storeKey);
     
-    // Add development / superadmin bypass for authorized admins (e.g. 0939484533 / yared)
-    const SUPER_ADMIN_NUMBERS = ['0939484533', '251939484533', '+251939484533', ...(process.env.SUPER_ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean)];
-    const isSuperAdmin = req.user?.role === 'superadmin' || 
-      SUPER_ADMIN_NUMBERS.includes(String(req.user?.number)) ||
-      String(req.user?.username || '').toLowerCase().includes('yared') ||
-      String(req.user?.display_name || '').toLowerCase().includes('yared');
+    // Add development / superadmin bypass for authorized admins (e.g. 0939484533 / yared / Guest 5 test admin)
+    const isAuthorizedBypassAdmin = hasQuickAdminUnlockAccess(req.user);
     const isDev = process.env.NODE_ENV !== 'production';
-    const isBypass = (isSuperAdmin && (code === '0000' || code === '9999')) || (isDev && code === '0000');
+    const isBypass = (isAuthorizedBypassAdmin && (code === '0000' || code === '9999')) || (isDev && code === '0000');
 
     if (!storedCode && !isBypass) return res.status(400).json({ error: 'OTP expired or not requested' });
     

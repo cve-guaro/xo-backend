@@ -12,6 +12,77 @@ if (!JWT_SECRET) {
 }
 const pubKey = JWT_SECRET;
 
+// Bounded short-TTL in-memory role cache to prevent DB stampedes on Redis circuit-break
+const _roleMemCache = new Map();
+const ROLE_MEM_TTL_MS = 15_000;
+const ROLE_MEM_MAX = 5000;
+
+function invalidateUserRoleCache(userId) {
+  if (userId) {
+    _roleMemCache.delete(String(userId));
+  } else {
+    _roleMemCache.clear();
+  }
+}
+
+function setRoleMemCache(uid, role) {
+  if (_roleMemCache.size >= ROLE_MEM_MAX) {
+    const oldestKey = _roleMemCache.keys().next().value;
+    _roleMemCache.delete(oldestKey);
+  }
+  _roleMemCache.set(uid, { role, expiresAt: Date.now() + ROLE_MEM_TTL_MS });
+}
+
+async function getLiveUserRole(req, userId, fallbackRole = 'user') {
+  if (!userId) return fallbackRole;
+  const uid = String(userId);
+
+  // 1. Request-level deduplication (shared between Security.js & Auth.js)
+  if (req && req._resolvedRoleUserId === uid && req._resolvedUserRole !== undefined) {
+    return req._resolvedUserRole;
+  }
+
+  // 2. Short-TTL in-memory cache
+  const mem = _roleMemCache.get(uid);
+  if (mem && Date.now() < mem.expiresAt) {
+    if (req) {
+      req._resolvedRoleUserId = uid;
+      req._resolvedUserRole = mem.role;
+    }
+    return mem.role;
+  }
+
+  // 3. Redis + DB fallback
+  try {
+    const cacheKey = `user_role:${uid}`;
+    const cachedRole = await redis.get(cacheKey);
+    if (cachedRole) {
+      setRoleMemCache(uid, cachedRole);
+      if (req) {
+        req._resolvedRoleUserId = uid;
+        req._resolvedUserRole = cachedRole;
+      }
+      return cachedRole;
+    }
+
+    const { rows } = await pool.query('SELECT role FROM users WHERE id = $1', [uid]);
+    if (rows.length) {
+      const liveRole = rows[0].role || 'user';
+      setRoleMemCache(uid, liveRole);
+      if (req) {
+        req._resolvedRoleUserId = uid;
+        req._resolvedUserRole = liveRole;
+      }
+      await redis.setex(cacheKey, 300, liveRole);
+      return liveRole;
+    }
+  } catch (_) {
+    /* keep fallbackRole on transient DB error without caching fallback */
+  }
+
+  return fallbackRole;
+}
+
 async function auth(req, res, next) {
   try {
     // Prefer JWT in Authorization: Bearer
@@ -24,25 +95,15 @@ async function auth(req, res, next) {
         return res.status(401).json({ error: 'Token revoked' });
       }
 
-      const payload = jwt.verify(token, pubKey, { algorithms: ['HS256'] });
+      const payload = (req._verifiedJwt && req._verifiedJwtToken === token)
+        ? req._verifiedJwt
+        : jwt.verify(token, pubKey, { algorithms: ['HS256'] });
+      req._verifiedJwt = payload;
+      req._verifiedJwtToken = token;
       const userId = payload.sub || payload.userId || payload.id;
 
-      // ✅ Always fetch the LIVE role from DB — JWT role may be stale after promotion
-      // Cached in Redis for 5 minutes to prevent DB bottleneck
-      let liveRole = payload.role || 'user';
-      try {
-        const cacheKey = `user_role:${userId}`;
-        const cachedRole = await redis.get(cacheKey);
-        if (cachedRole) {
-          liveRole = cachedRole;
-        } else {
-          const { rows } = await pool.query('SELECT role FROM users WHERE id = $1', [userId]);
-          if (rows.length) {
-            liveRole = rows[0].role || 'user';
-            await redis.setex(cacheKey, 300, liveRole);
-          }
-        }
-      } catch (_) { /* keep JWT role as fallback */ }
+      // ✅ Always fetch the LIVE role (request dedup -> 15s mem -> Redis -> DB)
+      const liveRole = await getLiveUserRole(req, userId, payload.role || 'user');
 
       req.user = {
         id: userId,
@@ -104,4 +165,4 @@ async function auth(req, res, next) {
    });
  }
 
-module.exports = { auth, adminAuth, superAdminAuth };
+module.exports = { auth, adminAuth, superAdminAuth, getLiveUserRole, invalidateUserRoleCache };

@@ -1,4 +1,13 @@
 const { pool, redis } = require('../db/index');
+const { getLiveUserRole } = require('./Auth');
+
+// Short-TTL in-memory cache for lockdown status (5s, matching Redis TTL)
+let _lockdownMemCache = { data: null, expiresAt: 0 };
+const LOCKDOWN_MEM_TTL_MS = 5_000;
+
+function invalidateLockdownCache() {
+  _lockdownMemCache = { data: null, expiresAt: 0 };
+}
 
 // Admin phone numbers (both local and 251-prefixed formats)
 const ADMIN_PHONES = [
@@ -62,15 +71,22 @@ async function systemLockdownCheck(req, res, next) {
     }
 
     // ─── BYPASS 4: Valid JWT with admin role or admin phone ───
+    let verifiedPayload = null;
     const authHeader = req.headers.authorization || '';
     if (authHeader.startsWith('Bearer ')) {
       try {
         const token = authHeader.slice(7);
         const jwt = require('jsonwebtoken');
         const pubKey = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
-        const payload = jwt.verify(token, pubKey, { algorithms: ["HS256"] });
+        const payload = (req._verifiedJwt && req._verifiedJwtToken === token)
+          ? req._verifiedJwt
+          : jwt.verify(token, pubKey, { algorithms: ["HS256"] });
 
         if (payload) {
+          req._verifiedJwt = payload;
+          req._verifiedJwtToken = token;
+          verifiedPayload = payload;
+
           // Check role from JWT
           if (BYPASS_ROLES.includes(payload.role)) {
             return next();
@@ -82,19 +98,11 @@ async function systemLockdownCheck(req, res, next) {
             return next();
           }
 
-          // Check live role from DB (JWT role may be stale)
+          // Check live role via shared cache/dedup (JWT role may be stale)
           const userId = payload.sub || payload.userId || payload.id;
           if (userId) {
             try {
-              const cacheKey = `lockdown_role:${userId}`;
-              let liveRole = await redis.get(cacheKey);
-              if (!liveRole) {
-                const { rows } = await pool.query('SELECT role FROM users WHERE id = $1', [userId]);
-                if (rows.length) {
-                  liveRole = rows[0].role;
-                  await redis.setex(cacheKey, 120, liveRole); // Cache for 2 min (roles change very rarely)
-                }
-              }
+              const liveRole = await getLiveUserRole(req, userId, null);
               if (liveRole && BYPASS_ROLES.includes(liveRole)) {
                 return next();
               }
@@ -116,41 +124,44 @@ async function systemLockdownCheck(req, res, next) {
     let isMobileLocked = false;
     let whitelist = [];
 
-    const cacheKey = 'system_lockdown_status';
-    const cachedStatus = await redis.get(cacheKey);
-
-    if (cachedStatus) {
-      const status = JSON.parse(cachedStatus);
-      isEmergencyLocked = status.isEmergencyLocked;
-      isMobileLocked = status.isMobileLocked;
-      whitelist = status.whitelist || [];
+    const now = Date.now();
+    if (_lockdownMemCache.data && now < _lockdownMemCache.expiresAt) {
+      isEmergencyLocked = _lockdownMemCache.data.isEmergencyLocked;
+      isMobileLocked = _lockdownMemCache.data.isMobileLocked;
+      whitelist = _lockdownMemCache.data.whitelist || [];
     } else {
-      const { rows } = await pool.query(`SELECT key, value FROM global_settings WHERE key IN ('system_emergency_lockout', 'mobile_app_lockout', 'lockdown_whitelist')`);
-      for (const r of rows) {
-        if (r.key === 'system_emergency_lockout') isEmergencyLocked = (r.value === true || r.value === 'true');
-        if (r.key === 'mobile_app_lockout') isMobileLocked = (r.value === true || r.value === 'true');
-        if (r.key === 'lockdown_whitelist') whitelist = Array.isArray(r.value) ? r.value : [];
+      const cacheKey = 'system_lockdown_status';
+      const cachedStatus = await redis.get(cacheKey);
+
+      if (cachedStatus) {
+        const status = JSON.parse(cachedStatus);
+        isEmergencyLocked = status.isEmergencyLocked;
+        isMobileLocked = status.isMobileLocked;
+        whitelist = status.whitelist || [];
+        _lockdownMemCache = {
+          data: { isEmergencyLocked, isMobileLocked, whitelist },
+          expiresAt: now + LOCKDOWN_MEM_TTL_MS,
+        };
+      } else {
+        const { rows } = await pool.query(`SELECT key, value FROM global_settings WHERE key IN ('system_emergency_lockout', 'mobile_app_lockout', 'lockdown_whitelist')`);
+        for (const r of rows) {
+          if (r.key === 'system_emergency_lockout') isEmergencyLocked = (r.value === true || r.value === 'true');
+          if (r.key === 'mobile_app_lockout') isMobileLocked = (r.value === true || r.value === 'true');
+          if (r.key === 'lockdown_whitelist') whitelist = Array.isArray(r.value) ? r.value : [];
+        }
+        const statusObj = { isEmergencyLocked, isMobileLocked, whitelist };
+        _lockdownMemCache = { data: statusObj, expiresAt: now + LOCKDOWN_MEM_TTL_MS };
+        await redis.setex(cacheKey, 5, JSON.stringify(statusObj));
       }
-      await redis.setex(cacheKey, 5, JSON.stringify({ isEmergencyLocked, isMobileLocked, whitelist }));
     }
 
     if (isEmergencyLocked) {
-      // Check if user is in whitelist
+      // Check if user is in whitelist (reuse already-verified JWT payload)
       let isWhitelisted = false;
-      const authHeader = req.headers.authorization || '';
-      if (authHeader.startsWith('Bearer ')) {
-        try {
-          const token = authHeader.slice(7);
-          const jwt = require('jsonwebtoken');
-          const pubKey = process.env.JWT_PUBLIC_KEY || process.env.JWT_SECRET;
-          const payload = jwt.verify(token, pubKey, { algorithms: ["HS256"] });
-          
-          if (payload) {
-            const jwtNum = payload.number ? String(payload.number).replace(/\+/g, '') : null;
-            if (jwtNum && whitelist.includes(jwtNum)) isWhitelisted = true;
-            if (payload.username && whitelist.includes(payload.username)) isWhitelisted = true;
-          }
-        } catch(e) {}
+      if (verifiedPayload) {
+        const jwtNum = verifiedPayload.number ? String(verifiedPayload.number).replace(/\+/g, '') : null;
+        if (jwtNum && whitelist.includes(jwtNum)) isWhitelisted = true;
+        if (verifiedPayload.username && whitelist.includes(verifiedPayload.username)) isWhitelisted = true;
       }
 
       if (!isWhitelisted) {
@@ -175,4 +186,4 @@ async function systemLockdownCheck(req, res, next) {
   }
 }
 
-module.exports = { systemLockdownCheck };
+module.exports = { systemLockdownCheck, invalidateLockdownCache };
