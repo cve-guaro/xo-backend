@@ -165,7 +165,7 @@ function cleanupRoom(roomId) {
  * If another player is already waiting for the same tier, match them immediately.
  * Otherwise, add to queue and return position.
  */
-function enqueue(userId, socketId, stakeAmount) {
+function enqueue(userId, socketId, stakeAmount, isSocketAlive) {
   const uid = String(userId);
   const stake = Math.round(Number(stakeAmount));
 
@@ -182,7 +182,7 @@ function enqueue(userId, socketId, stakeAmount) {
 
   const queue = matchmakingQueues.get(stake);
 
-  // Prune stale entries (disconnected players)
+  // Prune stale or disconnected entries before matching
   while (queue.length > 0) {
     const head = queue[0];
     // Stale check: if entry is older than 2 minutes, remove
@@ -192,6 +192,11 @@ function enqueue(userId, socketId, stakeAmount) {
     }
     // Don't match with yourself
     if (head.userId === uid) {
+      queue.shift();
+      continue;
+    }
+    // Prune disconnected ghost players
+    if (typeof isSocketAlive === 'function' && !isSocketAlive(head.socketId, head.userId)) {
       queue.shift();
       continue;
     }

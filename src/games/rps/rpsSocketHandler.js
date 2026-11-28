@@ -734,8 +734,12 @@ function setupRPSSocket(io) {
           return ack?.({ ok: false, error: 'ALREADY_IN_GAME' });
         }
 
-        // Enqueue / match
-        const result = enqueue(userId, socket.id, stakeAmount);
+        // Enqueue / match (pruning disconnected ghost entries in queue)
+        const result = enqueue(userId, socket.id, stakeAmount, (queuedSocketId, queuedUserId) => {
+          const qs = io?.sockets?.sockets?.get(queuedSocketId);
+          if (qs && !qs.disconnected) return true;
+          return Boolean(findSocket(io, queuedUserId));
+        });
 
         if (result.matched) {
           const game = result.game;
@@ -744,15 +748,27 @@ function setupRPSSocket(io) {
           try {
             await deductBothStakes(game);
           } catch (err) {
+            const isMissingTable = err.code === '42P01' || (err.message && err.message.includes('rps_games'));
             console.error(`${LOG_PREFIX} Stake deduction failed:`, err.message);
+            if (isMissingTable) {
+              console.error(`${LOG_PREFIX} CRITICAL: rps_games table missing — apply migration_009_rps_schema.sql.`);
+            }
             cancelGame(game, 'stake_deduction_failed');
             cleanupRoom(game.roomId);
             await clearRpsInGameLocks(game);
-            ack?.({ ok: false, error: err.message === 'INSUFFICIENT_BALANCE' ? 'INSUFFICIENT_BALANCE' : 'STAKE_FAILED' });
+            const errCode = err.message === 'INSUFFICIENT_BALANCE'
+              ? 'INSUFFICIENT_BALANCE'
+              : (isMissingTable ? 'RPS_SCHEMA_MISSING' : 'STAKE_FAILED');
+            const errMessage = errCode === 'INSUFFICIENT_BALANCE'
+              ? 'One of the matched players has insufficient balance.'
+              : (isMissingTable ? 'RPS service is updating. Please try again shortly.' : 'Failed to lock stakes for match.');
+            ack?.({ ok: false, error: errCode, message: errMessage });
             // Notify BOTH players so neither player gets stuck searching
-            emitToPlayer(io, game.player1Id, 'rps:match_cancelled', { reason: 'stake_deduction_failed' });
+            emitToPlayer(io, game.player1Id, 'rps:error', { code: errCode, message: errMessage });
+            emitToPlayer(io, game.player1Id, 'rps:match_cancelled', { reason: errCode });
             if (game.player2Id) {
-              emitToPlayer(io, game.player2Id, 'rps:match_cancelled', { reason: 'stake_deduction_failed' });
+              emitToPlayer(io, game.player2Id, 'rps:error', { code: errCode, message: errMessage });
+              emitToPlayer(io, game.player2Id, 'rps:match_cancelled', { reason: errCode });
             }
             return;
           }
@@ -767,7 +783,7 @@ function setupRPSSocket(io) {
           const userMap = {};
           for (const r of usersRes.rows) userMap[r.id] = r.display_name || r.username || 'Player';
 
-          // Notify both players
+          // Notify both players (emitToPlayer delivers to user room + direct socket)
           const p1Socket = findSocket(io, game.player1Id);
           const p2Socket = findSocket(io, game.player2Id);
           p1Socket?.join?.(game.roomId);
@@ -781,22 +797,18 @@ function setupRPSSocket(io) {
             bestOf: game.bestOf,
           };
 
-          if (p1Socket) {
-            p1Socket.emit('rps:match_found', {
-              ...basePayload,
-              youAre: 'p1',
-              opponentId: game.player2Id,
-              opponentUsername: userMap[game.player2Id] || 'Player',
-            });
-          }
-          if (p2Socket) {
-            p2Socket.emit('rps:match_found', {
-              ...basePayload,
-              youAre: 'p2',
-              opponentId: game.player1Id,
-              opponentUsername: userMap[game.player1Id] || 'Player',
-            });
-          }
+          emitToPlayer(io, game.player1Id, 'rps:match_found', {
+            ...basePayload,
+            youAre: 'p1',
+            opponentId: game.player2Id,
+            opponentUsername: userMap[game.player2Id] || 'Player',
+          });
+          emitToPlayer(io, game.player2Id, 'rps:match_found', {
+            ...basePayload,
+            youAre: 'p2',
+            opponentId: game.player1Id,
+            opponentUsername: userMap[game.player1Id] || 'Player',
+          });
 
           ack?.({ ok: true, matched: true, roomId: game.roomId });
 
